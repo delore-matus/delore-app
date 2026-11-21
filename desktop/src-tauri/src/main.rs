@@ -71,13 +71,7 @@ impl DesktopState {
         };
         let gpu = detect_gpu();
         let runtime = match RuntimeManager::new() {
-            Ok(manager) if manager.runtime_dir().exists() => match manager.executable_path() {
-                Ok(_) => RuntimeState::Ready,
-                Err(error) => RuntimeState::Error {
-                    message: error.to_string(),
-                },
-            },
-            Ok(_) => RuntimeState::NotInstalled,
+            Ok(manager) => initial_runtime_state(&manager),
             Err(error) => RuntimeState::Error {
                 message: error.to_string(),
             },
@@ -152,11 +146,10 @@ async fn start_provider(
         .unwrap_or_else(ProviderConfig::defaults);
     let runtime_manager =
         RuntimeManager::new().map_err(|error| format!("Runtime paths unavailable: {error:#}"))?;
-    let requires_confirmation = !runtime_manager.runtime_dir().exists()
-        && matches!(
-            runtime_suitability(),
-            RuntimeSuitability::NotRecommended { .. }
-        );
+    let requires_confirmation = requires_runtime_confirmation(
+        runtime_manager.runtime_dir().exists(),
+        &runtime_suitability(),
+    );
     let confirmed = {
         let mut granted = state
             .inner()
@@ -230,9 +223,12 @@ async fn start_provider(
     let event_callback: ProviderEventCallback = Arc::new(move |event| {
         update_status(&event_state, &event_app, |snapshot| match event {
             ProviderEvent::Connection { state, message } => {
+                let connected = matches!(&state, provider_core::ConnectionState::Connected);
                 snapshot.connection = state;
                 if let Some(message) = message {
                     snapshot.error_message = Some(message);
+                } else if connected {
+                    snapshot.error_message = None;
                 }
             }
             ProviderEvent::FeeConfig { config } => snapshot.fee_config = Some(config),
@@ -309,7 +305,19 @@ fn set_payout_address(
 }
 
 async fn stop_provider_task(app: &tauri::AppHandle, state: &DesktopState) -> Result<(), String> {
-    let mut task_slot = state.inner.task.lock().await;
+    stop_provider_task_and_join(&state.inner).await?;
+    update_status(&state.inner, app, |snapshot| {
+        snapshot.provider_running = false;
+        snapshot.connection = provider_core::ConnectionState::Disconnected;
+        if matches!(&snapshot.current_job, CurrentJob::Running { .. }) {
+            snapshot.current_job = CurrentJob::Idle;
+        }
+    });
+    Ok(())
+}
+
+async fn stop_provider_task_and_join(state: &StateInner) -> Result<(), String> {
+    let mut task_slot = state.task.lock().await;
     let result = if let Some(task) = task_slot.as_mut() {
         let _ = task.stop.send(true);
         Some((&mut task.join).await)
@@ -321,14 +329,26 @@ async fn stop_provider_task(app: &tauri::AppHandle, state: &DesktopState) -> Res
     if let Some(Err(error)) = result {
         return Err(format!("Provider shutdown task failed: {error}"));
     }
-    update_status(&state.inner, app, |snapshot| {
-        snapshot.provider_running = false;
-        snapshot.connection = provider_core::ConnectionState::Disconnected;
-        if matches!(&snapshot.current_job, CurrentJob::Running { .. }) {
-            snapshot.current_job = CurrentJob::Idle;
-        }
-    });
     Ok(())
+}
+
+fn requires_runtime_confirmation(
+    runtime_installed: bool,
+    suitability: &RuntimeSuitability,
+) -> bool {
+    !runtime_installed && matches!(suitability, RuntimeSuitability::NotRecommended { .. })
+}
+
+fn initial_runtime_state(manager: &RuntimeManager) -> RuntimeState {
+    if !manager.runtime_dir().exists() {
+        return RuntimeState::NotInstalled;
+    }
+    match manager.executable_path() {
+        Ok(_) => RuntimeState::Ready,
+        Err(error) => RuntimeState::Error {
+            message: error.to_string(),
+        },
+    }
 }
 
 fn update_status(
@@ -396,4 +416,93 @@ fn main() {
         })
         .run(tauri::generate_context!())
         .expect("error while running DeLore");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        initial_runtime_state, requires_runtime_confirmation, stop_provider_task_and_join,
+        DesktopState, ProviderTask,
+    };
+    use provider_core::{
+        RuntimeManager, RuntimeProgressCallback, RuntimeState, RuntimeSuitability,
+    };
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use tokio::sync::watch;
+
+    #[test]
+    fn close_shutdown_helper_signals_and_joins_provider_task() {
+        tauri::async_runtime::block_on(async {
+            let state = DesktopState::new();
+            let (stop, mut stop_rx) = watch::channel(false);
+            let task_stopped = Arc::new(AtomicBool::new(false));
+            let observed_stop = task_stopped.clone();
+            let join = tauri::async_runtime::spawn(async move {
+                if stop_rx.changed().await.is_ok() && *stop_rx.borrow() {
+                    observed_stop.store(true, Ordering::Release);
+                }
+            });
+            *state.inner.task.lock().await = Some(ProviderTask { stop, join });
+
+            stop_provider_task_and_join(&state.inner).await.unwrap();
+
+            assert!(task_stopped.load(Ordering::Acquire));
+            assert!(state.inner.task.lock().await.is_none());
+        });
+    }
+
+    #[test]
+    #[ignore = "requires an installed managed Ollama runtime"]
+    fn close_shutdown_helper_stops_the_managed_runtime() {
+        tauri::async_runtime::block_on(async {
+            let manager = RuntimeManager::new().unwrap();
+            let executable = manager.executable_path().unwrap();
+            let runtime_callback: RuntimeProgressCallback =
+                Arc::new(|state| println!("close-test runtime={state:?}"));
+            println!("close-test managed executable={}", executable.display());
+            let runtime = manager.start(runtime_callback.clone()).await.unwrap();
+
+            let state = DesktopState::new();
+            let (stop, mut stop_rx) = watch::channel(false);
+            let join = tauri::async_runtime::spawn(async move {
+                if stop_rx.changed().await.is_ok() && *stop_rx.borrow() {
+                    runtime.shutdown(runtime_callback).await.unwrap();
+                }
+            });
+            *state.inner.task.lock().await = Some(ProviderTask { stop, join });
+
+            stop_provider_task_and_join(&state.inner).await.unwrap();
+            println!("close-test managed runtime stopped");
+        });
+    }
+
+    #[test]
+    fn missing_runtime_on_not_recommended_hardware_requires_confirmation() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "gpuswarm-missing-runtime-test-{}",
+            std::process::id()
+        ));
+        let manager = RuntimeManager::with_data_dir(data_dir.clone()).unwrap();
+        assert!(!manager.runtime_dir().exists());
+        assert_eq!(initial_runtime_state(&manager), RuntimeState::NotInstalled);
+        assert!(requires_runtime_confirmation(
+            false,
+            &RuntimeSuitability::NotRecommended {
+                reason: "integrated Intel GPU".to_string()
+            }
+        ));
+        assert!(!requires_runtime_confirmation(
+            true,
+            &RuntimeSuitability::NotRecommended {
+                reason: "integrated Intel GPU".to_string()
+            }
+        ));
+        assert!(!requires_runtime_confirmation(
+            false,
+            &RuntimeSuitability::Suitable
+        ));
+    }
 }
