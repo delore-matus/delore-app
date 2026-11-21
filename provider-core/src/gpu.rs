@@ -1,10 +1,67 @@
 use std::process::Command;
 
+use serde::Deserialize;
+
 #[derive(Debug, Clone)]
 pub struct GpuInfo {
     pub gpu_name: String,
     pub gpu_memory: String,
     pub support: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowsAdapter {
+    pub name: String,
+}
+
+#[derive(Deserialize)]
+struct WindowsCimAdapter {
+    #[serde(rename = "Name")]
+    name: Option<String>,
+}
+
+pub fn parse_windows_adapters(input: &str) -> Vec<WindowsAdapter> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Vec::new();
+    }
+
+    let value = match serde_json::from_str::<serde_json::Value>(input) {
+        Ok(value) => value,
+        Err(_) => return Vec::new(),
+    };
+
+    let objects: Vec<&serde_json::Value> = match &value {
+        serde_json::Value::Array(values) => values.iter().collect(),
+        serde_json::Value::Object(_) => vec![&value],
+        _ => return Vec::new(),
+    };
+
+    let mut adapters = Vec::new();
+    for object in objects {
+        let parsed = serde_json::from_value::<WindowsCimAdapter>(object.clone());
+        let Ok(adapter) = parsed else {
+            continue;
+        };
+        let Some(name) = adapter.name else {
+            continue;
+        };
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let lower = name.to_lowercase();
+        if lower.contains("microsoft basic")
+            || lower.contains("remote display")
+            || lower.contains("virtual")
+        {
+            continue;
+        }
+        adapters.push(WindowsAdapter {
+            name: name.to_string(),
+        });
+    }
+    adapters
 }
 
 pub trait GpuDetector {
@@ -111,37 +168,24 @@ impl GpuDetector for BestEffortDetector {
 
         #[cfg(target_os = "windows")]
         {
-            if let Ok(output) = Command::new("wmic")
+            if let Ok(output) = Command::new("powershell")
                 .args([
-                    "path",
-                    "win32_VideoController",
-                    "get",
-                    "Name,AdapterRAM",
-                    "/format:csv",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "Get-CimInstance Win32_VideoController | Select-Object Name,AdapterRAM | ConvertTo-Json -Compress",
                 ])
                 .output()
             {
                 if output.status.success() {
                     let text = String::from_utf8_lossy(&output.stdout);
-                    for line in text.lines().skip(1) {
-                        let line = line.trim();
-                        if line.is_empty() {
-                            continue;
-                        }
-                        let fields: Vec<&str> = line.split(',').collect();
-                        let name = fields
-                            .last()
-                            .map(|value| value.trim())
-                            .filter(|value| !value.is_empty());
-                        if let Some(name) = name {
-                            let lower = name.to_lowercase();
-                            if lower.contains("intel")
-                                || lower.contains("amd")
-                                || lower.contains("radeon")
-                                || lower.contains("nvidia")
-                            {
-                                return classify_gpu_name(name);
-                            }
+                    for adapter in parse_windows_adapters(&text) {
+                        let lower = adapter.name.to_lowercase();
+                        if lower.contains("intel")
+                            || lower.contains("amd")
+                            || lower.contains("radeon")
+                        {
+                            return classify_gpu_name(&adapter.name);
                         }
                     }
                 }
@@ -166,7 +210,46 @@ pub fn detect_gpu() -> GpuInfo {
 
 #[cfg(test)]
 mod tests {
-    use super::classify_gpu_name;
+    use super::{classify_gpu_name, parse_windows_adapters};
+
+    #[test]
+    fn parses_header_only_or_csv_garbage_as_empty() {
+        assert!(parse_windows_adapters("Node,AdapterRAM,Name").is_empty());
+        assert!(parse_windows_adapters("NODE,4294967296,Intel").is_empty());
+    }
+
+    #[test]
+    fn parses_single_adapter_object() {
+        let adapters =
+            parse_windows_adapters(r#"{"Name":"Intel(R) HD Graphics 520","AdapterRAM":1073741824}"#);
+        assert_eq!(adapters.len(), 1);
+        assert_eq!(adapters[0].name, "Intel(R) HD Graphics 520");
+    }
+
+    #[test]
+    fn parses_multiple_adapters_and_skips_virtual() {
+        let adapters = parse_windows_adapters(
+            r#"[
+                {"Name":"Microsoft Basic Display Adapter","AdapterRAM":0},
+                {"Name":"Intel(R) HD Graphics 520","AdapterRAM":1073741824},
+                {"Name":"Remote Display Adapter","AdapterRAM":0}
+            ]"#,
+        );
+        assert_eq!(adapters.len(), 1);
+        assert_eq!(adapters[0].name, "Intel(R) HD Graphics 520");
+    }
+
+    #[test]
+    fn parses_empty_output_as_empty() {
+        assert!(parse_windows_adapters("").is_empty());
+        assert!(parse_windows_adapters("   ").is_empty());
+    }
+
+    #[test]
+    fn parses_invalid_json_as_empty() {
+        assert!(parse_windows_adapters("{not json").is_empty());
+        assert!(parse_windows_adapters("null").is_empty());
+    }
 
     #[test]
     fn intel_hd_is_integrated_and_unsupported() {
