@@ -937,17 +937,21 @@ async fn ensure_free_space(path: &Path, required: u64) -> Result<()> {
     tokio::task::spawn_blocking(move || -> Result<()> {
         let free = fs2::available_space(&path)
             .with_context(|| format!("could not check free disk space at {}", path.display()))?;
-        if free < required {
-            bail!(
-                "insufficient disk space: need at least {} free, found {}",
-                format_bytes(required),
-                format_bytes(free)
-            );
-        }
-        Ok(())
+        ensure_available_space(required, free)
     })
     .await
     .context("disk-space check worker failed")?
+}
+
+fn ensure_available_space(required: u64, free: u64) -> Result<()> {
+    if free < required {
+        bail!(
+            "insufficient disk space: need at least {} free, found {}",
+            format_bytes(required),
+            format_bytes(free)
+        );
+    }
+    Ok(())
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -1118,9 +1122,10 @@ mod tests {
     };
 
     use super::{
-        download_resumable, ensure_download_confirmation, mach_header_supports_arch,
-        parse_checksum_file, process_pull_progress, select_localhost_port, verify_sha256,
-        RuntimeDownloadPhase, RuntimeProgressCallback, RuntimeState, RuntimeSuitability,
+        download_resumable, ensure_available_space, ensure_download_confirmation,
+        mach_header_supports_arch, parse_checksum_file, process_pull_progress,
+        select_localhost_port, verify_sha256, RuntimeDownloadPhase, RuntimeProgressCallback,
+        RuntimeState, RuntimeSuitability,
     };
 
     #[test]
@@ -1187,6 +1192,12 @@ mod tests {
     }
 
     #[test]
+    fn reports_low_disk_space_before_download() {
+        let error = ensure_available_space(2 * 1024 * 1024, 1024 * 1024).unwrap_err();
+        assert!(error.to_string().contains("insufficient disk space"));
+    }
+
+    #[test]
     fn parses_model_download_progress() {
         let states = Arc::new(std::sync::Mutex::new(Vec::new()));
         let observed = states.clone();
@@ -1225,6 +1236,34 @@ mod tests {
                 phase: RuntimeDownloadPhase::Model,
                 percent: 37,
                 bytes: 75,
+                expected_total_download_bytes: 1000,
+            })
+        );
+    }
+
+    #[test]
+    fn calculates_pull_progress_across_multiple_layers() {
+        let states = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = states.clone();
+        let callback: RuntimeProgressCallback = Arc::new(move |state| {
+            observed.lock().unwrap().push(state);
+        });
+        let mut layers = std::collections::HashMap::new();
+
+        for line in [
+            br#"{"status":"downloading","digest":"layer-a","total":100,"completed":50}"#.as_slice(),
+            br#"{"status":"downloading","digest":"layer-b","total":100,"completed":25}"#.as_slice(),
+            br#"{"status":"downloading","digest":"layer-a","total":100,"completed":75}"#.as_slice(),
+        ] {
+            assert!(!process_pull_progress(line, &callback, &mut layers, 200, 1000).unwrap());
+        }
+
+        assert_eq!(
+            states.lock().unwrap().last(),
+            Some(&RuntimeState::Downloading {
+                phase: RuntimeDownloadPhase::Model,
+                percent: 50,
+                bytes: 100,
                 expected_total_download_bytes: 1000,
             })
         );

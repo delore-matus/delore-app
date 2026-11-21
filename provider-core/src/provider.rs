@@ -22,7 +22,7 @@ pub struct JobHistoryEntry {
     pub duration_ms: u128,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectionState {
     Connecting,
@@ -241,27 +241,16 @@ async fn run_provider_connection(
         None => "not-set".to_string(),
     };
 
-    emit_connection(event_callback, ConnectionState::Connecting, None);
-    println!("Connecting provider to {coordinator_url}");
-    let connect = connect_async(coordinator_url);
-    let (websocket, _response) = tokio::select! {
-        biased;
-        _ = wait_for_stop(stop_rx) => {
-            emit_connection(event_callback, ConnectionState::Disconnected, None);
-            return Ok(());
-        }
-        result = connect => match result {
-            Ok(connection) => connection,
-            Err(error) => {
-            let error = anyhow::Error::from(error)
-                .context("failed to connect to coordinator; is it running?");
-            emit_failure(event_callback, &error);
-            return Err(error);
-            }
-        }
+    let Some(websocket) = connect_with_retry(
+        &coordinator_url,
+        !options.use_environment_overrides,
+        stop_rx,
+        event_callback,
+    )
+    .await?
+    else {
+        return Ok(());
     };
-    println!("Provider connected");
-    emit_connection(event_callback, ConnectionState::Connected, None);
 
     let (mut sender, mut receiver) = websocket.split();
     let mut fee_config: Option<FeeConfig> = None;
@@ -405,6 +394,52 @@ async fn run_provider_connection(
     Ok(())
 }
 
+type CoordinatorSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+async fn connect_with_retry(
+    coordinator_url: &str,
+    retry: bool,
+    stop_rx: &mut watch::Receiver<bool>,
+    event_callback: &ProviderEventCallback,
+) -> Result<Option<CoordinatorSocket>> {
+    loop {
+        emit_connection(event_callback, ConnectionState::Connecting, None);
+        println!("Connecting provider to {coordinator_url}");
+        let result = tokio::select! {
+            biased;
+            _ = wait_for_stop(stop_rx) => {
+                emit_connection(event_callback, ConnectionState::Disconnected, None);
+                return Ok(None);
+            }
+            result = connect_async(coordinator_url) => result,
+        };
+        match result {
+            Ok((websocket, _response)) => {
+                println!("Provider connected");
+                emit_connection(event_callback, ConnectionState::Connected, None);
+                return Ok(Some(websocket));
+            }
+            Err(error) => {
+                let error = anyhow::Error::from(error)
+                    .context("failed to connect to coordinator; is it running?");
+                if !retry {
+                    emit_failure(event_callback, &error);
+                    return Err(error);
+                }
+                let message = format!("{error:#}");
+                eprintln!("{message}");
+                emit_connection(event_callback, ConnectionState::Disconnected, Some(message));
+                tokio::select! {
+                    biased;
+                    _ = wait_for_stop(stop_rx) => return Ok(None),
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+                }
+            }
+        }
+    }
+}
+
 async fn wait_for_stop(stop_rx: &mut watch::Receiver<bool>) {
     loop {
         if *stop_rx.borrow() || stop_rx.changed().await.is_err() {
@@ -430,4 +465,112 @@ fn emit_failure(callback: &ProviderEventCallback, error: &anyhow::Error) {
         ConnectionState::Disconnected,
         Some(format!("{error:#}")),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        connect_with_retry, run_provider_managed, ConnectionState, ProviderConfig, ProviderEvent,
+        ProviderEventCallback, RuntimeProgressCallback, RuntimeState,
+    };
+    use std::sync::{Arc, Mutex};
+    use tokio::{net::TcpListener, sync::watch, time::timeout};
+    use tokio_tungstenite::accept_async;
+
+    #[tokio::test]
+    async fn managed_provider_honors_stop_before_runtime_install() {
+        let (stop, stop_rx) = watch::channel(true);
+        let runtime_states = Arc::new(Mutex::new(Vec::new()));
+        let observed_runtime = runtime_states.clone();
+        let runtime_callback: RuntimeProgressCallback =
+            Arc::new(move |state| observed_runtime.lock().unwrap().push(state));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed_events = events.clone();
+        let event_callback: ProviderEventCallback =
+            Arc::new(move |event| observed_events.lock().unwrap().push(event));
+
+        run_provider_managed(
+            ProviderConfig::defaults(),
+            false,
+            stop_rx,
+            runtime_callback,
+            event_callback,
+        )
+        .await
+        .unwrap();
+        drop(stop);
+
+        let runtime_states = runtime_states.lock().unwrap();
+        assert_eq!(runtime_states.first(), Some(&RuntimeState::Stopping));
+        assert!(matches!(
+            runtime_states.last(),
+            Some(RuntimeState::Ready | RuntimeState::NotInstalled)
+        ));
+        assert!(events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            ProviderEvent::Connection {
+                state: ConnectionState::Disconnected,
+                ..
+            }
+        )));
+    }
+
+    #[tokio::test]
+    async fn managed_connection_recovers_when_coordinator_returns() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (first, _) = listener.accept().await.unwrap();
+            drop(first);
+
+            let (second, _) = timeout(std::time::Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            accept_async(second).await.unwrap();
+        });
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed_events = events.clone();
+        let event_callback: ProviderEventCallback =
+            Arc::new(move |event| observed_events.lock().unwrap().push(event));
+        let (_stop, mut stop_rx) = watch::channel(false);
+        let socket = connect_with_retry(
+            &format!("ws://{address}/ws"),
+            true,
+            &mut stop_rx,
+            &event_callback,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(socket);
+        server.await.unwrap();
+
+        let states: Vec<_> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                ProviderEvent::Connection { state, .. } => Some(state.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            states,
+            [
+                ConnectionState::Connecting,
+                ConnectionState::Disconnected,
+                ConnectionState::Connecting,
+                ConnectionState::Connected,
+            ]
+        );
+        assert!(events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            ProviderEvent::Connection {
+                state: ConnectionState::Disconnected,
+                message: Some(message),
+            } if message.contains("failed to connect to coordinator")
+        )));
+    }
 }
