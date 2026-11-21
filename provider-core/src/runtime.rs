@@ -372,6 +372,7 @@ impl RuntimeManager {
             .arg("serve")
             .env("OLLAMA_HOST", format!("127.0.0.1:{port}"))
             .env("OLLAMA_MODELS", self.models_dir())
+            .env("OLLAMA_NO_CLOUD", "1")
             .current_dir(self.runtime_dir())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
