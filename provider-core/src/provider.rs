@@ -23,6 +23,19 @@ pub async fn run_provider(config: ProviderConfig) -> Result<()> {
     let model =
         std::env::var("OLLAMA_MODEL").unwrap_or(config.ollama_model.clone());
     let gpu = detect_gpu();
+    let payout_address = match config.payout_address.as_deref() {
+        Some(address) => match crate::validate_payout_address(address) {
+            Ok(()) => address.to_string(),
+            Err(error) => {
+                eprintln!(
+                    "WARNING: stored payout_address is invalid and will be sent as not-set: {}",
+                    error
+                );
+                "not-set".to_string()
+            }
+        },
+        None => "not-set".to_string(),
+    };
 
     println!("Connecting provider to {coordinator_url}");
     let (websocket, _response) = connect_async(coordinator_url)
@@ -35,9 +48,7 @@ pub async fn run_provider(config: ProviderConfig) -> Result<()> {
 
     let registration = WsMessage::Register(ProviderRegistration {
         provider_id: provider_id.clone(),
-        payout_address: config
-            .payout_address
-            .unwrap_or_else(|| "not-set".to_string()),
+        payout_address,
         gpu_name: gpu.gpu_name,
         gpu_memory: gpu.gpu_memory,
         model: model.clone(),

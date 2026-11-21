@@ -9,7 +9,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use provider_core::{
     config_dir, detect_gpu, load_config, ollama_is_installed,
-    ollama_model_is_installed, run_provider, save_config, ProviderConfig,
+    ollama_model_is_installed, run_provider, save_config, validate_payout_address,
+    ProviderConfig,
 };
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
@@ -63,6 +64,7 @@ fn validate_public_address(address: &str) -> Result<()> {
     {
         anyhow::bail!("Address must be 0x followed by exactly 40 hexadecimal characters.");
     }
+    validate_payout_address(trimmed)?;
     verify_eip55_checksum(trimmed)
 }
 
