@@ -25,9 +25,7 @@ impl ProviderConfig {
 pub fn validate_payout_address(address: &str) -> Result<()> {
     let address = address.trim();
     if address.len() != 42 {
-        anyhow::bail!(
-            "Payout address must be 0x followed by exactly 40 hexadecimal characters."
-        );
+        anyhow::bail!("Payout address must be 0x followed by exactly 40 hexadecimal characters.");
     }
     if !address.starts_with("0x") {
         anyhow::bail!("Payout address must start with 0x.");
@@ -38,9 +36,17 @@ pub fn validate_payout_address(address: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn set_payout_address(address: &str) -> Result<ProviderConfig> {
+    let address = address.trim();
+    validate_payout_address(address)?;
+    let mut config = load_config()?.unwrap_or_else(ProviderConfig::defaults);
+    config.payout_address = Some(address.to_string());
+    save_config(&config)?;
+    Ok(config)
+}
+
 pub fn config_dir() -> Result<PathBuf> {
-    let base =
-        dirs::config_dir().context("could not find the OS application config directory")?;
+    let base = dirs::config_dir().context("could not find the OS application config directory")?;
     Ok(base.join("GpuSwarm"))
 }
 
@@ -53,8 +59,8 @@ pub fn load_config() -> Result<Option<ProviderConfig>> {
     if !path.exists() {
         return Ok(None);
     }
-    let bytes =
-        std::fs::read(&path).with_context(|| format!("failed to read config: {}", path.display()))?;
+    let bytes = std::fs::read(&path)
+        .with_context(|| format!("failed to read config: {}", path.display()))?;
     let config: ProviderConfig = serde_json::from_slice(&bytes)
         .with_context(|| format!("failed to parse config: {}", path.display()))?;
     if let Some(address) = config.payout_address.as_deref() {

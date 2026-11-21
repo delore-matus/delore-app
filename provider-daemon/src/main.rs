@@ -160,6 +160,7 @@ fn runtime_progress_callback() -> RuntimeProgressCallback {
     let last_percent = Arc::new(AtomicU8::new(u8::MAX));
     Arc::new(move |state| match state {
         RuntimeState::Downloading {
+            phase,
             percent,
             bytes,
             expected_total_download_bytes,
@@ -170,8 +171,12 @@ fn runtime_progress_callback() -> RuntimeProgressCallback {
                 || percent == 100
                 || percent >= last.saturating_add(5)
             {
+                let action = match phase {
+                    provider_core::RuntimeDownloadPhase::Runtime => "Runtime",
+                    provider_core::RuntimeDownloadPhase::Model => "Model",
+                };
                 println!(
-                    "Runtime/model download: {percent}% ({bytes}/{expected_total_download_bytes} bytes)"
+                    "{action} download: {percent}% ({bytes} bytes transferred; expected combined download: {expected_total_download_bytes} bytes)"
                 );
                 last_percent.store(percent, Ordering::Relaxed);
             }

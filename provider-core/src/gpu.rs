@@ -1,8 +1,8 @@
 use std::process::Command;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GpuInfo {
     pub gpu_name: String,
     pub gpu_memory: String,
@@ -73,9 +73,7 @@ pub struct NvidiaDetector;
 fn classify_gpu_name(name: &str) -> GpuInfo {
     let lower = name.to_lowercase();
     if lower.contains("intel")
-        && (lower.contains("hd ")
-            || lower.contains("uhd")
-            || lower.contains("iris"))
+        && (lower.contains("hd ") || lower.contains("uhd") || lower.contains("iris"))
     {
         return GpuInfo {
             gpu_name: name.trim().to_string(),
@@ -220,8 +218,9 @@ mod tests {
 
     #[test]
     fn parses_single_adapter_object() {
-        let adapters =
-            parse_windows_adapters(r#"{"Name":"Intel(R) HD Graphics 520","AdapterRAM":1073741824}"#);
+        let adapters = parse_windows_adapters(
+            r#"{"Name":"Intel(R) HD Graphics 520","AdapterRAM":1073741824}"#,
+        );
         assert_eq!(adapters.len(), 1);
         assert_eq!(adapters[0].name, "Intel(R) HD Graphics 520");
     }

@@ -1,10 +1,15 @@
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use common::{FeeConfig, JobResult, ProviderRegistration, WsMessage};
 use futures_util::{SinkExt, StreamExt};
+use serde::Serialize;
+use tokio::sync::watch;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::{
-    detect_gpu, run_ollama, ProviderConfig, RunningRuntime, RuntimeManager, RuntimeProgressCallback,
+    detect_gpu, run_ollama, ProviderConfig, RunningRuntime, RuntimeManager,
+    RuntimeProgressCallback, RuntimeState,
 };
 
 #[derive(Debug, Clone)]
@@ -17,42 +22,189 @@ pub struct JobHistoryEntry {
     pub duration_ms: u128,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectionState {
+    Connecting,
+    Connected,
+    Disconnected,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "event", content = "payload", rename_all = "snake_case")]
+pub enum ProviderEvent {
+    Connection {
+        state: ConnectionState,
+        message: Option<String>,
+    },
+    FeeConfig {
+        config: FeeConfig,
+    },
+    JobStarted {
+        job_id: String,
+    },
+    JobFinished {
+        result: JobResult,
+    },
+    Error {
+        message: String,
+    },
+}
+
+pub type ProviderEventCallback = Arc<dyn Fn(ProviderEvent) + Send + Sync + 'static>;
+
+#[derive(Clone, Copy)]
+struct ProviderRunOptions {
+    confirmed_not_recommended: bool,
+    stop_after_job: bool,
+    handle_ctrl_c: bool,
+    use_environment_overrides: bool,
+}
+
 pub async fn run_provider(config: ProviderConfig) -> Result<()> {
-    run_provider_with_confirmation(config, false, false, std::sync::Arc::new(|_| {})).await
+    run_provider_with_confirmation(config, false, false, Arc::new(|_| {})).await
 }
 
 pub async fn run_provider_with_confirmation(
     config: ProviderConfig,
     confirmed_not_recommended: bool,
     stop_after_job: bool,
-    callback: RuntimeProgressCallback,
+    runtime_callback: RuntimeProgressCallback,
 ) -> Result<()> {
-    let model = std::env::var("OLLAMA_MODEL").unwrap_or(config.ollama_model.clone());
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let result = run_provider_inner(
+        config,
+        ProviderRunOptions {
+            confirmed_not_recommended,
+            stop_after_job,
+            handle_ctrl_c: true,
+            use_environment_overrides: true,
+        },
+        stop_rx,
+        runtime_callback,
+        Arc::new(|_| {}),
+    )
+    .await;
+    drop(stop_tx);
+    result
+}
+
+pub async fn run_provider_managed(
+    config: ProviderConfig,
+    confirmed_not_recommended: bool,
+    stop_rx: watch::Receiver<bool>,
+    runtime_callback: RuntimeProgressCallback,
+    event_callback: ProviderEventCallback,
+) -> Result<()> {
+    run_provider_inner(
+        config,
+        ProviderRunOptions {
+            confirmed_not_recommended,
+            stop_after_job: false,
+            handle_ctrl_c: false,
+            use_environment_overrides: false,
+        },
+        stop_rx,
+        runtime_callback,
+        event_callback,
+    )
+    .await
+}
+
+async fn run_provider_inner(
+    config: ProviderConfig,
+    options: ProviderRunOptions,
+    mut stop_rx: watch::Receiver<bool>,
+    runtime_callback: RuntimeProgressCallback,
+    event_callback: ProviderEventCallback,
+) -> Result<()> {
+    let model = if options.use_environment_overrides {
+        std::env::var("OLLAMA_MODEL").unwrap_or(config.ollama_model.clone())
+    } else {
+        config.ollama_model.clone()
+    };
     let runtime_manager = RuntimeManager::new()?;
-    let runtime_install = runtime_manager
-        .install(&model, confirmed_not_recommended, callback.clone())
-        .await?;
-    let model_size = runtime_install.model_download_bytes;
-    let runtime = runtime_manager.start(callback.clone()).await?;
+    let runtime_install = tokio::select! {
+        biased;
+        _ = wait_for_stop(&mut stop_rx) => {
+            runtime_callback(RuntimeState::Stopping);
+            runtime_callback(if runtime_manager.runtime_dir().exists() {
+                RuntimeState::Ready
+            } else {
+                RuntimeState::NotInstalled
+            });
+            emit_connection(&event_callback, ConnectionState::Disconnected, None);
+            return Ok(());
+        }
+        result = runtime_manager.install(
+            &model,
+            options.confirmed_not_recommended,
+            runtime_callback.clone(),
+        ) => result?,
+    };
+    let runtime = tokio::select! {
+        biased;
+        _ = wait_for_stop(&mut stop_rx) => {
+            runtime_callback(RuntimeState::Stopping);
+            runtime_callback(if runtime_manager.runtime_dir().exists() {
+                RuntimeState::Ready
+            } else {
+                RuntimeState::NotInstalled
+            });
+            emit_connection(&event_callback, ConnectionState::Disconnected, None);
+            return Ok(());
+        }
+        result = runtime_manager.start(runtime_callback.clone()) => result?,
+    };
     println!(
         "Managed Ollama runtime listening on 127.0.0.1:{}",
         runtime.port()
     );
 
     let operation = async {
-        runtime
-            .ensure_model(&model, model_size, callback.clone())
-            .await?;
-        run_provider_connection(config, model, &runtime, stop_after_job).await
+        let ensure_model = runtime.ensure_model_with_total(
+            &model,
+            runtime_install.model_download_bytes,
+            runtime_install.expected_total_download_bytes,
+            runtime_callback.clone(),
+        );
+        tokio::select! {
+            biased;
+            _ = wait_for_stop(&mut stop_rx) => return Ok(()),
+            result = ensure_model => result?,
+        }
+        if *stop_rx.borrow() {
+            return Ok(());
+        }
+        run_provider_connection(
+            config,
+            model,
+            &runtime,
+            options,
+            &mut stop_rx,
+            &event_callback,
+        )
+        .await
     }
     .await;
-    let shutdown = runtime.shutdown(callback.clone()).await;
+
+    let shutdown = runtime.shutdown(runtime_callback).await;
     match (operation, shutdown) {
         (Ok(()), Ok(())) => Ok(()),
-        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-        (Err(error), Err(shutdown_error)) => Err(error.context(format!(
-            "managed runtime shutdown also failed: {shutdown_error}"
-        ))),
+        (Err(error), Ok(())) => {
+            emit_failure(&event_callback, &error);
+            Err(error)
+        }
+        (Ok(()), Err(error)) => {
+            emit_failure(&event_callback, &error);
+            Err(error)
+        }
+        (Err(error), Err(shutdown_error)) => {
+            emit_failure(&event_callback, &error);
+            Err(error.context(format!(
+                "managed runtime shutdown also failed: {shutdown_error}"
+            )))
+        }
     }
 }
 
@@ -60,10 +212,20 @@ async fn run_provider_connection(
     config: ProviderConfig,
     model: String,
     runtime: &RunningRuntime,
-    stop_after_job: bool,
+    options: ProviderRunOptions,
+    stop_rx: &mut watch::Receiver<bool>,
+    event_callback: &ProviderEventCallback,
 ) -> Result<()> {
-    let coordinator_url = std::env::var("COORDINATOR_WS").unwrap_or(config.coordinator_ws.clone());
-    let provider_id = std::env::var("PROVIDER_ID").unwrap_or(config.provider_id.clone());
+    let coordinator_url = if options.use_environment_overrides {
+        std::env::var("COORDINATOR_WS").unwrap_or(config.coordinator_ws.clone())
+    } else {
+        config.coordinator_ws.clone()
+    };
+    let provider_id = if options.use_environment_overrides {
+        std::env::var("PROVIDER_ID").unwrap_or(config.provider_id.clone())
+    } else {
+        config.provider_id.clone()
+    };
     let gpu = detect_gpu();
     let payout_address = match config.payout_address.as_deref() {
         Some(address) => match crate::validate_payout_address(address) {
@@ -79,15 +241,30 @@ async fn run_provider_connection(
         None => "not-set".to_string(),
     };
 
+    emit_connection(event_callback, ConnectionState::Connecting, None);
     println!("Connecting provider to {coordinator_url}");
-    let (websocket, _response) = connect_async(coordinator_url)
-        .await
-        .context("failed to connect to coordinator; is it running?")?;
+    let connect = connect_async(coordinator_url);
+    let (websocket, _response) = tokio::select! {
+        biased;
+        _ = wait_for_stop(stop_rx) => {
+            emit_connection(event_callback, ConnectionState::Disconnected, None);
+            return Ok(());
+        }
+        result = connect => match result {
+            Ok(connection) => connection,
+            Err(error) => {
+            let error = anyhow::Error::from(error)
+                .context("failed to connect to coordinator; is it running?");
+            emit_failure(event_callback, &error);
+            return Err(error);
+            }
+        }
+    };
     println!("Provider connected");
+    emit_connection(event_callback, ConnectionState::Connected, None);
 
     let (mut sender, mut receiver) = websocket.split();
     let mut fee_config: Option<FeeConfig> = None;
-
     let registration = WsMessage::Register(ProviderRegistration {
         provider_id: provider_id.clone(),
         payout_address,
@@ -102,9 +279,14 @@ async fn run_provider_connection(
         .await
         .context("failed to send provider registration")?;
 
-    loop {
+    'connection: loop {
         let message = tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
+            biased;
+            _ = wait_for_stop(stop_rx) => {
+                let _ = sender.send(Message::Close(None)).await;
+                break;
+            }
+            _ = tokio::signal::ctrl_c(), if options.handle_ctrl_c => {
                 println!("Stopping GPU Swarm provider.");
                 break;
             }
@@ -123,14 +305,24 @@ async fn run_provider_connection(
                 match message {
                     WsMessage::Job(job) => {
                         println!("Received job");
-                        let result = run_ollama(
+                        event_callback(ProviderEvent::JobStarted {
+                            job_id: job.id.clone(),
+                        });
+                        let inference = run_ollama(
                             runtime.api_url(),
                             &job.id,
                             &provider_id,
                             &model,
                             &job.prompt,
-                        )
-                        .await;
+                        );
+                        let result = tokio::select! {
+                            biased;
+                            _ = wait_for_stop(stop_rx) => {
+                                let _ = sender.send(Message::Close(None)).await;
+                                break 'connection;
+                            }
+                            result = inference => result,
+                        };
 
                         let result: JobResult = match result {
                             Ok(result) => result,
@@ -145,12 +337,13 @@ async fn run_provider_connection(
                             },
                         };
 
-                        let result_json = serde_json::to_string(&WsMessage::Result(result))
+                        let result_json = serde_json::to_string(&WsMessage::Result(result.clone()))
                             .context("failed to serialize job result")?;
                         sender
                             .send(Message::Text(result_json))
                             .await
                             .context("failed to send job result")?;
+                        event_callback(ProviderEvent::JobFinished { result });
 
                         if let Some(fees) = &fee_config {
                             println!(
@@ -161,7 +354,7 @@ async fn run_provider_connection(
                             );
                         }
                         println!("Sent inference result for job {}", job.id);
-                        if stop_after_job {
+                        if options.stop_after_job {
                             println!("One-job mode complete; stopping provider.");
                             break;
                         }
@@ -178,6 +371,9 @@ async fn run_provider_connection(
                             fees.fee_bps, fees.provider_payout_units
                         );
                         println!("Platform fee recipient: {}", fees.fee_address);
+                        event_callback(ProviderEvent::FeeConfig {
+                            config: fees.clone(),
+                        });
                         fee_config = Some(fees);
                     }
                 }
@@ -192,12 +388,12 @@ async fn run_provider_connection(
             Message::Pong(_) => {}
             Message::Close(frame) => {
                 if let Some(frame) = frame {
-                    println!(
+                    let message = format!(
                         "Coordinator disconnected: code={} reason={}",
                         frame.code, frame.reason
                     );
-                } else {
-                    println!("Coordinator disconnected");
+                    println!("{message}");
+                    emit_connection(event_callback, ConnectionState::Disconnected, Some(message));
                 }
                 break;
             }
@@ -205,5 +401,33 @@ async fn run_provider_connection(
         }
     }
 
+    emit_connection(event_callback, ConnectionState::Disconnected, None);
     Ok(())
+}
+
+async fn wait_for_stop(stop_rx: &mut watch::Receiver<bool>) {
+    loop {
+        if *stop_rx.borrow() || stop_rx.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+fn emit_connection(
+    callback: &ProviderEventCallback,
+    state: ConnectionState,
+    message: Option<String>,
+) {
+    callback(ProviderEvent::Connection { state, message });
+}
+
+fn emit_failure(callback: &ProviderEventCallback, error: &anyhow::Error) {
+    callback(ProviderEvent::Error {
+        message: format!("{error:#}"),
+    });
+    emit_connection(
+        callback,
+        ConnectionState::Disconnected,
+        Some(format!("{error:#}")),
+    );
 }

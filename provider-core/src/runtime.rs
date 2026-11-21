@@ -9,7 +9,7 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::{process::Child, process::Command, time::timeout};
 
@@ -19,10 +19,19 @@ const CHECKSUMS_URL: &str =
 const REGISTRY_URL: &str = "https://registry.ollama.ai/v2";
 const UNPACKED_SPACE_MULTIPLIER: u64 = 4;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeDownloadPhase {
+    Runtime,
+    Model,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
 pub enum RuntimeState {
     NotInstalled,
     Downloading {
+        phase: RuntimeDownloadPhase,
         percent: u8,
         bytes: u64,
         expected_total_download_bytes: u64,
@@ -37,7 +46,8 @@ pub enum RuntimeState {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
 pub enum RuntimeSuitability {
     Suitable,
     NotRecommended { reason: String },
@@ -49,6 +59,7 @@ pub type RuntimeProgressCallback = Arc<dyn Fn(RuntimeState) + Send + Sync + 'sta
 pub struct RuntimeInstall {
     pub executable_path: PathBuf,
     pub model_download_bytes: u64,
+    pub expected_total_download_bytes: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -182,6 +193,7 @@ impl RuntimeManager {
             return Ok(RuntimeInstall {
                 executable_path: executable_path?,
                 model_download_bytes: 0,
+                expected_total_download_bytes: 0,
             });
         }
         callback(RuntimeState::NotInstalled);
@@ -209,6 +221,7 @@ impl RuntimeManager {
         let archive_path = self.data_dir.join(asset.archive_name());
         let part_path = self.data_dir.join(format!("{}.part", asset.archive_name()));
         callback(RuntimeState::Downloading {
+            phase: RuntimeDownloadPhase::Runtime,
             percent: 0,
             bytes: 0,
             expected_total_download_bytes: expected_download,
@@ -220,6 +233,7 @@ impl RuntimeManager {
             .is_ok_and(|metadata| metadata.len() == asset.size);
         if cached_archive {
             callback(RuntimeState::Downloading {
+                phase: RuntimeDownloadPhase::Runtime,
                 percent: 100,
                 bytes: asset.size,
                 expected_total_download_bytes: expected_download,
@@ -236,6 +250,7 @@ impl RuntimeManager {
                 &part_path,
                 asset.size,
                 expected_download,
+                RuntimeDownloadPhase::Runtime,
                 callback,
             )
             .await?;
@@ -314,6 +329,7 @@ impl RuntimeManager {
         Ok(RuntimeInstall {
             executable_path: self.executable_path()?,
             model_download_bytes: model_size,
+            expected_total_download_bytes: expected_download,
         })
     }
 
@@ -444,8 +460,24 @@ impl RunningRuntime {
         expected_model_bytes: u64,
         callback: RuntimeProgressCallback,
     ) -> Result<()> {
+        self.ensure_model_with_total(model, expected_model_bytes, expected_model_bytes, callback)
+            .await
+    }
+
+    pub async fn ensure_model_with_total(
+        &self,
+        model: &str,
+        expected_model_bytes: u64,
+        expected_total_download_bytes: u64,
+        callback: RuntimeProgressCallback,
+    ) -> Result<()> {
         match self
-            .ensure_model_inner(model, expected_model_bytes, &callback)
+            .ensure_model_inner(
+                model,
+                expected_model_bytes,
+                expected_total_download_bytes,
+                &callback,
+            )
             .await
         {
             Ok(()) => Ok(()),
@@ -462,6 +494,7 @@ impl RunningRuntime {
         &self,
         model: &str,
         expected_model_bytes: u64,
+        expected_total_download_bytes: u64,
         callback: &RuntimeProgressCallback,
     ) -> Result<()> {
         #[derive(serde::Serialize)]
@@ -504,13 +537,19 @@ impl RunningRuntime {
         } else {
             expected_model_bytes
         };
+        let expected_total_download_bytes = if expected_total_download_bytes == 0 {
+            expected_model_bytes
+        } else {
+            expected_total_download_bytes
+        };
         ensure_free_space(&self.models_dir, expected_model_bytes)
             .await
             .context("insufficient free disk space to download the model")?;
         callback(RuntimeState::Downloading {
+            phase: RuntimeDownloadPhase::Model,
             percent: 0,
             bytes: 0,
-            expected_total_download_bytes: expected_model_bytes,
+            expected_total_download_bytes,
         });
         let response = self
             .http
@@ -527,22 +566,32 @@ impl RunningRuntime {
         let mut stream = response.bytes_stream();
         use futures_util::StreamExt;
         let mut pending = Vec::new();
-        let mut latest_total = expected_model_bytes;
-        let mut latest_completed = 0_u64;
+        let mut layers = std::collections::HashMap::new();
         let mut finished = false;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.context("model download was interrupted; retry to resume")?;
             pending.extend_from_slice(&chunk);
             while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
                 let line: Vec<u8> = pending.drain(..=newline).collect();
-                if process_pull_progress(&line, callback, &mut latest_total, &mut latest_completed)?
-                {
+                if process_pull_progress(
+                    &line,
+                    callback,
+                    &mut layers,
+                    expected_model_bytes,
+                    expected_total_download_bytes,
+                )? {
                     finished = true;
                 }
             }
         }
         if !pending.is_empty()
-            && process_pull_progress(&pending, callback, &mut latest_total, &mut latest_completed)?
+            && process_pull_progress(
+                &pending,
+                callback,
+                &mut layers,
+                expected_model_bytes,
+                expected_total_download_bytes,
+            )?
         {
             finished = true;
         }
@@ -605,6 +654,7 @@ async fn model_download_size(http: &reqwest::Client, model: &str) -> Result<u64>
 #[derive(Deserialize)]
 struct PullProgress {
     status: Option<String>,
+    digest: Option<String>,
     total: Option<u64>,
     completed: Option<u64>,
     error: Option<String>,
@@ -613,34 +663,47 @@ struct PullProgress {
 fn process_pull_progress(
     line: &[u8],
     callback: &RuntimeProgressCallback,
-    total: &mut u64,
-    completed: &mut u64,
+    layers: &mut std::collections::HashMap<String, (u64, u64)>,
+    expected_model_bytes: u64,
+    expected_total_download_bytes: u64,
 ) -> Result<bool> {
     let progress: PullProgress =
         serde_json::from_slice(line).context("Ollama returned invalid model-download progress")?;
     if let Some(error) = progress.error {
         bail!("Ollama model download failed: {error}");
     }
+    let layer = layers
+        .entry(progress.digest.unwrap_or_else(|| "unknown".to_string()))
+        .or_insert((0, 0));
     if let Some(reported_total) = progress.total {
-        *total = reported_total;
+        layer.0 = reported_total;
     }
     if let Some(reported_completed) = progress.completed {
-        *completed = reported_completed;
+        layer.1 = reported_completed;
     }
     let finished = progress.status.as_deref() == Some("success");
+    let completed = if finished {
+        expected_model_bytes
+    } else {
+        layers
+            .values()
+            .fold(0_u64, |sum, (_, completed)| sum.saturating_add(*completed))
+            .min(expected_model_bytes)
+    };
     let percent = if finished {
         100
     } else {
-        (*completed)
+        completed
             .saturating_mul(100)
-            .checked_div(*total)
+            .checked_div(expected_model_bytes)
             .unwrap_or(0)
             .min(100) as u8
     };
     callback(RuntimeState::Downloading {
+        phase: RuntimeDownloadPhase::Model,
         percent,
-        bytes: *completed,
-        expected_total_download_bytes: *total,
+        bytes: completed,
+        expected_total_download_bytes,
     });
     Ok(finished)
 }
@@ -752,6 +815,7 @@ async fn download_resumable(
     destination: &Path,
     expected_size: u64,
     expected_total_download_bytes: u64,
+    phase: RuntimeDownloadPhase,
     callback: &RuntimeProgressCallback,
 ) -> Result<()> {
     use tokio::io::AsyncWriteExt;
@@ -761,6 +825,7 @@ async fn download_resumable(
         .is_ok_and(|metadata| metadata.len() == expected_size)
     {
         callback(RuntimeState::Downloading {
+            phase,
             percent: 100,
             bytes: expected_size,
             expected_total_download_bytes,
@@ -825,7 +890,8 @@ async fn download_resumable(
             bail!("runtime download exceeded the pinned archive size");
         }
         callback(RuntimeState::Downloading {
-            percent: ((received.saturating_mul(100) / expected_total_download_bytes).min(99)) as u8,
+            phase,
+            percent: ((received.saturating_mul(100) / expected_size).min(100)) as u8,
             bytes: received,
             expected_total_download_bytes,
         });
@@ -1054,7 +1120,7 @@ mod tests {
     use super::{
         download_resumable, ensure_download_confirmation, mach_header_supports_arch,
         parse_checksum_file, process_pull_progress, select_localhost_port, verify_sha256,
-        RuntimeProgressCallback, RuntimeState, RuntimeSuitability,
+        RuntimeDownloadPhase, RuntimeProgressCallback, RuntimeState, RuntimeSuitability,
     };
 
     #[test]
@@ -1088,6 +1154,7 @@ mod tests {
     #[test]
     fn download_state_exposes_expected_total() {
         let state = RuntimeState::Downloading {
+            phase: RuntimeDownloadPhase::Runtime,
             percent: 12,
             bytes: 120,
             expected_total_download_bytes: 1000,
@@ -1095,6 +1162,7 @@ mod tests {
         assert!(matches!(
             state,
             RuntimeState::Downloading {
+                phase: RuntimeDownloadPhase::Runtime,
                 expected_total_download_bytes: 1000,
                 ..
             }
@@ -1125,23 +1193,39 @@ mod tests {
         let callback: RuntimeProgressCallback = Arc::new(move |state| {
             observed.lock().unwrap().push(state);
         });
-        let mut total = 100;
-        let mut completed = 0;
+        let mut layers = std::collections::HashMap::new();
         assert!(!process_pull_progress(
-            br#"{"status":"downloading","total":100,"completed":25}"#,
+            br#"{"status":"downloading","digest":"layer-a","total":100,"completed":25}"#,
             &callback,
-            &mut total,
-            &mut completed,
+            &mut layers,
+            100,
+            1000,
         )
         .unwrap());
-        assert_eq!(total, 100);
-        assert_eq!(completed, 25);
         assert_eq!(
             states.lock().unwrap().last(),
             Some(&RuntimeState::Downloading {
+                phase: RuntimeDownloadPhase::Model,
                 percent: 25,
                 bytes: 25,
-                expected_total_download_bytes: 100,
+                expected_total_download_bytes: 1000,
+            })
+        );
+        assert!(!process_pull_progress(
+            br#"{"status":"downloading","digest":"layer-b","total":100,"completed":50}"#,
+            &callback,
+            &mut layers,
+            200,
+            1000,
+        )
+        .unwrap());
+        assert_eq!(
+            states.lock().unwrap().last(),
+            Some(&RuntimeState::Downloading {
+                phase: RuntimeDownloadPhase::Model,
+                percent: 37,
+                bytes: 75,
+                expected_total_download_bytes: 1000,
             })
         );
     }
@@ -1182,6 +1266,7 @@ mod tests {
             &partial_path,
             payload.len() as u64,
             payload.len() as u64,
+            RuntimeDownloadPhase::Runtime,
             &callback,
         )
         .await
