@@ -25,6 +25,19 @@ the saved config for that process without changing `config.json`. This is useful
 for running multiple test providers on one Windows machine. Real users normally
 need only one provider instance per machine.
 
+## GPU support status
+
+The provider reports GPU detection separately from GPU job support:
+
+- `nvidia-supported`: NVIDIA GPU detected by `nvidia-smi`.
+- `integrated-intel-unsupported`: Intel HD/UHD/Iris integrated graphics detected.
+  These GPUs are shown as not suitable for GPU jobs.
+- `integrated-amd-best-effort`: AMD/Radeon graphics detected with best-effort
+  detection only. ROCm-specific execution is not implemented.
+- `apple-silicon-best-effort`: Apple Silicon chip/GPU information detected.
+  Ollama may use Metal, but the app does not perform Metal-specific detection.
+- `none` or `other-best-effort`: no clearly supported GPU was identified.
+
 ## Fees
 
 The coordinator sets a platform fee for the mock job ledger. Providers do not
