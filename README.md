@@ -48,6 +48,24 @@ Configure it on the coordinator with `PLATFORM_FEE_BPS` from 0 to 5000 and
 This is bookkeeping only in test mode: no blockchain calls and no real money are
 used or paid.
 
+Set the coordinator's TESTNET fee recipient address before starting the
+coordinator:
+
+```powershell
+$env:GPUSWARM_FEE_ADDRESS="0x1111111111111111111111111111111111111111"
+cargo run -p coordinator
+```
+
+```bash
+export GPUSWARM_FEE_ADDRESS="0x1111111111111111111111111111111111111111"
+cargo run -p coordinator
+```
+
+The address must be `0x` followed by exactly 40 hexadecimal characters. For
+local testnet use only, `GPUSWARM_ALLOW_NO_FEE_ADDRESS=1` permits a missing
+address and emits a loud warning. Providers never configure or receive this
+address; it is coordinator/operator data only.
+
 ## Job reliability and disconnects
 
 A new job is queued and assigned once an idle provider is available. If a

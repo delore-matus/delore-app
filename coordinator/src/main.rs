@@ -70,6 +70,26 @@ fn calculate_fee(price_units: u64, fee_bps: u64) -> (u64, u64) {
     (fee, price_units - fee)
 }
 
+fn validate_fee_address(address: Option<&str>) -> Result<String> {
+    let address = address.unwrap_or("").trim();
+    if address.is_empty() {
+        anyhow::bail!("GPUSWARM_FEE_ADDRESS is missing");
+    }
+    if !address.starts_with("0x") {
+        anyhow::bail!("GPUSWARM_FEE_ADDRESS must start with 0x");
+    }
+    if address.len() != 42 {
+        if address.len() < 42 {
+            anyhow::bail!("GPUSWARM_FEE_ADDRESS is too short; expected 40 hex characters");
+        }
+        anyhow::bail!("GPUSWARM_FEE_ADDRESS is too long; expected 40 hex characters");
+    }
+    if !address[2..].chars().all(|ch| ch.is_ascii_hexdigit()) {
+        anyhow::bail!("GPUSWARM_FEE_ADDRESS contains non-hex characters");
+    }
+    Ok(address.to_string())
+}
+
 fn parse_fee_settings() -> Result<FeeSettings> {
     let fee_bps = std::env::var("PLATFORM_FEE_BPS")
         .unwrap_or_else(|_| "1000".to_string())
@@ -83,17 +103,22 @@ fn parse_fee_settings() -> Result<FeeSettings> {
         .unwrap_or_else(|_| "10000".to_string())
         .parse::<u64>()
         .context("JOB_PRICE_UNITS must be a non-negative integer")?;
-    let platform_address =
-        std::env::var("PLATFORM_ADDRESS").unwrap_or_else(|_| "0xPLATFORM_PLACEHOLDER".to_string());
-    if platform_address != "0xPLATFORM_PLACEHOLDER"
-        && (platform_address.len() != 42
-            || !platform_address.starts_with("0x")
-            || !platform_address[2..].chars().all(|c| c.is_ascii_hexdigit()))
-    {
-        anyhow::bail!(
-            "PLATFORM_ADDRESS must be a public 0x address; never configure a private key"
-        );
-    }
+    let configured_address = std::env::var("GPUSWARM_FEE_ADDRESS").ok();
+    let platform_address = match validate_fee_address(configured_address.as_deref()) {
+        Ok(address) => address,
+        Err(error) => {
+            if std::env::var("GPUSWARM_ALLOW_NO_FEE_ADDRESS").as_deref() == Ok("1") {
+                eprintln!(
+                    "WARNING: TESTNET ONLY - fee address is unavailable ({}); \
+                     GPUSWARM_ALLOW_NO_FEE_ADDRESS=1 is in effect",
+                    error
+                );
+                "0x0000000000000000000000000000000000000000".to_string()
+            } else {
+                return Err(error);
+            }
+        }
+    };
 
     Ok(FeeSettings {
         fee_bps,
@@ -522,7 +547,7 @@ async fn handle_websocket(socket: WebSocket, state: AppState) {
                             append_line(
                                 "earnings.log",
                                 &format!(
-                                    "timestamp={} job_id={} provider_id={} payout_address={} gross_price={} platform_fee={} provider_payout={} fee_bps={}",
+                                    "timestamp={} job_id={} provider_id={} payout_address={} gross_price={} platform_fee={} provider_payout={} fee_bps={} fee_address={} fee_amount={}",
                                     timestamp_millis(),
                                     result.job_id,
                                     result.provider_id,
@@ -535,7 +560,9 @@ async fn handle_websocket(socket: WebSocket, state: AppState) {
                                     receive_fees.job_price_units,
                                     platform_fee,
                                     provider_payout,
-                                    receive_fees.fee_bps
+                                    receive_fees.fee_bps,
+                                    receive_fees.platform_address,
+                                    platform_fee
                                 ),
                             );
                         } else {
@@ -789,7 +816,7 @@ mod tests {
     use super::{
         apply_completed_job_result, calculate_fee, fail_running_jobs_for_provider,
         assign_pending_job, AppState, FeeSettings, JobPayload, JobRecord, JobResult,
-        ProviderInfo,
+        ProviderInfo, validate_fee_address,
     };
     use std::{
         collections::{HashMap, VecDeque},
@@ -897,6 +924,38 @@ mod tests {
             record.error.as_deref(),
             Some("Provider disconnected while job was running")
         );
+    }
+
+    #[test]
+    fn fee_address_accepts_valid_address() {
+        let address = "0x1111111111111111111111111111111111111111";
+        assert_eq!(validate_fee_address(Some(address)).unwrap(), address);
+    }
+
+    #[test]
+    fn fee_address_rejects_empty_address() {
+        assert!(validate_fee_address(None).is_err());
+        assert!(validate_fee_address(Some("")).is_err());
+    }
+
+    #[test]
+    fn fee_address_rejects_missing_0x_prefix() {
+        assert!(validate_fee_address(Some("1111111111111111111111111111111111111111")).is_err());
+    }
+
+    #[test]
+    fn fee_address_rejects_too_short_address() {
+        assert!(validate_fee_address(Some("0x1234")).is_err());
+    }
+
+    #[test]
+    fn fee_address_rejects_too_long_address() {
+        assert!(validate_fee_address(Some("0x11111111111111111111111111111111111111111111")).is_err());
+    }
+
+    #[test]
+    fn fee_address_rejects_non_hex_characters() {
+        assert!(validate_fee_address(Some("0xzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz")).is_err());
     }
 
     #[tokio::test]
