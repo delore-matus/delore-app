@@ -4,6 +4,21 @@ This local Rust prototype coordinates provider daemons and an app-managed Ollama
 runtime. It is for testing on a local machine or testnet only; it does not use
 real money or private keys.
 
+## Desktop app shell
+
+The initial Tauri v2 status app lives in `desktop/` and shares provider logic
+through `provider-core`; it does not launch the CLI. Install Node.js and the
+Tauri prerequisites for your OS, then run `npm install` in `desktop/` and
+`cargo tauri dev` from that directory. `npm run build` checks TypeScript and
+builds the Vite frontend.
+
+This shell currently covers provider status, runtime/model progress, coordinator
+fees and connection state, job state, and validated payout-address editing.
+System tray, autostart, installers/bundles, and CI are intentionally not part
+of this step.
+The minimal Windows development icon is only a build resource; final platform
+icons remain part of the later bundling step.
+
 ## Configuration
 
 | Variable | Default | Used by |
