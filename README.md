@@ -1,8 +1,8 @@
 # GPU Swarm MVP
 
-This local Rust prototype coordinates provider daemons and a local Ollama server.
-It is for testing on a local machine or testnet only; it does not use real money
-or private keys.
+This local Rust prototype coordinates provider daemons and an app-managed Ollama
+runtime. It is for testing on a local machine or testnet only; it does not use
+real money or private keys.
 
 ## Configuration
 
@@ -10,7 +10,7 @@ or private keys.
 |---|---|---|
 | `COORDINATOR_WS` | `ws://127.0.0.1:8081/ws` | Provider WebSocket URL |
 | `PROVIDER_ID` | `provider-node-01` | Provider identity |
-| `OLLAMA_MODEL` | `llama3.2:3b` | Ollama model for inference |
+| `OLLAMA_MODEL` | `llama3.2:3b` | Model fetched by the managed inference runtime |
 
 Set variables in PowerShell before starting a process, for example:
 
@@ -24,6 +24,63 @@ For local testing only, set `PROVIDER_ID` before starting a provider to override
 the saved config for that process without changing `config.json`. This is useful
 for running multiple test providers on one Windows machine. Real users normally
 need only one provider instance per machine.
+
+## Managed inference runtime
+
+The provider downloads and manages Ollama v0.40.17 on first start. It uses plain
+official release archives, never the Windows installer or macOS disk image.
+The SHA-256 values for the supported archives are pinned in provider-core and
+cross-checked against the official `sha256sum.txt` fetched over HTTPS at runtime;
+downloaded archives are rejected if either checksum does not match.
+
+| Platform | Archive |
+|---|---|
+| Windows x64 | `ollama-windows-amd64.zip` (~1.51 GiB) |
+| Windows ARM64 | `ollama-windows-arm64.zip` |
+| Linux x64 | `ollama-linux-amd64.tar.zst` (~1.44 GiB) |
+| Linux ARM64 | `ollama-linux-arm64.tar.zst` |
+| macOS | `ollama-darwin.tgz` (~179 MiB) |
+
+ROCm and MLX add-on archives are not downloaded. Downloads resume from a partial
+archive where the server supports HTTP range requests. Before downloading, the
+provider queries the selected model manifest, displays the combined runtime
+archive plus model download size, and checks free space for the archive,
+conservative extraction reserve, and model. It checks the actual extracted
+archive size again before extraction. `provider-core` reports progress through
+`RuntimeState` callbacks, including the expected combined download bytes before
+the transfer starts.
+
+Runtime files and models are kept under the OS-local application data directory:
+
+- Windows: `%LOCALAPPDATA%\GpuSwarm\runtime` and `%LOCALAPPDATA%\GpuSwarm\models`
+- macOS: `~/Library/Application Support/GpuSwarm/runtime` and
+  `~/Library/Application Support/GpuSwarm/models`
+- Linux: `$XDG_DATA_HOME/GpuSwarm/runtime` and
+  `$XDG_DATA_HOME/GpuSwarm/models` (normally `~/.local/share/GpuSwarm`)
+
+The app starts the bundled executable directly, sets `OLLAMA_MODELS` to its
+private model directory, and binds the API to a dynamically selected
+`127.0.0.1` port. The process is stopped with the provider. The app does not
+install Ollama system-wide, change `PATH`, create services, or modify the
+registry. Any system Ollama installation is ignored.
+For a single-job integration test, run `gpuswarm start --once`; the provider
+shuts the managed runtime down after returning that job result.
+
+Intel integrated graphics, unsupported/unknown GPUs, and CPU-only systems are
+marked not recommended. The CLI asks for explicit confirmation before runtime
+download on those machines; inference can then run on CPU. The macOS archive
+binary is checked against the machine architecture at runtime. macOS behavior
+has not been built or run on this Windows development machine.
+
+The `zstd` crate decodes Linux `.tar.zst` archives in-process, without requiring
+an installed `zstd` executable. The `tar` crate reads and extracts the tar
+payload in-process, without requiring system tar tooling.
+
+`OLLAMA_MODEL` remains configurable. Use `llama3.2:1b` for a smaller development
+model, for example `$env:OLLAMA_MODEL = "llama3.2:1b"` in PowerShell. The
+default `llama3.2:3b` model is subject to Meta's Llama 3.2 Community License,
+including attribution requirements. TODO: review model licensing before any
+commercial release.
 
 ## GPU support status
 

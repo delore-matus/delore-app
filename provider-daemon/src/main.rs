@@ -2,15 +2,18 @@
 
 use std::{
     io::{self, Write},
-    process::Command,
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        Arc,
+    },
 };
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use provider_core::{
-    config_dir, detect_gpu, load_config, ollama_is_installed,
-    ollama_model_is_installed, run_provider, save_config, validate_payout_address,
-    ProviderConfig,
+    config_dir, detect_gpu, load_config, run_provider_with_confirmation, runtime_suitability,
+    save_config, validate_payout_address, ProviderConfig, RuntimeManager, RuntimeProgressCallback,
+    RuntimeState, RuntimeSuitability,
 };
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
@@ -25,7 +28,10 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Setup,
-    Start,
+    Start {
+        #[arg(long)]
+        once: bool,
+    },
     Status,
     Config {
         #[command(subcommand)]
@@ -107,40 +113,15 @@ fn run_setup() -> Result<()> {
         println!("Integrated GPU, not supported: jobs run on CPU.");
     }
 
-    if !ollama_is_installed() {
-        println!("Ollama is not installed.");
-        println!("Official download: https://ollama.com/download");
-
-        #[cfg(target_os = "windows")]
-        if confirm("Install Ollama with winget now?")? {
-            let status = Command::new("winget")
-                .args(["install", "--id", "Ollama.Ollama", "-e"])
-                .status()
-                .context("failed to start winget")?;
-            if !status.success() {
-                println!("Warning: Ollama installation did not complete successfully.");
-            }
-        }
-    } else {
-        println!("Ollama is installed.");
-    }
-
     let existing = load_config()?.unwrap_or_else(ProviderConfig::defaults);
     let model = std::env::var("OLLAMA_MODEL").unwrap_or(existing.ollama_model.clone());
-
-    if ollama_is_installed() && !ollama_model_is_installed(&model) {
-        println!("Ollama model '{model}' is not installed.");
-        println!("Download model: ollama pull {model}");
-        if confirm("Download this Ollama model now?")? {
-            let status = Command::new("ollama")
-                .args(["pull", &model])
-                .status()
-                .context("failed to start ollama pull")?;
-            if !status.success() {
-                println!("Warning: model download did not complete successfully.");
-            }
-        } else {
-            println!("Model download skipped.");
+    match runtime_suitability() {
+        RuntimeSuitability::Suitable => {
+            println!("Managed Ollama runtime will be prepared on first start.");
+        }
+        RuntimeSuitability::NotRecommended { reason } => {
+            println!("Not recommended: {reason}");
+            println!("Managed Ollama runtime will be prepared only after explicit confirmation.");
         }
     }
 
@@ -164,13 +145,35 @@ fn run_setup() -> Result<()> {
 
     let mut config = existing;
     config.payout_address = Some(address);
-    config.coordinator_ws =
-        std::env::var("COORDINATOR_WS").unwrap_or(config.coordinator_ws);
+    config.coordinator_ws = std::env::var("COORDINATOR_WS").unwrap_or(config.coordinator_ws);
     config.ollama_model = model;
     save_config(&config)?;
-    println!("Saved config to {}", provider_core::config_path()?.display());
+    println!(
+        "Saved config to {}",
+        provider_core::config_path()?.display()
+    );
     println!("Setup complete. Run: gpuswarm start");
     Ok(())
+}
+
+fn runtime_progress_callback() -> RuntimeProgressCallback {
+    let last_percent = Arc::new(AtomicU8::new(0));
+    Arc::new(move |state| match state {
+        RuntimeState::Downloading {
+            percent,
+            bytes,
+            expected_total_download_bytes,
+        } => {
+            let last = last_percent.load(Ordering::Relaxed);
+            if percent == 0 || percent == 100 || percent >= last.saturating_add(5) {
+                println!(
+                    "Runtime/model download: {percent}% ({bytes}/{expected_total_download_bytes} bytes)"
+                );
+                last_percent.store(percent, Ordering::Relaxed);
+            }
+        }
+        state => println!("Runtime: {state:?}"),
+    })
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -221,9 +224,8 @@ async fn print_status() -> Result<()> {
     }
 
     if let Some(config) = config {
-        let url = coordinator_http_url(
-            &std::env::var("COORDINATOR_WS").unwrap_or(config.coordinator_ws),
-        );
+        let url =
+            coordinator_http_url(&std::env::var("COORDINATOR_WS").unwrap_or(config.coordinator_ws));
         match reqwest::Client::new().get(url).send().await {
             Ok(response) if response.status().is_success() => {
                 match response.json::<FeesStatus>().await {
@@ -251,10 +253,15 @@ async fn print_status() -> Result<()> {
     if gpu.support == "integrated-intel-unsupported" {
         println!("Integrated GPU, not supported: jobs run on CPU.");
     }
-    if ollama_is_installed() {
-        println!("Ollama: installed");
+    let runtime = RuntimeManager::new()?;
+    if runtime.runtime_dir().exists() {
+        runtime.executable_path()?;
+        println!(
+            "Managed runtime: ready (v{})",
+            provider_core::runtime::OLLAMA_VERSION
+        );
     } else {
-        println!("Ollama: not detected");
+        println!("Managed runtime: not installed");
     }
     Ok(())
 }
@@ -264,10 +271,33 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Setup => run_setup()?,
-        Commands::Start => {
-            let config = load_config()?
-                .ok_or_else(|| anyhow::anyhow!("GPU Swarm is not configured. Run `gpuswarm setup` first."))?;
-            run_provider(config).await?;
+        Commands::Start { once } => {
+            let config = load_config()?.ok_or_else(|| {
+                anyhow::anyhow!("GPU Swarm is not configured. Run `gpuswarm setup` first.")
+            })?;
+            let runtime_needs_download = !RuntimeManager::new()?.runtime_dir().exists();
+            let confirmed_not_recommended = if runtime_needs_download {
+                match runtime_suitability() {
+                    RuntimeSuitability::Suitable => false,
+                    RuntimeSuitability::NotRecommended { reason } => {
+                        println!("Not recommended: {reason}");
+                        if !confirm("Continue with managed runtime preparation and CPU inference?")?
+                        {
+                            anyhow::bail!("runtime preparation cancelled");
+                        }
+                        true
+                    }
+                }
+            } else {
+                false
+            };
+            run_provider_with_confirmation(
+                config,
+                confirmed_not_recommended,
+                once,
+                runtime_progress_callback(),
+            )
+            .await?;
         }
         Commands::Status => print_status().await?,
         Commands::Config { command: None } => match load_config()? {
@@ -281,7 +311,10 @@ async fn main() -> Result<()> {
             let mut config = load_config()?.unwrap_or_else(ProviderConfig::defaults);
             config.payout_address = Some(address.trim().to_string());
             save_config(&config)?;
-            println!("Saved config to {}", config_dir()?.join("config.json").display());
+            println!(
+                "Saved config to {}",
+                config_dir()?.join("config.json").display()
+            );
         }
         Commands::Uninstall => {
             if confirm("Delete the GpuSwarm configuration?")? {

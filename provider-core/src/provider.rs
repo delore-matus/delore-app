@@ -18,12 +18,13 @@ pub struct JobHistoryEntry {
 }
 
 pub async fn run_provider(config: ProviderConfig) -> Result<()> {
-    run_provider_with_confirmation(config, false, std::sync::Arc::new(|_| {})).await
+    run_provider_with_confirmation(config, false, false, std::sync::Arc::new(|_| {})).await
 }
 
 pub async fn run_provider_with_confirmation(
     config: ProviderConfig,
     confirmed_not_recommended: bool,
+    stop_after_job: bool,
     callback: RuntimeProgressCallback,
 ) -> Result<()> {
     let model = std::env::var("OLLAMA_MODEL").unwrap_or(config.ollama_model.clone());
@@ -42,7 +43,7 @@ pub async fn run_provider_with_confirmation(
         runtime
             .ensure_model(&model, model_size, callback.clone())
             .await?;
-        run_provider_connection(config, model, &runtime).await
+        run_provider_connection(config, model, &runtime, stop_after_job).await
     }
     .await;
     let shutdown = runtime.shutdown(callback.clone()).await;
@@ -59,6 +60,7 @@ async fn run_provider_connection(
     config: ProviderConfig,
     model: String,
     runtime: &RunningRuntime,
+    stop_after_job: bool,
 ) -> Result<()> {
     let coordinator_url = std::env::var("COORDINATOR_WS").unwrap_or(config.coordinator_ws.clone());
     let provider_id = std::env::var("PROVIDER_ID").unwrap_or(config.provider_id.clone());
@@ -159,6 +161,10 @@ async fn run_provider_connection(
                             );
                         }
                         println!("Sent inference result for job {}", job.id);
+                        if stop_after_job {
+                            println!("One-job mode complete; stopping provider.");
+                            break;
+                        }
                     }
                     WsMessage::Result(result) => {
                         println!("Ignoring unexpected result message: {result:?}");
