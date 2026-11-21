@@ -179,10 +179,9 @@ impl RuntimeManager {
                     self.runtime_dir().display()
                 )
             });
-            let model_download_bytes = self.model_download_size(model).await?;
             return Ok(RuntimeInstall {
                 executable_path: executable_path?,
-                model_download_bytes,
+                model_download_bytes: 0,
             });
         }
         callback(RuntimeState::NotInstalled);
@@ -346,35 +345,7 @@ impl RuntimeManager {
     }
 
     pub async fn model_download_size(&self, model: &str) -> Result<u64> {
-        let (name, tag) = model.rsplit_once(':').unwrap_or((model, "latest"));
-        let name = name.strip_prefix("registry.ollama.ai/").unwrap_or(name);
-        let name = if name.contains('/') {
-            name.to_string()
-        } else {
-            format!("library/{name}")
-        };
-        let url = format!("{REGISTRY_URL}/{name}/manifests/{tag}");
-        let response = self
-            .http
-            .get(url)
-            .header(
-                reqwest::header::ACCEPT,
-                "application/vnd.docker.distribution.manifest.v2+json",
-            )
-            .send()
-            .await
-            .context("could not reach the model registry; check your internet connection")?
-            .error_for_status()
-            .context("model registry returned an error while estimating model size")?;
-        let manifest: RegistryManifest = response
-            .json()
-            .await
-            .context("model registry returned an invalid model manifest")?;
-        manifest.layers.iter().try_fold(0_u64, |total, layer| {
-            total
-                .checked_add(layer.size)
-                .context("model manifest size overflowed")
-        })
+        model_download_size(&self.http, model).await
     }
 
     pub async fn start(&self, callback: RuntimeProgressCallback) -> Result<RunningRuntime> {
@@ -527,6 +498,11 @@ impl RunningRuntime {
             callback(RuntimeState::Running);
             return Ok(());
         }
+        let expected_model_bytes = if expected_model_bytes == 0 {
+            model_download_size(&self.http, model).await?
+        } else {
+            expected_model_bytes
+        };
         ensure_free_space(&self.models_dir, expected_model_bytes)
             .await
             .context("insufficient free disk space to download the model")?;
@@ -592,6 +568,37 @@ impl RunningRuntime {
         callback(RuntimeState::Ready);
         Ok(())
     }
+}
+
+async fn model_download_size(http: &reqwest::Client, model: &str) -> Result<u64> {
+    let (name, tag) = model.rsplit_once(':').unwrap_or((model, "latest"));
+    let name = name.strip_prefix("registry.ollama.ai/").unwrap_or(name);
+    let name = if name.contains('/') {
+        name.to_string()
+    } else {
+        format!("library/{name}")
+    };
+    let url = format!("{REGISTRY_URL}/{name}/manifests/{tag}");
+    let response = http
+        .get(url)
+        .header(
+            reqwest::header::ACCEPT,
+            "application/vnd.docker.distribution.manifest.v2+json",
+        )
+        .send()
+        .await
+        .context("could not reach the model registry; check your internet connection")?
+        .error_for_status()
+        .context("model registry returned an error while estimating model size")?;
+    let manifest: RegistryManifest = response
+        .json()
+        .await
+        .context("model registry returned an invalid model manifest")?;
+    manifest.layers.iter().try_fold(0_u64, |total, layer| {
+        total
+            .checked_add(layer.size)
+            .context("model manifest size overflowed")
+    })
 }
 
 #[derive(Deserialize)]
