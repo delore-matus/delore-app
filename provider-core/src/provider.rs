@@ -8,7 +8,7 @@ use tokio::sync::watch;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::{
-    detect_gpu, run_ollama, ProviderConfig, RunningRuntime, RuntimeManager,
+    detect_gpu, effective_ollama_model, run_ollama, ProviderConfig, RunningRuntime, RuntimeManager,
     RuntimeProgressCallback, RuntimeState,
 };
 
@@ -58,7 +58,7 @@ struct ProviderRunOptions {
     confirmed_not_recommended: bool,
     stop_after_job: bool,
     handle_ctrl_c: bool,
-    use_environment_overrides: bool,
+    use_cli_environment_overrides: bool,
 }
 
 pub async fn run_provider(config: ProviderConfig) -> Result<()> {
@@ -78,7 +78,7 @@ pub async fn run_provider_with_confirmation(
             confirmed_not_recommended,
             stop_after_job,
             handle_ctrl_c: true,
-            use_environment_overrides: true,
+            use_cli_environment_overrides: true,
         },
         stop_rx,
         runtime_callback,
@@ -102,7 +102,7 @@ pub async fn run_provider_managed(
             confirmed_not_recommended,
             stop_after_job: false,
             handle_ctrl_c: false,
-            use_environment_overrides: false,
+            use_cli_environment_overrides: false,
         },
         stop_rx,
         runtime_callback,
@@ -118,11 +118,7 @@ async fn run_provider_inner(
     runtime_callback: RuntimeProgressCallback,
     event_callback: ProviderEventCallback,
 ) -> Result<()> {
-    let model = if options.use_environment_overrides {
-        std::env::var("OLLAMA_MODEL").unwrap_or(config.ollama_model.clone())
-    } else {
-        config.ollama_model.clone()
-    };
+    let model = effective_ollama_model(&config)?.effective;
     let runtime_manager = RuntimeManager::new()?;
     let runtime_install = tokio::select! {
         biased;
@@ -216,12 +212,12 @@ async fn run_provider_connection(
     stop_rx: &mut watch::Receiver<bool>,
     event_callback: &ProviderEventCallback,
 ) -> Result<()> {
-    let coordinator_url = if options.use_environment_overrides {
+    let coordinator_url = if options.use_cli_environment_overrides {
         std::env::var("COORDINATOR_WS").unwrap_or(config.coordinator_ws.clone())
     } else {
         config.coordinator_ws.clone()
     };
-    let provider_id = if options.use_environment_overrides {
+    let provider_id = if options.use_cli_environment_overrides {
         std::env::var("PROVIDER_ID").unwrap_or(config.provider_id.clone())
     } else {
         config.provider_id.clone()
@@ -243,7 +239,7 @@ async fn run_provider_connection(
 
     let Some(websocket) = connect_with_retry(
         &coordinator_url,
-        !options.use_environment_overrides,
+        !options.use_cli_environment_overrides,
         stop_rx,
         event_callback,
     )

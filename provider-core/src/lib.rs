@@ -7,7 +7,8 @@ pub mod provider;
 pub mod runtime;
 
 pub use config::{
-    config_dir, config_path, load_config, save_config, set_payout_address, validate_payout_address,
+    config_dir, config_path, effective_ollama_model, load_config, save_config, set_ollama_model,
+    set_payout_address, validate_ollama_model, validate_payout_address, OllamaModelSelection,
     ProviderConfig,
 };
 pub use gpu::{detect_gpu, parse_windows_adapters, GpuInfo, WindowsAdapter};

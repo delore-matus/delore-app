@@ -631,6 +631,7 @@ async fn model_download_size(http: &reqwest::Client, model: &str) -> Result<u64>
     let url = format!("{REGISTRY_URL}/{name}/manifests/{tag}");
     let response = http
         .get(url)
+        .timeout(Duration::from_secs(8))
         .header(
             reqwest::header::ACCEPT,
             "application/vnd.docker.distribution.manifest.v2+json",

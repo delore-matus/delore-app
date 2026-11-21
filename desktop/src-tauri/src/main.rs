@@ -4,9 +4,10 @@ use std::sync::{
 };
 
 use provider_core::{
-    detect_gpu, load_config, run_provider_managed, runtime_suitability, FeeConfig, GpuInfo,
-    ProviderConfig, ProviderEvent, ProviderEventCallback, RuntimeDownloadPhase, RuntimeManager,
-    RuntimeProgressCallback, RuntimeState, RuntimeSuitability,
+    detect_gpu, effective_ollama_model, load_config, run_provider_managed, runtime_suitability,
+    set_ollama_model as save_ollama_model, FeeConfig, GpuInfo, ProviderConfig, ProviderEvent,
+    ProviderEventCallback, RuntimeDownloadPhase, RuntimeManager, RuntimeProgressCallback,
+    RuntimeState, RuntimeSuitability,
 };
 use serde::Serialize;
 use tauri::{Emitter, Manager, State, WindowEvent};
@@ -37,7 +38,12 @@ struct StatusSnapshot {
     current_job: CurrentJob,
     payout_address: Option<String>,
     coordinator_ws: String,
-    model: String,
+    configured_model: String,
+    effective_model: String,
+    model_override_active: bool,
+    configured_model_download_bytes: Option<u64>,
+    effective_model_download_bytes: Option<u64>,
+    model_size_error: Option<String>,
     runtime_percent: u8,
     model_percent: u8,
     expected_total_download_bytes: Option<u64>,
@@ -83,6 +89,8 @@ impl DesktopState {
             RuntimeState::Error { message } => Some(message.clone()),
             _ => None,
         };
+        let configured_model = config.ollama_model.clone();
+        let (effective_model, model_override_active, model_error) = model_status_selection(&config);
         let snapshot = StatusSnapshot {
             provider_running: false,
             runtime,
@@ -93,11 +101,16 @@ impl DesktopState {
             current_job: CurrentJob::Idle,
             payout_address: config.payout_address,
             coordinator_ws: config.coordinator_ws,
-            model: config.ollama_model,
+            configured_model,
+            effective_model,
+            model_override_active,
+            configured_model_download_bytes: None,
+            effective_model_download_bytes: None,
+            model_size_error: None,
             runtime_percent: 0,
             model_percent: 0,
             expected_total_download_bytes: None,
-            error_message: error_message.or(runtime_error),
+            error_message: error_message.or(runtime_error).or(model_error),
         };
         Self {
             inner: Arc::new(StateInner {
@@ -112,14 +125,28 @@ impl DesktopState {
 }
 
 #[tauri::command]
-fn get_status(state: State<'_, DesktopState>) -> Result<StatusSnapshot, String> {
-    state
-        .inner()
-        .inner
+async fn get_status(state: State<'_, DesktopState>) -> Result<StatusSnapshot, String> {
+    let inner = state.inner().inner.clone();
+    let mut snapshot = inner
         .snapshot
         .lock()
-        .map(|snapshot| snapshot.clone())
-        .map_err(|error| format!("Provider status is unavailable: {error}"))
+        .map_err(|error| format!("Provider status is unavailable: {error}"))?
+        .clone();
+    populate_model_download_sizes(&mut snapshot).await;
+    let mut stored = inner
+        .snapshot
+        .lock()
+        .map_err(|error| format!("Provider status is unavailable: {error}"))?;
+    if stored.configured_model == snapshot.configured_model
+        && stored.effective_model == snapshot.effective_model
+    {
+        stored.configured_model_download_bytes = snapshot.configured_model_download_bytes;
+        stored.effective_model_download_bytes = snapshot.effective_model_download_bytes;
+        stored.model_size_error = snapshot.model_size_error;
+        Ok(stored.clone())
+    } else {
+        Ok(stored.clone())
+    }
 }
 
 #[tauri::command]
@@ -144,6 +171,7 @@ async fn start_provider(
     let config = load_config()
         .map_err(|error| format!("Could not load provider configuration: {error:#}"))?
         .unwrap_or_else(ProviderConfig::defaults);
+    let selection = effective_ollama_model(&config).map_err(|error| format!("{error:#}"))?;
     let runtime_manager =
         RuntimeManager::new().map_err(|error| format!("Runtime paths unavailable: {error:#}"))?;
     let requires_confirmation = requires_runtime_confirmation(
@@ -184,7 +212,9 @@ async fn start_provider(
         snapshot.current_job = CurrentJob::Idle;
         snapshot.error_message = None;
         snapshot.coordinator_ws = config.coordinator_ws.clone();
-        snapshot.model = config.ollama_model.clone();
+        snapshot.configured_model = selection.configured;
+        snapshot.effective_model = selection.effective;
+        snapshot.model_override_active = selection.environment_override;
         snapshot.runtime_percent = 0;
         snapshot.model_percent = 0;
         snapshot.expected_total_download_bytes = None;
@@ -298,10 +328,81 @@ fn set_payout_address(
     update_status(&state.inner().inner, &app, |snapshot| {
         snapshot.payout_address = config.payout_address;
         snapshot.coordinator_ws = config.coordinator_ws;
-        snapshot.model = config.ollama_model;
         snapshot.error_message = None;
     });
-    get_status(state)
+    state
+        .inner()
+        .inner
+        .snapshot
+        .lock()
+        .map(|snapshot| snapshot.clone())
+        .map_err(|error| format!("Provider status is unavailable: {error}"))
+}
+
+#[tauri::command]
+async fn set_ollama_model(
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    model: String,
+) -> Result<StatusSnapshot, String> {
+    let config = save_ollama_model(&model).map_err(|error| format!("{error:#}"))?;
+    let (effective_model, model_override_active, model_error) = model_status_selection(&config);
+    update_status(&state.inner().inner, &app, |snapshot| {
+        snapshot.configured_model = config.ollama_model;
+        snapshot.effective_model = effective_model;
+        snapshot.model_override_active = model_override_active;
+        snapshot.configured_model_download_bytes = None;
+        snapshot.effective_model_download_bytes = None;
+        snapshot.model_size_error = None;
+        snapshot.error_message = model_error;
+    });
+    get_status(state).await
+}
+
+fn model_status_selection(config: &ProviderConfig) -> (String, bool, Option<String>) {
+    match effective_ollama_model(config) {
+        Ok(selection) => (selection.effective, selection.environment_override, None),
+        Err(error) => (
+            std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| config.ollama_model.clone()),
+            std::env::var_os("OLLAMA_MODEL").is_some(),
+            Some(error.to_string()),
+        ),
+    }
+}
+
+async fn populate_model_download_sizes(snapshot: &mut StatusSnapshot) {
+    let manager = match RuntimeManager::new() {
+        Ok(manager) => manager,
+        Err(error) => {
+            snapshot.model_size_error = Some(error.to_string());
+            return;
+        }
+    };
+    let configured = manager
+        .model_download_size(&snapshot.configured_model)
+        .await;
+    snapshot.configured_model_download_bytes = configured.as_ref().ok().copied();
+    let mut errors = Vec::new();
+    if let Err(error) = &configured {
+        errors.push(format!("saved model: {error:#}"));
+    }
+    if snapshot.effective_model == snapshot.configured_model {
+        snapshot.effective_model_download_bytes = snapshot.configured_model_download_bytes;
+    } else {
+        let effective = manager.model_download_size(&snapshot.effective_model).await;
+        snapshot.effective_model_download_bytes = effective.as_ref().ok().copied();
+        if let Err(error) = effective {
+            errors.push(format!("OLLAMA_MODEL override: {error:#}"));
+        }
+    }
+    snapshot.model_size_error = if errors.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "Could not estimate model download size: {}",
+            errors.join("; ")
+        ))
+    };
 }
 
 async fn stop_provider_task(app: &tauri::AppHandle, state: &DesktopState) -> Result<(), String> {
@@ -388,7 +489,8 @@ fn main() {
             start_provider,
             stop_provider,
             confirm_runtime_download,
-            set_payout_address
+            set_payout_address,
+            set_ollama_model
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {

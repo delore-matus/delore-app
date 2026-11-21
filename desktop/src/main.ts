@@ -38,7 +38,12 @@ interface StatusSnapshot {
   current_job: CurrentJob
   payout_address: string | null
   coordinator_ws: string
-  model: string
+  configured_model: string
+  effective_model: string
+  model_override_active: boolean
+  configured_model_download_bytes: number | null
+  effective_model_download_bytes: number | null
+  model_size_error: string | null
   runtime_percent: number
   model_percent: number
   expected_total_download_bytes: number | null
@@ -51,6 +56,8 @@ if (!root) throw new Error('App root element is missing')
 let snapshot: StatusSnapshot | null = null
 let addressError = ''
 let addressSuccess = ''
+let modelError = ''
+let modelSuccess = ''
 let working = false
 
 root.innerHTML = `
@@ -92,6 +99,20 @@ root.innerHTML = `
         <p class="muted" id="download-size"></p>
       </div>
       <p class="muted" id="runtime-detail">Reading runtime state…</p>
+      <form class="model-form" id="model-form" novalidate>
+        <label for="ollama-model">Configured Ollama model</label>
+        <div class="address-form">
+          <input id="ollama-model" name="ollama-model" type="text" autocomplete="off"
+            spellcheck="false" placeholder="llama3.2:3b" />
+          <button class="button button-secondary" id="save-model" type="submit">Save model</button>
+        </div>
+        <p class="muted" id="configured-model-size">Checking model download size…</p>
+        <p class="warning-text" id="model-override" hidden></p>
+        <p class="muted" id="effective-model-size" hidden></p>
+        <p class="field-error" id="model-error" role="alert" hidden></p>
+        <p class="field-success" id="model-success" role="status" hidden></p>
+        <p class="muted" id="model-restart-note">Changes apply the next time the provider starts.</p>
+      </form>
     </section>
 
     <div class="details-grid">
@@ -180,6 +201,8 @@ function renderStatus(): void {
   const status = snapshot
   const input = $<HTMLInputElement>('payout-address')
   if (document.activeElement !== input) input.value = status.payout_address ?? ''
+  const modelInput = $<HTMLInputElement>('ollama-model')
+  if (document.activeElement !== modelInput) modelInput.value = status.configured_model
 
   const connected = status.connection === 'connected'
   $<HTMLElement>('connection').classList.toggle('is-connected', connected)
@@ -217,7 +240,10 @@ function renderStatus(): void {
   $<HTMLButtonElement>('start-provider').disabled = status.provider_running || working
   $<HTMLButtonElement>('stop-provider').disabled = !status.provider_running || working
   $<HTMLButtonElement>('save-address').disabled = working
+  modelInput.disabled = status.provider_running || working
+  $<HTMLButtonElement>('save-model').disabled = status.provider_running || working
   updateAddressFeedback()
+  updateModelFeedback(status)
 }
 
 function renderRuntime(status: StatusSnapshot): void {
@@ -312,6 +338,37 @@ function updateAddressFeedback(): void {
   saved.hidden = !addressSuccess
 }
 
+function updateModelFeedback(status: StatusSnapshot): void {
+  const configuredSize = $<HTMLParagraphElement>('configured-model-size')
+  configuredSize.textContent = status.configured_model_download_bytes === null
+    ? 'Configured model download size unavailable.'
+    : `Estimated download for ${status.configured_model}: ${formatBytes(status.configured_model_download_bytes)}`
+
+  const override = $<HTMLParagraphElement>('model-override')
+  override.hidden = !status.model_override_active
+  override.textContent = status.model_override_active
+    ? `OLLAMA_MODEL is set and overrides the saved config. Effective model: ${status.effective_model}.`
+    : ''
+
+  const effectiveSize = $<HTMLParagraphElement>('effective-model-size')
+  effectiveSize.hidden = !status.model_override_active
+  effectiveSize.textContent = status.model_override_active
+    ? status.effective_model_download_bytes === null
+      ? `Effective model download size unavailable for ${status.effective_model}.`
+      : `Estimated download for effective model ${status.effective_model}: ${formatBytes(status.effective_model_download_bytes)}`
+    : ''
+
+  const error = $<HTMLParagraphElement>('model-error')
+  error.textContent = modelError || status.model_size_error || ''
+  error.hidden = !error.textContent
+  const success = $<HTMLParagraphElement>('model-success')
+  success.textContent = modelSuccess
+  success.hidden = !modelSuccess
+  $<HTMLParagraphElement>('model-restart-note').textContent = status.provider_running
+    ? 'Stop the provider before changing the model.'
+    : 'Model changes apply the next time the provider starts.'
+}
+
 async function startProvider(): Promise<void> {
   if (!snapshot || working) return
   if (
@@ -357,6 +414,26 @@ $<HTMLButtonElement>('confirm-runtime').addEventListener('click', (event) => {
   event.preventDefault()
   $<HTMLDialogElement>('runtime-confirmation').close()
   void invokeProviderStart(true)
+})
+
+$<HTMLFormElement>('model-form').addEventListener('submit', async (event) => {
+  event.preventDefault()
+  if (!snapshot || snapshot.provider_running || working) return
+  const model = $<HTMLInputElement>('ollama-model').value.trim()
+  modelError = ''
+  modelSuccess = ''
+  working = true
+  renderStatus()
+  try {
+    const next = await invoke<StatusSnapshot>('set_ollama_model', { model })
+    updateStatus(next)
+    modelSuccess = 'Model saved.'
+  } catch (error) {
+    modelError = errorMessage(error)
+  } finally {
+    working = false
+    if (snapshot) renderStatus()
+  }
 })
 
 $<HTMLFormElement>('payout-form').addEventListener('submit', async (event) => {

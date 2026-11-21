@@ -243,6 +243,18 @@ h2 {
   margin-top: 8px;
 }
 
+.model-form {
+  max-width: 680px;
+  margin-top: 20px;
+}
+
+.model-form > .muted,
+.model-form > .warning-text {
+  margin: 8px 0 0;
+  font-size: 11px;
+  line-height: 1.6;
+}
+
 .payout-panel {
   display: grid;
   grid-template-columns: 0.8fr 1.2fr;
