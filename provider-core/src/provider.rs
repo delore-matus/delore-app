@@ -133,6 +133,7 @@ pub async fn run_provider(config: ProviderConfig) -> Result<()> {
                             fees.fee_bps,
                             fees.provider_payout_units
                         );
+                        println!("Platform fee recipient: {}", fees.fee_address);
                         fee_config = Some(fees);
                     }
                 }

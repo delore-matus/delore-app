@@ -63,6 +63,7 @@ struct FeesResponse {
     fee_bps: u64,
     provider_share_percent: u64,
     platform_share_percent: u64,
+    fee_address: String,
 }
 
 fn calculate_fee(price_units: u64, fee_bps: u64) -> (u64, u64) {
@@ -399,6 +400,7 @@ async fn get_fees(State(state): State<AppState>) -> impl IntoResponse {
         fee_bps: state.fees.fee_bps,
         provider_share_percent: 100 - platform_share_percent,
         platform_share_percent,
+        fee_address: state.fees.platform_address.clone(),
     })
 }
 
@@ -457,6 +459,7 @@ async fn handle_websocket(socket: WebSocket, state: AppState) {
                 send_fees.fee_bps,
             )
             .1,
+            fee_address: send_fees.platform_address.clone(),
         })) {
             if sender.send(Message::Text(json)).await.is_err() {
                 let _ = send_close_tx.send(true);

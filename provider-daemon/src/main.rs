@@ -103,6 +103,9 @@ fn run_setup() -> Result<()> {
     let gpu = detect_gpu();
     println!("Detected GPU: {}", gpu.gpu_name);
     println!("GPU memory: {}", gpu.gpu_memory);
+    if gpu.support == "integrated-intel-unsupported" {
+        println!("Integrated GPU, not supported: jobs run on CPU.");
+    }
 
     if !ollama_is_installed() {
         println!("Ollama is not installed.");
@@ -174,6 +177,7 @@ fn run_setup() -> Result<()> {
 struct FeesStatus {
     fee_bps: u64,
     provider_share_percent: u64,
+    fee_address: String,
 }
 
 fn coordinator_http_url(coordinator_ws: &str) -> String {
@@ -223,11 +227,14 @@ async fn print_status() -> Result<()> {
         match reqwest::Client::new().get(url).send().await {
             Ok(response) if response.status().is_success() => {
                 match response.json::<FeesStatus>().await {
-                    Ok(fees) => println!(
-                        "Platform fee: {} — you receive {}% of each job price.",
-                        percent_from_bps(fees.fee_bps),
-                        fees.provider_share_percent
-                    ),
+                    Ok(fees) => {
+                        println!(
+                            "Platform fee: {} — you receive {}% of each job price.",
+                            percent_from_bps(fees.fee_bps),
+                            fees.provider_share_percent
+                        );
+                        println!("Platform fee recipient: {}", fees.fee_address);
+                    }
                     Err(_) => println!("Platform fee: unknown, will be shown on connect"),
                 }
             }
@@ -241,6 +248,9 @@ async fn print_status() -> Result<()> {
     println!("GPU: {}", gpu.gpu_name);
     println!("GPU memory: {}", gpu.gpu_memory);
     println!("GPU support: {}", gpu.support);
+    if gpu.support == "integrated-intel-unsupported" {
+        println!("Integrated GPU, not supported: jobs run on CPU.");
+    }
     if ollama_is_installed() {
         println!("Ollama: installed");
     } else {

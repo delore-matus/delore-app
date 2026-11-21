@@ -49,6 +49,7 @@ pub struct FeeConfig {
     pub fee_bps: u64,
     pub job_price_units: u64,
     pub provider_payout_units: u64,
+    pub fee_address: String,
 }
 
 /// Messages exchanged over the coordinator/provider WebSocket.
