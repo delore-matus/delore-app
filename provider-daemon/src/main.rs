@@ -157,7 +157,7 @@ fn run_setup() -> Result<()> {
 }
 
 fn runtime_progress_callback() -> RuntimeProgressCallback {
-    let last_percent = Arc::new(AtomicU8::new(0));
+    let last_percent = Arc::new(AtomicU8::new(u8::MAX));
     Arc::new(move |state| match state {
         RuntimeState::Downloading {
             percent,
@@ -165,7 +165,11 @@ fn runtime_progress_callback() -> RuntimeProgressCallback {
             expected_total_download_bytes,
         } => {
             let last = last_percent.load(Ordering::Relaxed);
-            if percent == 0 || percent == 100 || percent >= last.saturating_add(5) {
+            if last == u8::MAX
+                || percent < last
+                || percent == 100
+                || percent >= last.saturating_add(5)
+            {
                 println!(
                     "Runtime/model download: {percent}% ({bytes}/{expected_total_download_bytes} bytes)"
                 );
