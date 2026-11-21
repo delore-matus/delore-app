@@ -3,7 +3,9 @@ use common::{FeeConfig, JobResult, ProviderRegistration, WsMessage};
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-use crate::{detect_gpu, run_ollama, ProviderConfig};
+use crate::{
+    detect_gpu, run_ollama, ProviderConfig, RunningRuntime, RuntimeManager, RuntimeProgressCallback,
+};
 
 #[derive(Debug, Clone)]
 pub struct JobHistoryEntry {
@@ -16,12 +18,50 @@ pub struct JobHistoryEntry {
 }
 
 pub async fn run_provider(config: ProviderConfig) -> Result<()> {
-    let coordinator_url =
-        std::env::var("COORDINATOR_WS").unwrap_or(config.coordinator_ws.clone());
-    let provider_id =
-        std::env::var("PROVIDER_ID").unwrap_or(config.provider_id.clone());
-    let model =
-        std::env::var("OLLAMA_MODEL").unwrap_or(config.ollama_model.clone());
+    run_provider_with_confirmation(config, false, std::sync::Arc::new(|_| {})).await
+}
+
+pub async fn run_provider_with_confirmation(
+    config: ProviderConfig,
+    confirmed_not_recommended: bool,
+    callback: RuntimeProgressCallback,
+) -> Result<()> {
+    let model = std::env::var("OLLAMA_MODEL").unwrap_or(config.ollama_model.clone());
+    let runtime_manager = RuntimeManager::new()?;
+    let runtime_install = runtime_manager
+        .install(&model, confirmed_not_recommended, callback.clone())
+        .await?;
+    let model_size = runtime_install.model_download_bytes;
+    let runtime = runtime_manager.start(callback.clone()).await?;
+    println!(
+        "Managed Ollama runtime listening on 127.0.0.1:{}",
+        runtime.port()
+    );
+
+    let operation = async {
+        runtime
+            .ensure_model(&model, model_size, callback.clone())
+            .await?;
+        run_provider_connection(config, model, &runtime).await
+    }
+    .await;
+    let shutdown = runtime.shutdown(callback.clone()).await;
+    match (operation, shutdown) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(error), Err(shutdown_error)) => Err(error.context(format!(
+            "managed runtime shutdown also failed: {shutdown_error}"
+        ))),
+    }
+}
+
+async fn run_provider_connection(
+    config: ProviderConfig,
+    model: String,
+    runtime: &RunningRuntime,
+) -> Result<()> {
+    let coordinator_url = std::env::var("COORDINATOR_WS").unwrap_or(config.coordinator_ws.clone());
+    let provider_id = std::env::var("PROVIDER_ID").unwrap_or(config.provider_id.clone());
     let gpu = detect_gpu();
     let payout_address = match config.payout_address.as_deref() {
         Some(address) => match crate::validate_payout_address(address) {
@@ -55,8 +95,7 @@ pub async fn run_provider(config: ProviderConfig) -> Result<()> {
     });
     sender
         .send(Message::Text(
-            serde_json::to_string(&registration)
-                .context("failed to serialize registration")?,
+            serde_json::to_string(&registration).context("failed to serialize registration")?,
         ))
         .await
         .context("failed to send provider registration")?;
@@ -77,12 +116,13 @@ pub async fn run_provider(config: ProviderConfig) -> Result<()> {
 
         match message {
             Message::Text(json) => {
-                let message: WsMessage = serde_json::from_str(&json)
-                    .context("coordinator sent invalid JSON")?;
+                let message: WsMessage =
+                    serde_json::from_str(&json).context("coordinator sent invalid JSON")?;
                 match message {
                     WsMessage::Job(job) => {
                         println!("Received job");
                         let result = run_ollama(
+                            runtime.api_url(),
                             &job.id,
                             &provider_id,
                             &model,
@@ -103,9 +143,8 @@ pub async fn run_provider(config: ProviderConfig) -> Result<()> {
                             },
                         };
 
-                        let result_json =
-                            serde_json::to_string(&WsMessage::Result(result))
-                                .context("failed to serialize job result")?;
+                        let result_json = serde_json::to_string(&WsMessage::Result(result))
+                            .context("failed to serialize job result")?;
                         sender
                             .send(Message::Text(result_json))
                             .await
@@ -130,8 +169,7 @@ pub async fn run_provider(config: ProviderConfig) -> Result<()> {
                     WsMessage::FeeConfig(fees) => {
                         println!(
                             "Platform fee: {} bps — you receive {} units per job.",
-                            fees.fee_bps,
-                            fees.provider_payout_units
+                            fees.fee_bps, fees.provider_payout_units
                         );
                         println!("Platform fee recipient: {}", fees.fee_address);
                         fee_config = Some(fees);

@@ -1,4 +1,3 @@
-use std::process::Command;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -19,31 +18,8 @@ struct OllamaGenerateResponse {
     eval_duration: Option<u64>,
 }
 
-pub fn ollama_is_installed() -> bool {
-    Command::new("ollama")
-        .arg("--version")
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
-pub fn ollama_model_is_installed(model: &str) -> bool {
-    let Ok(output) = Command::new("ollama").arg("list").output() else {
-        return false;
-    };
-    if !output.status.success() {
-        return false;
-    }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .skip(1)
-        .any(|line| {
-            line.split_whitespace()
-                .next()
-                .is_some_and(|name| name == model || name.starts_with(&format!("{model}:")))
-        })
-}
-
 pub async fn run_ollama(
+    api_url: &str,
     job_id: &str,
     provider_id: &str,
     model: &str,
@@ -58,7 +34,7 @@ pub async fn run_ollama(
     };
 
     let response = http
-        .post("http://127.0.0.1:11434/api/generate")
+        .post(format!("{}/api/generate", api_url.trim_end_matches('/')))
         .json(&request)
         .send()
         .await

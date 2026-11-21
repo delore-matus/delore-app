@@ -1,13 +1,17 @@
 use std::{
     fs::File,
     io::Read,
+    net::TcpListener,
     path::{Path, PathBuf},
+    process::Stdio,
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use tokio::{process::Child, process::Command, time::timeout};
 
 pub const OLLAMA_VERSION: &str = "0.40.17";
 const CHECKSUMS_URL: &str =
@@ -40,6 +44,12 @@ pub enum RuntimeSuitability {
 }
 
 pub type RuntimeProgressCallback = Arc<dyn Fn(RuntimeState) + Send + Sync + 'static>;
+
+#[derive(Debug, Clone)]
+pub struct RuntimeInstall {
+    pub executable_path: PathBuf,
+    pub model_download_bytes: u64,
+}
 
 #[derive(Clone, Copy)]
 struct RuntimeAsset {
@@ -133,8 +143,16 @@ impl RuntimeManager {
         find_ollama_executable(&self.runtime_dir())
     }
 
-    pub async fn install(&self, model: &str, callback: RuntimeProgressCallback) -> Result<PathBuf> {
-        match self.install_inner(model, &callback).await {
+    pub async fn install(
+        &self,
+        model: &str,
+        confirmed_not_recommended: bool,
+        callback: RuntimeProgressCallback,
+    ) -> Result<RuntimeInstall> {
+        match self
+            .install_inner(model, confirmed_not_recommended, &callback)
+            .await
+        {
             Ok(path) => {
                 callback(RuntimeState::Ready);
                 Ok(path)
@@ -151,16 +169,24 @@ impl RuntimeManager {
     async fn install_inner(
         &self,
         model: &str,
+        confirmed_not_recommended: bool,
         callback: &RuntimeProgressCallback,
-    ) -> Result<PathBuf> {
+    ) -> Result<RuntimeInstall> {
         if self.runtime_dir().exists() {
-            return self.executable_path().with_context(|| {
+            let executable_path = self.executable_path().with_context(|| {
                 format!(
                     "runtime directory exists but contains no Ollama executable: {}",
                     self.runtime_dir().display()
                 )
             });
+            let model_download_bytes = self.model_download_size(model).await?;
+            return Ok(RuntimeInstall {
+                executable_path: executable_path?,
+                model_download_bytes,
+            });
         }
+        callback(RuntimeState::NotInstalled);
+        ensure_download_confirmation(runtime_suitability(), confirmed_not_recommended)?;
 
         let asset = selected_asset()?;
         tokio::fs::create_dir_all(&self.data_dir)
@@ -286,7 +312,10 @@ impl RuntimeManager {
         tokio::fs::remove_file(&archive_path)
             .await
             .context("runtime installed but failed to remove its archive")?;
-        self.executable_path()
+        Ok(RuntimeInstall {
+            executable_path: self.executable_path()?,
+            model_download_bytes: model_size,
+        })
     }
 
     async fn fetch_official_checksum(&self, asset: RuntimeAsset) -> Result<&'static str> {
@@ -316,7 +345,7 @@ impl RuntimeManager {
         Ok(asset.sha256)
     }
 
-    async fn model_download_size(&self, model: &str) -> Result<u64> {
+    pub async fn model_download_size(&self, model: &str) -> Result<u64> {
         let (name, tag) = model.rsplit_once(':').unwrap_or((model, "latest"));
         let name = name.strip_prefix("registry.ollama.ai/").unwrap_or(name);
         let name = if name.contains('/') {
@@ -347,6 +376,283 @@ impl RuntimeManager {
                 .context("model manifest size overflowed")
         })
     }
+
+    pub async fn start(&self, callback: RuntimeProgressCallback) -> Result<RunningRuntime> {
+        match self.start_inner(&callback).await {
+            Ok(runtime) => Ok(runtime),
+            Err(error) => {
+                callback(RuntimeState::Error {
+                    message: error.to_string(),
+                });
+                Err(error)
+            }
+        }
+    }
+
+    async fn start_inner(&self, callback: &RuntimeProgressCallback) -> Result<RunningRuntime> {
+        callback(RuntimeState::Starting);
+        let executable = self.executable_path()?;
+        tokio::fs::create_dir_all(self.models_dir())
+            .await
+            .context("failed to create the private model directory")?;
+        let port = select_localhost_port()?;
+        let api_url = format!("http://127.0.0.1:{port}");
+        let mut child = Command::new(&executable)
+            .arg("serve")
+            .env("OLLAMA_HOST", format!("127.0.0.1:{port}"))
+            .env("OLLAMA_MODELS", self.models_dir())
+            .current_dir(self.runtime_dir())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| {
+                format!(
+                    "failed to start managed runtime at {}",
+                    executable.display()
+                )
+            })?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(status) = child
+                .try_wait()
+                .context("failed to check managed Ollama process")?
+            {
+                bail!("managed Ollama process exited during startup with {status}");
+            }
+            if self
+                .http
+                .get(format!("{api_url}/api/version"))
+                .timeout(Duration::from_secs(1))
+                .send()
+                .await
+                .is_ok_and(|response| response.status().is_success())
+            {
+                callback(RuntimeState::Running);
+                return Ok(RunningRuntime {
+                    child,
+                    api_url,
+                    port,
+                    http: self.http.clone(),
+                    models_dir: self.models_dir(),
+                });
+            }
+            if Instant::now() >= deadline {
+                child
+                    .kill()
+                    .await
+                    .context("failed to stop Ollama after its startup timeout")?;
+                bail!("managed Ollama runtime did not become ready within 30 seconds");
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+}
+
+pub struct RunningRuntime {
+    child: Child,
+    api_url: String,
+    port: u16,
+    http: reqwest::Client,
+    models_dir: PathBuf,
+}
+
+impl RunningRuntime {
+    pub fn api_url(&self) -> &str {
+        &self.api_url
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub async fn ensure_model(
+        &self,
+        model: &str,
+        expected_model_bytes: u64,
+        callback: RuntimeProgressCallback,
+    ) -> Result<()> {
+        match self
+            .ensure_model_inner(model, expected_model_bytes, &callback)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                callback(RuntimeState::Error {
+                    message: error.to_string(),
+                });
+                Err(error)
+            }
+        }
+    }
+
+    async fn ensure_model_inner(
+        &self,
+        model: &str,
+        expected_model_bytes: u64,
+        callback: &RuntimeProgressCallback,
+    ) -> Result<()> {
+        #[derive(serde::Serialize)]
+        struct PullRequest<'a> {
+            name: &'a str,
+            stream: bool,
+        }
+
+        #[derive(Deserialize)]
+        struct TagResponse {
+            models: Vec<TaggedModel>,
+        }
+
+        #[derive(Deserialize)]
+        struct TaggedModel {
+            name: String,
+        }
+
+        let tags: TagResponse = self
+            .http
+            .get(format!("{}/api/tags", self.api_url))
+            .send()
+            .await
+            .context("could not check models in the managed runtime")?
+            .error_for_status()
+            .context("managed runtime rejected the model-list request")?
+            .json()
+            .await
+            .context("managed runtime returned an invalid model list")?;
+        if tags
+            .models
+            .iter()
+            .any(|entry| entry.name == model || entry.name.starts_with(&format!("{model}:")))
+        {
+            callback(RuntimeState::Running);
+            return Ok(());
+        }
+        ensure_free_space(&self.models_dir, expected_model_bytes)
+            .await
+            .context("insufficient free disk space to download the model")?;
+        callback(RuntimeState::Downloading {
+            percent: 0,
+            bytes: 0,
+            expected_total_download_bytes: expected_model_bytes,
+        });
+        let response = self
+            .http
+            .post(format!("{}/api/pull", self.api_url))
+            .json(&PullRequest {
+                name: model,
+                stream: true,
+            })
+            .send()
+            .await
+            .context("model download failed; check your internet connection")?
+            .error_for_status()
+            .context("Ollama rejected the model download request")?;
+        let mut stream = response.bytes_stream();
+        use futures_util::StreamExt;
+        let mut pending = Vec::new();
+        let mut latest_total = expected_model_bytes;
+        let mut latest_completed = 0_u64;
+        let mut finished = false;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("model download was interrupted; retry to resume")?;
+            pending.extend_from_slice(&chunk);
+            while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+                let line: Vec<u8> = pending.drain(..=newline).collect();
+                if process_pull_progress(&line, callback, &mut latest_total, &mut latest_completed)?
+                {
+                    finished = true;
+                }
+            }
+        }
+        if !pending.is_empty()
+            && process_pull_progress(&pending, callback, &mut latest_total, &mut latest_completed)?
+        {
+            finished = true;
+        }
+        if !finished {
+            bail!("model download ended before Ollama reported completion");
+        }
+        callback(RuntimeState::Running);
+        Ok(())
+    }
+
+    pub async fn shutdown(mut self, callback: RuntimeProgressCallback) -> Result<()> {
+        callback(RuntimeState::Stopping);
+        if self
+            .child
+            .try_wait()
+            .context("failed to check managed Ollama process before shutdown")?
+            .is_none()
+        {
+            timeout(Duration::from_secs(10), self.child.kill())
+                .await
+                .context("timed out while stopping managed Ollama")?
+                .context("failed to stop managed Ollama")?;
+        }
+        callback(RuntimeState::Ready);
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+struct PullProgress {
+    status: Option<String>,
+    total: Option<u64>,
+    completed: Option<u64>,
+    error: Option<String>,
+}
+
+fn process_pull_progress(
+    line: &[u8],
+    callback: &RuntimeProgressCallback,
+    total: &mut u64,
+    completed: &mut u64,
+) -> Result<bool> {
+    let progress: PullProgress =
+        serde_json::from_slice(line).context("Ollama returned invalid model-download progress")?;
+    if let Some(error) = progress.error {
+        bail!("Ollama model download failed: {error}");
+    }
+    if let Some(reported_total) = progress.total {
+        *total = reported_total;
+    }
+    if let Some(reported_completed) = progress.completed {
+        *completed = reported_completed;
+    }
+    let finished = progress.status.as_deref() == Some("success");
+    let percent = if finished {
+        100
+    } else {
+        (*completed)
+            .saturating_mul(100)
+            .checked_div(*total)
+            .unwrap_or(0)
+            .min(100) as u8
+    };
+    callback(RuntimeState::Downloading {
+        percent,
+        bytes: *completed,
+        expected_total_download_bytes: *total,
+    });
+    Ok(finished)
+}
+
+fn select_localhost_port() -> Result<u16> {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .context("failed to select a private localhost port for Ollama")?;
+    Ok(listener.local_addr()?.port())
+}
+
+fn ensure_download_confirmation(
+    suitability: RuntimeSuitability,
+    confirmed_not_recommended: bool,
+) -> Result<()> {
+    if let RuntimeSuitability::NotRecommended { reason } = suitability {
+        if !confirmed_not_recommended {
+            bail!("runtime download requires explicit confirmation: {reason}");
+        }
+    }
+    Ok(())
 }
 
 async fn cleanup_extract_dir(path: &Path, error: anyhow::Error) -> anyhow::Error {
@@ -738,8 +1044,9 @@ mod tests {
     };
 
     use super::{
-        download_resumable, mach_header_supports_arch, parse_checksum_file, verify_sha256,
-        RuntimeProgressCallback, RuntimeState,
+        download_resumable, ensure_download_confirmation, mach_header_supports_arch,
+        parse_checksum_file, process_pull_progress, select_localhost_port, verify_sha256,
+        RuntimeProgressCallback, RuntimeState, RuntimeSuitability,
     };
 
     #[test]
@@ -784,6 +1091,51 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn selects_an_available_private_localhost_port() {
+        let port = select_localhost_port().unwrap();
+        assert_ne!(port, 0);
+        assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_ok());
+    }
+
+    #[test]
+    fn requires_explicit_consent_on_not_recommended_hardware() {
+        let suitability = RuntimeSuitability::NotRecommended {
+            reason: "CPU-only".to_string(),
+        };
+        assert!(ensure_download_confirmation(suitability.clone(), false).is_err());
+        assert!(ensure_download_confirmation(suitability, true).is_ok());
+        assert!(ensure_download_confirmation(RuntimeSuitability::Suitable, false).is_ok());
+    }
+
+    #[test]
+    fn parses_model_download_progress() {
+        let states = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = states.clone();
+        let callback: RuntimeProgressCallback = Arc::new(move |state| {
+            observed.lock().unwrap().push(state);
+        });
+        let mut total = 100;
+        let mut completed = 0;
+        assert!(!process_pull_progress(
+            br#"{"status":"downloading","total":100,"completed":25}"#,
+            &callback,
+            &mut total,
+            &mut completed,
+        )
+        .unwrap());
+        assert_eq!(total, 100);
+        assert_eq!(completed, 25);
+        assert_eq!(
+            states.lock().unwrap().last(),
+            Some(&RuntimeState::Downloading {
+                percent: 25,
+                bytes: 25,
+                expected_total_download_bytes: 100,
+            })
+        );
     }
 
     #[tokio::test]
