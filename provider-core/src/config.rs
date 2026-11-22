@@ -220,6 +220,11 @@ fn set_payout_address_at(address: &str, path: &Path) -> Result<ProviderConfig> {
 }
 
 pub fn config_dir() -> Result<PathBuf> {
+    if let Ok(override_dir) = std::env::var("GPUSWARM_CONFIG_DIR") {
+        if !override_dir.trim().is_empty() {
+            return Ok(PathBuf::from(override_dir));
+        }
+    }
     let base = dirs::config_dir().context("could not find the OS application config directory")?;
     Ok(base.join("GpuSwarm"))
 }
@@ -250,13 +255,35 @@ pub fn load_config() -> Result<Option<ProviderConfig>> {
     load_config_from(&config_path()?)
 }
 
+fn decode_config_bytes(bytes: &[u8]) -> String {
+    if bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
+        return String::from_utf8_lossy(&bytes[3..]).into_owned();
+    }
+    if bytes.starts_with(&[0xff, 0xfe]) {
+        let units: Vec<u16> = bytes[2..]
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect();
+        return String::from_utf16_lossy(&units);
+    }
+    if bytes.starts_with(&[0xfe, 0xff]) {
+        let units: Vec<u16> = bytes[2..]
+            .chunks_exact(2)
+            .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+            .collect();
+        return String::from_utf16_lossy(&units);
+    }
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
 fn load_config_from(path: &Path) -> Result<Option<ProviderConfig>> {
     if !path.exists() {
         return Ok(None);
     }
     let bytes = std::fs::read(path)
         .with_context(|| format!("failed to read config: {}", path.display()))?;
-    let config: ProviderConfig = serde_json::from_slice(&bytes)
+    let text = decode_config_bytes(&bytes);
+    let config: ProviderConfig = serde_json::from_str(&text)
         .with_context(|| format!("failed to parse config: {}", path.display()))?;
     if let Some(address) = config.payout_address.as_deref() {
         if let Err(error) = validate_payout_address(address) {
@@ -425,6 +452,42 @@ mod tests {
             assert!(set_ollama_model_at(invalid, &path).is_err());
             assert_eq!(fs::read(&path).unwrap(), original);
         }
+        remove_test_config(&path);
+    }
+
+    #[test]
+    fn loads_bom_utf16_and_windows_line_endings() {
+        let path = test_config_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let json = r#"{"payout_address":null,"provider_id":"encoding-test","coordinator_ws":"ws://127.0.0.1:8081/ws","ollama_model":"llama3.2:1b","resource_settings":{"mode":"only_when_idle","idle_threshold_minutes":5,"schedule":null,"preset":"balanced","do_not_run_on_battery":true,"not_recommended_confirmed":false,"performance_percent":50},"desktop_preferences":{"theme":"dark","language":"english","start_on_login":false,"start_minimized_to_tray":false,"keep_running_in_tray":false,"notifications_enabled":false}}"#.replace('\n', "\r\n");
+
+        let mut utf8_bom = vec![0xef, 0xbb, 0xbf];
+        utf8_bom.extend_from_slice(json.as_bytes());
+        fs::write(&path, utf8_bom).unwrap();
+        assert_eq!(
+            load_config_from(&path).unwrap().unwrap().provider_id,
+            "encoding-test"
+        );
+
+        let mut utf16_le = vec![0xff, 0xfe];
+        for unit in json.encode_utf16() {
+            utf16_le.extend_from_slice(&unit.to_le_bytes());
+        }
+        fs::write(&path, utf16_le).unwrap();
+        assert_eq!(
+            load_config_from(&path).unwrap().unwrap().provider_id,
+            "encoding-test"
+        );
+
+        let mut utf16_be = vec![0xfe, 0xff];
+        for unit in json.encode_utf16() {
+            utf16_be.extend_from_slice(&unit.to_be_bytes());
+        }
+        fs::write(&path, utf16_be).unwrap();
+        assert_eq!(
+            load_config_from(&path).unwrap().unwrap().provider_id,
+            "encoding-test"
+        );
         remove_test_config(&path);
     }
 
