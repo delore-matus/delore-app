@@ -41,6 +41,12 @@ pub struct ProviderRegistration {
     pub gpu_name: String,
     pub gpu_memory: String,
     pub model: String,
+    #[serde(default = "provider_accepts_jobs_by_default")]
+    pub accepting_jobs: bool,
+}
+
+fn provider_accepts_jobs_by_default() -> bool {
+    true
 }
 
 /// Coordinator fee information sent to providers after they connect.
@@ -74,5 +80,38 @@ pub enum WsMessage {
     /// The coordinator's current mock-ledger fee configuration.
     #[serde(rename = "fee_config")]
     FeeConfig(FeeConfig),
+
+    /// Whether this connected provider can receive another job.
+    #[serde(rename = "availability")]
+    Availability { accepting_jobs: bool },
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{ProviderRegistration, WsMessage};
+
+    #[test]
+    fn older_provider_registration_defaults_to_accepting_jobs() {
+        let registration: ProviderRegistration = serde_json::from_str(
+            r#"{
+                "provider_id": "provider",
+                "payout_address": "not-set",
+                "gpu_name": "GPU",
+                "gpu_memory": "unknown",
+                "model": "model"
+            }"#,
+        )
+        .unwrap();
+        assert!(registration.accepting_jobs);
+    }
+
+    #[test]
+    fn availability_message_has_explicit_paused_state() {
+        let message = WsMessage::Availability {
+            accepting_jobs: false,
+        };
+        let json = serde_json::to_value(message).unwrap();
+        assert_eq!(json["type"], "availability");
+        assert_eq!(json["payload"]["accepting_jobs"], false);
+    }
+}

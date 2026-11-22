@@ -11,9 +11,9 @@ use std::{
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use provider_core::{
-    config_dir, detect_gpu, load_config, run_provider_with_confirmation, runtime_suitability,
-    save_config, validate_payout_address, ProviderConfig, RuntimeManager, RuntimeProgressCallback,
-    RuntimeState, RuntimeSuitability,
+    config_dir, decide_current_policy, detect_gpu, load_config, run_provider_with_confirmation,
+    runtime_suitability, save_config, validate_payout_address, NativeSystemProbe, ProviderConfig,
+    RuntimeManager, RuntimeProgressCallback, RuntimeState, RuntimeSuitability, SystemProbe,
 };
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
@@ -232,9 +232,10 @@ async fn print_status() -> Result<()> {
         None => println!("Configuration: not set (run `gpuswarm setup`)"),
     }
 
-    if let Some(config) = config {
-        let url =
-            coordinator_http_url(&std::env::var("COORDINATOR_WS").unwrap_or(config.coordinator_ws));
+    if let Some(config) = config.as_ref() {
+        let coordinator_ws =
+            std::env::var("COORDINATOR_WS").unwrap_or_else(|_| config.coordinator_ws.clone());
+        let url = coordinator_http_url(&coordinator_ws);
         match reqwest::Client::new().get(url).send().await {
             Ok(response) if response.status().is_success() => {
                 match response.json::<FeesStatus>().await {
@@ -262,6 +263,38 @@ async fn print_status() -> Result<()> {
     if gpu.support == "integrated-intel-unsupported" {
         println!("Integrated GPU, not supported: jobs run on CPU.");
     }
+    let resource_settings = config
+        .as_ref()
+        .map(|config| config.resource_settings.clone())
+        .unwrap_or_default();
+    let logical_cpu_count = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1);
+    let mapping = resource_settings.preset.mapping(
+        logical_cpu_count,
+        resource_settings.mode == provider_core::ResourceMode::AlwaysOnLowPriority,
+    );
+    let system = NativeSystemProbe.sample();
+    let policy = decide_current_policy(&resource_settings, system.idle, system.power, false);
+    println!(
+        "Resource policy: mode={:?}, idle threshold={} min, preset={:?}, decision={policy:?}",
+        resource_settings.mode, resource_settings.idle_threshold_minutes, resource_settings.preset
+    );
+    println!(
+        "Preset mapping: threads={}, keep-alive={}, priority={:?} (supported={}), concurrency={}, max loaded models={}",
+        mapping.num_thread,
+        mapping.keep_alive,
+        mapping.process_priority,
+        mapping.priority_supported,
+        mapping.ollama_num_parallel,
+        mapping.max_loaded_models
+    );
+    println!(
+        "System probe: idle={:?}, power={:?}, diagnostic={}",
+        system.idle,
+        system.power,
+        system.diagnostic.as_deref().unwrap_or("none")
+    );
     let runtime = RuntimeManager::new()?;
     if runtime.runtime_dir().exists() {
         runtime.executable_path()?;
@@ -284,8 +317,7 @@ async fn main() -> Result<()> {
             let config = load_config()?.ok_or_else(|| {
                 anyhow::anyhow!("GPU Swarm is not configured. Run `gpuswarm setup` first.")
             })?;
-            let runtime_needs_download = !RuntimeManager::new()?.runtime_dir().exists();
-            let confirmed_not_recommended = if runtime_needs_download {
+            let confirmed_not_recommended = if !config.resource_settings.not_recommended_confirmed {
                 match runtime_suitability() {
                     RuntimeSuitability::Suitable => false,
                     RuntimeSuitability::NotRecommended { reason } => {

@@ -3,12 +3,16 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::resource::ResourceSettings;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub payout_address: Option<String>,
     pub provider_id: String,
     pub coordinator_ws: String,
     pub ollama_model: String,
+    #[serde(default)]
+    pub resource_settings: ResourceSettings,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +29,7 @@ impl ProviderConfig {
             provider_id: uuid::Uuid::new_v4().to_string(),
             coordinator_ws: "ws://127.0.0.1:8081/ws".to_string(),
             ollama_model: "llama3.2:3b".to_string(),
+            resource_settings: ResourceSettings::default(),
         }
     }
 }
@@ -99,6 +104,27 @@ pub fn set_ollama_model(model: &str) -> Result<ProviderConfig> {
     set_ollama_model_at(model, &config_path()?)
 }
 
+pub fn set_resource_settings(settings: ResourceSettings) -> Result<ProviderConfig> {
+    set_resource_settings_at(settings, &config_path()?)
+}
+
+pub fn confirm_not_recommended_runtime() -> Result<ProviderConfig> {
+    let mut config = load_config()?.unwrap_or_else(ProviderConfig::defaults);
+    config.resource_settings.not_recommended_confirmed = true;
+    save_config(&config)?;
+    Ok(config)
+}
+
+fn set_resource_settings_at(settings: ResourceSettings, path: &Path) -> Result<ProviderConfig> {
+    settings.validate()?;
+    let mut config = load_config_from(path)?.unwrap_or_else(ProviderConfig::defaults);
+    let confirmed_before = config.resource_settings.not_recommended_confirmed;
+    config.resource_settings = settings;
+    config.resource_settings.not_recommended_confirmed |= confirmed_before;
+    save_config_to(&config, path)?;
+    Ok(config)
+}
+
 fn set_ollama_model_at(model: &str, path: &Path) -> Result<ProviderConfig> {
     let model = model.trim();
     validate_ollama_model(model)?;
@@ -154,6 +180,10 @@ fn load_config_from(path: &Path) -> Result<Option<ProviderConfig>> {
             error
         );
     }
+    config
+        .resource_settings
+        .validate()
+        .with_context(|| format!("invalid resource_settings in {}", path.display()))?;
     Ok(Some(config))
 }
 
@@ -166,6 +196,7 @@ fn save_config_to(config: &ProviderConfig, path: &Path) -> Result<()> {
         validate_payout_address(address)?;
     }
     validate_ollama_model(&config.ollama_model)?;
+    config.resource_settings.validate()?;
     let dir = path
         .parent()
         .context("provider config path has no parent directory")?;
@@ -186,8 +217,10 @@ mod tests {
 
     use super::{
         load_config_from, save_config_to, select_ollama_model, set_ollama_model_at,
-        set_payout_address_at, validate_ollama_model, validate_payout_address, ProviderConfig,
+        set_payout_address_at, set_resource_settings_at, validate_ollama_model,
+        validate_payout_address, ProviderConfig,
     };
+    use crate::resource::{ResourceMode, ResourceSchedule, ResourceSettings};
 
     fn test_config_path() -> PathBuf {
         std::env::temp_dir()
@@ -297,6 +330,109 @@ mod tests {
             assert!(set_ollama_model_at(invalid, &path).is_err());
             assert_eq!(fs::read(&path).unwrap(), original);
         }
+        remove_test_config(&path);
+    }
+
+    #[test]
+    fn old_config_without_resource_settings_loads_with_defaults_without_rewriting() {
+        let path = test_config_path();
+        let old_json = r#"{
+            "payout_address": null,
+            "provider_id": "test-provider",
+            "coordinator_ws": "ws://127.0.0.1:8081/ws",
+            "ollama_model": "llama3.2:3b"
+        }"#;
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, old_json).unwrap();
+
+        let config = load_config_from(&path).unwrap().unwrap();
+        assert_eq!(config.resource_settings, ResourceSettings::default());
+        assert_eq!(fs::read_to_string(&path).unwrap(), old_json);
+        remove_test_config(&path);
+    }
+
+    #[test]
+    fn resource_settings_reject_invalid_values_and_preserve_config() {
+        let path = test_config_path();
+        save_config_to(&ProviderConfig::defaults(), &path).unwrap();
+        let original = fs::read(&path).unwrap();
+
+        let invalid = ResourceSettings {
+            idle_threshold_minutes: 0,
+            ..ResourceSettings::default()
+        };
+        assert!(set_resource_settings_at(invalid, &path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+
+        let invalid_json = serde_json::json!({
+            "payout_address": null,
+            "provider_id": "test-provider",
+            "coordinator_ws": "ws://127.0.0.1:8081/ws",
+            "ollama_model": "llama3.2:3b",
+            "resource_settings": {
+                "mode": "scheduled_hours",
+                "idle_threshold_minutes": 5,
+                "schedule": null,
+                "preset": "balanced",
+                "do_not_run_on_battery": true,
+                "not_recommended_confirmed": false
+            }
+        });
+        fs::write(&path, serde_json::to_vec(&invalid_json).unwrap()).unwrap();
+        assert!(load_config_from(&path).is_err());
+        remove_test_config(&path);
+    }
+
+    #[test]
+    fn resource_schedule_round_trips_validated_local_hours() {
+        let path = test_config_path();
+        let settings = ResourceSettings {
+            mode: ResourceMode::ScheduledHours,
+            schedule: Some(ResourceSchedule {
+                weekdays: vec![1, 5],
+                start: "22:15".into(),
+                end: "06:45".into(),
+            }),
+            ..ResourceSettings::default()
+        };
+        let config = set_resource_settings_at(settings.clone(), &path).unwrap();
+        assert_eq!(config.resource_settings, settings);
+        assert_eq!(
+            load_config_from(&path).unwrap().unwrap().resource_settings,
+            settings
+        );
+        remove_test_config(&path);
+    }
+
+    #[test]
+    fn not_recommended_confirmation_is_stored_in_config() {
+        let path = test_config_path();
+        let settings = ResourceSettings {
+            not_recommended_confirmed: true,
+            ..ResourceSettings::default()
+        };
+        set_resource_settings_at(settings, &path).unwrap();
+        let loaded = load_config_from(&path).unwrap().unwrap();
+        assert!(loaded.resource_settings.not_recommended_confirmed);
+        remove_test_config(&path);
+    }
+
+    #[test]
+    fn resource_settings_updates_cannot_clear_hardware_confirmation() {
+        let path = test_config_path();
+        let confirmed = ResourceSettings {
+            not_recommended_confirmed: true,
+            ..ResourceSettings::default()
+        };
+        set_resource_settings_at(confirmed, &path).unwrap();
+        set_resource_settings_at(ResourceSettings::default(), &path).unwrap();
+        assert!(
+            load_config_from(&path)
+                .unwrap()
+                .unwrap()
+                .resource_settings
+                .not_recommended_confirmed
+        );
         remove_test_config(&path);
     }
 }

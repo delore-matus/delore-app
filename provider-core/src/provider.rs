@@ -1,15 +1,17 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
-use common::{FeeConfig, JobResult, ProviderRegistration, WsMessage};
+use common::{FeeConfig, JobPayload, JobResult, ProviderRegistration, WsMessage};
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use tokio::sync::watch;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::{
-    detect_gpu, effective_ollama_model, run_ollama, ProviderConfig, RunningRuntime, RuntimeManager,
-    RuntimeProgressCallback, RuntimeState,
+    decide_current_policy, detect_gpu, effective_ollama_model, ensure_provider_confirmation,
+    run_ollama_with_settings, runtime_suitability, save_config, NativeSystemProbe, PolicyDecision,
+    ProviderConfig, ResourceMetrics, ResourceMonitor, ResourceSettings, RunningRuntime,
+    RuntimeManager, RuntimeProgressCallback, RuntimeState, RuntimeSuitability, SystemProbe,
 };
 
 #[derive(Debug, Clone)]
@@ -46,6 +48,13 @@ pub enum ProviderEvent {
     JobFinished {
         result: JobResult,
     },
+    Policy {
+        decision: PolicyDecision,
+        diagnostic: Option<String>,
+    },
+    ResourceMonitor {
+        metrics: ResourceMetrics,
+    },
     Error {
         message: String,
     },
@@ -53,12 +62,48 @@ pub enum ProviderEvent {
 
 pub type ProviderEventCallback = Arc<dyn Fn(ProviderEvent) + Send + Sync + 'static>;
 
+#[derive(Clone)]
+pub struct ProviderControl {
+    pause_tx: watch::Sender<bool>,
+}
+
+impl ProviderControl {
+    pub fn set_paused(&self, paused: bool) -> Result<()> {
+        self.pause_tx
+            .send(paused)
+            .context("provider control channel is closed")
+    }
+
+    pub fn pause(&self) -> Result<()> {
+        self.set_paused(true)
+    }
+
+    pub fn resume(&self) -> Result<()> {
+        self.set_paused(false)
+    }
+}
+
+pub fn provider_control_channel() -> (ProviderControl, watch::Receiver<bool>) {
+    let (pause_tx, pause_rx) = watch::channel(false);
+    (ProviderControl { pause_tx }, pause_rx)
+}
+
 #[derive(Clone, Copy)]
 struct ProviderRunOptions {
     confirmed_not_recommended: bool,
     stop_after_job: bool,
     handle_ctrl_c: bool,
     use_cli_environment_overrides: bool,
+}
+
+struct ProviderConnectionContext<'a> {
+    runtime: &'a RunningRuntime,
+    options: ProviderRunOptions,
+    stop_rx: &'a mut watch::Receiver<bool>,
+    pause_rx: &'a mut watch::Receiver<bool>,
+    resource_settings: &'a ResourceSettings,
+    system_probe: &'a dyn SystemProbe,
+    event_callback: &'a ProviderEventCallback,
 }
 
 pub async fn run_provider(config: ProviderConfig) -> Result<()> {
@@ -72,6 +117,7 @@ pub async fn run_provider_with_confirmation(
     runtime_callback: RuntimeProgressCallback,
 ) -> Result<()> {
     let (stop_tx, stop_rx) = watch::channel(false);
+    let (_control, pause_rx) = provider_control_channel();
     let result = run_provider_inner(
         config,
         ProviderRunOptions {
@@ -81,6 +127,8 @@ pub async fn run_provider_with_confirmation(
             use_cli_environment_overrides: true,
         },
         stop_rx,
+        pause_rx,
+        Arc::new(NativeSystemProbe),
         runtime_callback,
         Arc::new(|_| {}),
     )
@@ -96,6 +144,47 @@ pub async fn run_provider_managed(
     runtime_callback: RuntimeProgressCallback,
     event_callback: ProviderEventCallback,
 ) -> Result<()> {
+    let (_control, pause_rx) = provider_control_channel();
+    run_provider_managed_with_control(
+        config,
+        confirmed_not_recommended,
+        stop_rx,
+        pause_rx,
+        runtime_callback,
+        event_callback,
+    )
+    .await
+}
+
+pub async fn run_provider_managed_with_control(
+    config: ProviderConfig,
+    confirmed_not_recommended: bool,
+    stop_rx: watch::Receiver<bool>,
+    pause_rx: watch::Receiver<bool>,
+    runtime_callback: RuntimeProgressCallback,
+    event_callback: ProviderEventCallback,
+) -> Result<()> {
+    run_provider_managed_with_probe(
+        config,
+        confirmed_not_recommended,
+        stop_rx,
+        pause_rx,
+        Arc::new(NativeSystemProbe),
+        runtime_callback,
+        event_callback,
+    )
+    .await
+}
+
+pub async fn run_provider_managed_with_probe(
+    config: ProviderConfig,
+    confirmed_not_recommended: bool,
+    stop_rx: watch::Receiver<bool>,
+    pause_rx: watch::Receiver<bool>,
+    system_probe: Arc<dyn SystemProbe>,
+    runtime_callback: RuntimeProgressCallback,
+    event_callback: ProviderEventCallback,
+) -> Result<()> {
     run_provider_inner(
         config,
         ProviderRunOptions {
@@ -105,6 +194,8 @@ pub async fn run_provider_managed(
             use_cli_environment_overrides: false,
         },
         stop_rx,
+        pause_rx,
+        system_probe,
         runtime_callback,
         event_callback,
     )
@@ -112,14 +203,38 @@ pub async fn run_provider_managed(
 }
 
 async fn run_provider_inner(
-    config: ProviderConfig,
+    mut config: ProviderConfig,
     options: ProviderRunOptions,
     mut stop_rx: watch::Receiver<bool>,
+    mut pause_rx: watch::Receiver<bool>,
+    system_probe: Arc<dyn SystemProbe>,
     runtime_callback: RuntimeProgressCallback,
     event_callback: ProviderEventCallback,
 ) -> Result<()> {
+    config.resource_settings.validate()?;
     let model = effective_ollama_model(&config)?.effective;
     let runtime_manager = RuntimeManager::new()?;
+    if *stop_rx.borrow() {
+        runtime_callback(RuntimeState::Stopping);
+        runtime_callback(if runtime_manager.runtime_dir().exists() {
+            RuntimeState::Ready
+        } else {
+            RuntimeState::NotInstalled
+        });
+        emit_connection(&event_callback, ConnectionState::Disconnected, None);
+        return Ok(());
+    }
+    let confirmed_not_recommended =
+        options.confirmed_not_recommended || config.resource_settings.not_recommended_confirmed;
+    let suitability = runtime_suitability();
+    ensure_provider_confirmation(&suitability, confirmed_not_recommended)?;
+    if options.confirmed_not_recommended
+        && !config.resource_settings.not_recommended_confirmed
+        && matches!(suitability, RuntimeSuitability::NotRecommended { .. })
+    {
+        config.resource_settings.not_recommended_confirmed = true;
+        save_config(&config)?;
+    }
     let runtime_install = tokio::select! {
         biased;
         _ = wait_for_stop(&mut stop_rx) => {
@@ -134,7 +249,7 @@ async fn run_provider_inner(
         }
         result = runtime_manager.install(
             &model,
-            options.confirmed_not_recommended,
+            confirmed_not_recommended,
             runtime_callback.clone(),
         ) => result?,
     };
@@ -150,8 +265,12 @@ async fn run_provider_inner(
             emit_connection(&event_callback, ConnectionState::Disconnected, None);
             return Ok(());
         }
-        result = runtime_manager.start(runtime_callback.clone()) => result?,
+        result = runtime_manager.start_with_settings(
+            &config.resource_settings,
+            runtime_callback.clone(),
+        ) => result?,
     };
+    let resource_settings = config.resource_settings.clone();
     println!(
         "Managed Ollama runtime listening on 127.0.0.1:{}",
         runtime.port()
@@ -175,10 +294,15 @@ async fn run_provider_inner(
         run_provider_connection(
             config,
             model,
-            &runtime,
-            options,
-            &mut stop_rx,
-            &event_callback,
+            ProviderConnectionContext {
+                runtime: &runtime,
+                options,
+                stop_rx: &mut stop_rx,
+                pause_rx: &mut pause_rx,
+                resource_settings: &resource_settings,
+                system_probe: system_probe.as_ref(),
+                event_callback: &event_callback,
+            },
         )
         .await
     }
@@ -207,11 +331,17 @@ async fn run_provider_inner(
 async fn run_provider_connection(
     config: ProviderConfig,
     model: String,
-    runtime: &RunningRuntime,
-    options: ProviderRunOptions,
-    stop_rx: &mut watch::Receiver<bool>,
-    event_callback: &ProviderEventCallback,
+    context: ProviderConnectionContext<'_>,
 ) -> Result<()> {
+    let ProviderConnectionContext {
+        runtime,
+        options,
+        stop_rx,
+        pause_rx,
+        resource_settings,
+        system_probe,
+        event_callback,
+    } = context;
     let coordinator_url = if options.use_cli_environment_overrides {
         std::env::var("COORDINATOR_WS").unwrap_or(config.coordinator_ws.clone())
     } else {
@@ -223,6 +353,18 @@ async fn run_provider_connection(
         config.provider_id.clone()
     };
     let gpu = detect_gpu();
+    let initial_sample = system_probe.sample();
+    let mut policy_decision = decide_current_policy(
+        resource_settings,
+        initial_sample.idle,
+        initial_sample.power,
+        *pause_rx.borrow(),
+    );
+    let accepting_jobs = matches!(&policy_decision, PolicyDecision::Run);
+    event_callback(ProviderEvent::Policy {
+        decision: policy_decision.clone(),
+        diagnostic: initial_sample.diagnostic.clone(),
+    });
     let payout_address = match config.payout_address.as_deref() {
         Some(address) => match crate::validate_payout_address(address) {
             Ok(()) => address.to_string(),
@@ -256,6 +398,7 @@ async fn run_provider_connection(
         gpu_name: gpu.gpu_name,
         gpu_memory: gpu.gpu_memory,
         model: model.clone(),
+        accepting_jobs,
     });
     sender
         .send(Message::Text(
@@ -264,21 +407,68 @@ async fn run_provider_connection(
         .await
         .context("failed to send provider registration")?;
 
+    let mut deferred_job: Option<JobPayload> = None;
+    let mut policy_refresh = tokio::time::interval(Duration::from_secs(2));
+    let mut resource_monitor = ResourceMonitor::default();
+    let mut pause_control_open = true;
     'connection: loop {
-        let message = tokio::select! {
-            biased;
-            _ = wait_for_stop(stop_rx) => {
-                let _ = sender.send(Message::Close(None)).await;
-                break;
-            }
-            _ = tokio::signal::ctrl_c(), if options.handle_ctrl_c => {
-                println!("Stopping GPU Swarm provider.");
-                break;
-            }
-            message = receiver.next() => {
-                match message {
-                    Some(message) => message.context("failed to read WebSocket message")?,
-                    None => break,
+        let deferred = if matches!(&policy_decision, PolicyDecision::Run) {
+            deferred_job.take()
+        } else {
+            None
+        };
+        let message = if let Some(job) = deferred {
+            Message::Text(
+                serde_json::to_string(&WsMessage::Job(job))
+                    .context("failed to serialize deferred provider job")?,
+            )
+        } else {
+            tokio::select! {
+                biased;
+                _ = wait_for_stop(stop_rx) => {
+                    let _ = sender.send(Message::Close(None)).await;
+                    break;
+                }
+                _ = tokio::signal::ctrl_c(), if options.handle_ctrl_c => {
+                    println!("Stopping GPU Swarm provider.");
+                    break;
+                }
+                _ = policy_refresh.tick() => {
+                    refresh_policy(
+                        resource_settings,
+                        pause_rx,
+                        system_probe,
+                        &mut policy_decision,
+                        &mut sender,
+                        event_callback,
+                    )
+                    .await?;
+                    event_callback(ProviderEvent::ResourceMonitor {
+                        metrics: resource_monitor.sample(runtime.process_id()),
+                    });
+                    continue;
+                }
+                changed = pause_rx.changed(), if pause_control_open => {
+                    if changed.is_ok() {
+                        refresh_policy(
+                            resource_settings,
+                            pause_rx,
+                            system_probe,
+                            &mut policy_decision,
+                            &mut sender,
+                            event_callback,
+                        )
+                        .await?;
+                    } else {
+                        pause_control_open = false;
+                    }
+                    continue;
+                }
+                message = receiver.next() => {
+                    match message {
+                        Some(message) => message.context("failed to read WebSocket message")?,
+                        None => break,
+                    }
                 }
             }
         };
@@ -289,24 +479,74 @@ async fn run_provider_connection(
                     serde_json::from_str(&json).context("coordinator sent invalid JSON")?;
                 match message {
                     WsMessage::Job(job) => {
+                        refresh_policy(
+                            resource_settings,
+                            pause_rx,
+                            system_probe,
+                            &mut policy_decision,
+                            &mut sender,
+                            event_callback,
+                        )
+                        .await?;
+                        if !matches!(&policy_decision, PolicyDecision::Run) {
+                            println!(
+                                "Coordinator sent job {} while provider is paused; holding it until resume",
+                                job.id
+                            );
+                            deferred_job = Some(job);
+                            continue;
+                        }
                         println!("Received job");
                         event_callback(ProviderEvent::JobStarted {
                             job_id: job.id.clone(),
                         });
-                        let inference = run_ollama(
+                        let inference = run_ollama_with_settings(
                             runtime.api_url(),
                             &job.id,
                             &provider_id,
                             &model,
                             &job.prompt,
+                            resource_settings,
                         );
-                        let result = tokio::select! {
-                            biased;
-                            _ = wait_for_stop(stop_rx) => {
-                                let _ = sender.send(Message::Close(None)).await;
-                                break 'connection;
+                        tokio::pin!(inference);
+                        let result = loop {
+                            tokio::select! {
+                                biased;
+                                _ = wait_for_stop(stop_rx) => {
+                                    let _ = sender.send(Message::Close(None)).await;
+                                    break 'connection;
+                                }
+                                result = &mut inference => break result,
+                                _ = policy_refresh.tick() => {
+                                    refresh_policy(
+                                        resource_settings,
+                                        pause_rx,
+                                        system_probe,
+                                        &mut policy_decision,
+                                        &mut sender,
+                                        event_callback,
+                                    )
+                                    .await?;
+                                    event_callback(ProviderEvent::ResourceMonitor {
+                                        metrics: resource_monitor.sample(runtime.process_id()),
+                                    });
+                                }
+                                changed = pause_rx.changed(), if pause_control_open => {
+                                    if changed.is_ok() {
+                                        refresh_policy(
+                                            resource_settings,
+                                            pause_rx,
+                                            system_probe,
+                                            &mut policy_decision,
+                                            &mut sender,
+                                            event_callback,
+                                        )
+                                        .await?;
+                                    } else {
+                                        pause_control_open = false;
+                                    }
+                                }
                             }
-                            result = inference => result,
                         };
 
                         let result: JobResult = match result {
@@ -322,6 +562,15 @@ async fn run_provider_connection(
                             },
                         };
 
+                        refresh_policy(
+                            resource_settings,
+                            pause_rx,
+                            system_probe,
+                            &mut policy_decision,
+                            &mut sender,
+                            event_callback,
+                        )
+                        .await?;
                         let result_json = serde_json::to_string(&WsMessage::Result(result.clone()))
                             .context("failed to serialize job result")?;
                         sender
@@ -361,6 +610,9 @@ async fn run_provider_connection(
                         });
                         fee_config = Some(fees);
                     }
+                    WsMessage::Availability { .. } => {
+                        println!("Ignoring unexpected coordinator availability message");
+                    }
                 }
             }
             Message::Binary(_) => println!("Ignoring unexpected binary message"),
@@ -392,6 +644,41 @@ async fn run_provider_connection(
 
 type CoordinatorSocket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+async fn refresh_policy(
+    settings: &ResourceSettings,
+    pause_rx: &watch::Receiver<bool>,
+    system_probe: &dyn SystemProbe,
+    current: &mut PolicyDecision,
+    sender: &mut futures_util::stream::SplitSink<CoordinatorSocket, Message>,
+    event_callback: &ProviderEventCallback,
+) -> Result<()> {
+    let sample = system_probe.sample();
+    let next = decide_current_policy(settings, sample.idle, sample.power, *pause_rx.borrow());
+    if *current == next {
+        return Ok(());
+    }
+
+    let accepting_jobs = matches!(&next, PolicyDecision::Run);
+    let availability = WsMessage::Availability { accepting_jobs };
+    sender
+        .send(Message::Text(
+            serde_json::to_string(&availability)
+                .context("failed to serialize provider availability")?,
+        ))
+        .await
+        .context("failed to send provider availability")?;
+    match &next {
+        PolicyDecision::Run => println!("Provider policy: Run; accepting jobs"),
+        PolicyDecision::Paused(reason) => println!("Provider policy: Paused — {reason}"),
+    }
+    event_callback(ProviderEvent::Policy {
+        decision: next.clone(),
+        diagnostic: sample.diagnostic,
+    });
+    *current = next;
+    Ok(())
+}
 
 async fn connect_with_retry(
     coordinator_url: &str,

@@ -8,8 +8,8 @@ use std::{
     fs::OpenOptions,
     io::Write,
     net::SocketAddr,
-    sync::Arc,
     sync::atomic::{AtomicU64, Ordering},
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -30,8 +30,7 @@ use serde::Serialize;
 use tokio::sync::{mpsc, watch, Mutex};
 
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
-type ProviderSenderMap =
-    HashMap<String, (u64, mpsc::UnboundedSender<JobPayload>)>;
+type ProviderSenderMap = HashMap<String, (u64, mpsc::UnboundedSender<JobPayload>)>;
 
 /// Application state shared by HTTP and WebSocket handlers.
 #[derive(Clone)]
@@ -136,6 +135,7 @@ struct ProviderInfo {
     gpu_memory: String,
     model: String,
     status: String,
+    accepting_jobs: bool,
     jobs_completed: u64,
     total_earned_units: u64,
 }
@@ -163,17 +163,18 @@ fn apply_completed_job_result(
     result: &JobResult,
     fees: &FeeSettings,
 ) {
-    let (platform_fee, provider_payout) =
-        calculate_fee(fees.job_price_units, fees.fee_bps);
-    let record = jobs.entry(result.job_id.clone()).or_insert_with(|| JobRecord {
-        id: result.job_id.clone(),
-        prompt: String::new(),
-        status: "queued".to_string(),
-        provider_id: None,
-        result: None,
-        fee_breakdown: None,
-        error: None,
-    });
+    let (platform_fee, provider_payout) = calculate_fee(fees.job_price_units, fees.fee_bps);
+    let record = jobs
+        .entry(result.job_id.clone())
+        .or_insert_with(|| JobRecord {
+            id: result.job_id.clone(),
+            prompt: String::new(),
+            status: "queued".to_string(),
+            provider_id: None,
+            result: None,
+            fee_breakdown: None,
+            error: None,
+        });
     record.status = "completed".to_string();
     record.provider_id = Some(result.provider_id.clone());
     record.result = Some(result.clone());
@@ -191,9 +192,7 @@ fn fail_running_jobs_for_provider(
     error: &str,
 ) {
     for record in jobs.values_mut() {
-        if record.status == "running"
-            && record.provider_id.as_deref() == Some(provider_id)
-        {
+        if record.status == "running" && record.provider_id.as_deref() == Some(provider_id) {
             record.status = "failed".to_string();
             record.error = Some(error.to_string());
             append_line(
@@ -273,7 +272,7 @@ async fn assign_pending_job(state: AppState) {
             let providers = state.providers.lock().await;
             providers
                 .iter()
-                .find(|(_, provider)| provider.status == "idle")
+                .find(|(_, provider)| provider.status == "idle" && provider.accepting_jobs)
                 .map(|(provider_id, _)| provider_id.clone())
         };
         let Some(provider_id) = idle_provider else {
@@ -281,7 +280,9 @@ async fn assign_pending_job(state: AppState) {
         };
         let sender = {
             let sender_map = state.provider_senders.lock().await;
-            sender_map.get(&provider_id).map(|(_, sender)| sender.clone())
+            sender_map
+                .get(&provider_id)
+                .map(|(_, sender)| sender.clone())
         };
         let Some(sender) = sender else {
             break;
@@ -325,8 +326,7 @@ async fn assign_pending_job(state: AppState) {
                     && record.provider_id.as_deref() == Some(&timeout_provider_id)
                 {
                     record.status = "failed".to_string();
-                    record.error =
-                        Some(format!("Job timed out after {timeout_secs} seconds"));
+                    record.error = Some(format!("Job timed out after {timeout_secs} seconds"));
                     append_line(
                         "failed_jobs.log",
                         &format!(
@@ -423,10 +423,7 @@ fn append_line(path: &str, line: &str) {
 }
 
 /// GET /ws: upgrade the HTTP connection to a WebSocket.
-async fn ws_upgrade(
-    State(state): State<AppState>,
-    upgrade: WebSocketUpgrade,
-) -> impl IntoResponse {
+async fn ws_upgrade(State(state): State<AppState>, upgrade: WebSocketUpgrade) -> impl IntoResponse {
     upgrade.on_upgrade(move |socket| handle_websocket(socket, state))
 }
 
@@ -454,11 +451,7 @@ async fn handle_websocket(socket: WebSocket, state: AppState) {
         if let Ok(json) = serde_json::to_string(&WsMessage::FeeConfig(SharedFeeConfig {
             fee_bps: send_fees.fee_bps,
             job_price_units: send_fees.job_price_units,
-            provider_payout_units: calculate_fee(
-                send_fees.job_price_units,
-                send_fees.fee_bps,
-            )
-            .1,
+            provider_payout_units: calculate_fee(send_fees.job_price_units, send_fees.fee_bps).1,
             fee_address: send_fees.platform_address.clone(),
         })) {
             if sender.send(Message::Text(json)).await.is_err() {
@@ -530,20 +523,21 @@ async fn handle_websocket(socket: WebSocket, state: AppState) {
                                 "completed_jobs.log",
                                 &format!(
                                     "[SUCCESS] Job {} completed by {}. Result: {}",
-                                    result.job_id,
-                                    result.provider_id,
-                                    result.result_data
+                                    result.job_id, result.provider_id, result.result_data
                                 ),
                             );
                             {
                                 let mut providers = receive_providers.lock().await;
                                 if let Some(provider) = providers.get_mut(&result.provider_id) {
-                                    provider.status = "idle".to_string();
-                                    provider.jobs_completed = provider.jobs_completed.saturating_add(1);
+                                    provider.status = if provider.accepting_jobs {
+                                        "idle".to_string()
+                                    } else {
+                                        "paused".to_string()
+                                    };
+                                    provider.jobs_completed =
+                                        provider.jobs_completed.saturating_add(1);
                                     provider.total_earned_units =
-                                        provider
-                                            .total_earned_units
-                                            .saturating_add(provider_payout);
+                                        provider.total_earned_units.saturating_add(provider_payout);
                                 }
                             }
                             assign_pending_job(receive_state.clone()).await;
@@ -569,17 +563,21 @@ async fn handle_websocket(socket: WebSocket, state: AppState) {
                                 ),
                             );
                         } else {
-                            if let Some(record) = receive_state.jobs.lock().await.get_mut(&result.job_id) {
+                            if let Some(record) =
+                                receive_state.jobs.lock().await.get_mut(&result.job_id)
+                            {
                                 record.status = "failed".to_string();
                                 record.result = Some(result.clone());
                                 record.error = result.error.clone();
                             }
-                            if let Some(provider) = receive_providers
-                                .lock()
-                                .await
-                                .get_mut(&result.provider_id)
+                            if let Some(provider) =
+                                receive_providers.lock().await.get_mut(&result.provider_id)
                             {
-                                provider.status = "idle".to_string();
+                                provider.status = if provider.accepting_jobs {
+                                    "idle".to_string()
+                                } else {
+                                    "paused".to_string()
+                                };
                             }
                             assign_pending_job(receive_state.clone()).await;
                             append_line(
@@ -623,9 +621,7 @@ async fn handle_websocket(socket: WebSocket, state: AppState) {
                         let mut providers = receive_providers.lock().await;
                         let (jobs_completed, total_earned_units) = providers
                             .get(&provider_id)
-                            .map(|provider| {
-                                (provider.jobs_completed, provider.total_earned_units)
-                            })
+                            .map(|provider| (provider.jobs_completed, provider.total_earned_units))
                             .unwrap_or((0, 0));
                         providers.insert(
                             provider_id.clone(),
@@ -635,23 +631,52 @@ async fn handle_websocket(socket: WebSocket, state: AppState) {
                                 gpu_name: registration.gpu_name,
                                 gpu_memory: registration.gpu_memory,
                                 model: registration.model,
-                                status: "idle".to_string(),
+                                status: if registration.accepting_jobs {
+                                    "idle".to_string()
+                                } else {
+                                    "paused".to_string()
+                                },
+                                accepting_jobs: registration.accepting_jobs,
                                 jobs_completed,
                                 total_earned_units,
                             },
                         );
                         *receive_provider_id.lock().await = Some(provider_id);
-                        state
-                            .provider_senders
-                            .lock()
-                            .await
-                            .insert(
-                                registration.provider_id.clone(),
-                                (connection_id, job_tx.clone()),
-                            );
+                        state.provider_senders.lock().await.insert(
+                            registration.provider_id.clone(),
+                            (connection_id, job_tx.clone()),
+                        );
                         println!("Registered provider: {}", registration.provider_id);
                         drop(providers);
                         assign_pending_job(state.clone()).await;
+                    }
+                    Ok(WsMessage::Availability { accepting_jobs }) => {
+                        let provider_id = receive_provider_id.lock().await.clone();
+                        if let Some(provider_id) = provider_id {
+                            let is_active_connection = receive_state
+                                .provider_senders
+                                .lock()
+                                .await
+                                .get(&provider_id)
+                                .is_some_and(|(active_id, _)| *active_id == connection_id);
+                            if is_active_connection {
+                                if let Some(provider) =
+                                    receive_providers.lock().await.get_mut(&provider_id)
+                                {
+                                    provider.accepting_jobs = accepting_jobs;
+                                    if provider.status != "busy" {
+                                        provider.status = if accepting_jobs {
+                                            "idle".to_string()
+                                        } else {
+                                            "paused".to_string()
+                                        };
+                                    }
+                                }
+                                if accepting_jobs {
+                                    assign_pending_job(receive_state.clone()).await;
+                                }
+                            }
+                        }
                     }
                     Ok(WsMessage::FeeConfig(config)) => {
                         eprintln!("Unexpected fee config from provider: {config:?}");
@@ -662,7 +687,10 @@ async fn handle_websocket(socket: WebSocket, state: AppState) {
                 },
                 Ok(Message::Close(frame)) => {
                     if let Some(frame) = frame {
-                        println!("Provider disconnected: code={} reason={}", frame.code, frame.reason);
+                        println!(
+                            "Provider disconnected: code={} reason={}",
+                            frame.code, frame.reason
+                        );
                     } else {
                         println!("Provider disconnected");
                     }
@@ -675,7 +703,11 @@ async fn handle_websocket(socket: WebSocket, state: AppState) {
                             .is_some_and(|(active_id, _)| *active_id == connection_id);
                         if is_active_connection {
                             receive_providers.lock().await.remove(&provider_id);
-                            receive_state.provider_senders.lock().await.remove(&provider_id);
+                            receive_state
+                                .provider_senders
+                                .lock()
+                                .await
+                                .remove(&provider_id);
                             {
                                 fail_running_jobs_for_provider(
                                     &mut *receive_state.jobs.lock().await,
@@ -709,7 +741,11 @@ async fn handle_websocket(socket: WebSocket, state: AppState) {
                             .is_some_and(|(active_id, _)| *active_id == connection_id);
                         if is_active_connection {
                             receive_providers.lock().await.remove(&provider_id);
-                            receive_state.provider_senders.lock().await.remove(&provider_id);
+                            receive_state
+                                .provider_senders
+                                .lock()
+                                .await
+                                .remove(&provider_id);
                             {
                                 fail_running_jobs_for_provider(
                                     &mut *receive_state.jobs.lock().await,
@@ -817,9 +853,9 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_completed_job_result, calculate_fee, fail_running_jobs_for_provider,
-        assign_pending_job, AppState, FeeSettings, JobPayload, JobRecord, JobResult,
-        ProviderInfo, validate_fee_address,
+        apply_completed_job_result, assign_pending_job, calculate_fee,
+        fail_running_jobs_for_provider, validate_fee_address, AppState, FeeSettings, JobPayload,
+        JobRecord, JobResult, ProviderInfo,
     };
     use std::{
         collections::{HashMap, VecDeque},
@@ -953,7 +989,9 @@ mod tests {
 
     #[test]
     fn fee_address_rejects_too_long_address() {
-        assert!(validate_fee_address(Some("0x11111111111111111111111111111111111111111111")).is_err());
+        assert!(
+            validate_fee_address(Some("0x11111111111111111111111111111111111111111111")).is_err()
+        );
     }
 
     #[test]
@@ -967,7 +1005,7 @@ mod tests {
         let state = AppState {
             assignment_lock: Arc::new(Mutex::new(())),
             pending_jobs: Arc::new(Mutex::new(VecDeque::from([
-                "job-single-assignment".to_string(),
+                "job-single-assignment".to_string()
             ]))),
             jobs: Arc::new(Mutex::new(HashMap::from([(
                 "job-single-assignment".to_string(),
@@ -993,7 +1031,8 @@ mod tests {
                     gpu_name: "test GPU".to_string(),
                     gpu_memory: "test memory".to_string(),
                     model: "test model".to_string(),
-                    status: "idle".to_string(),
+                    status: "paused".to_string(),
+                    accepting_jobs: false,
                     jobs_completed: 0,
                     total_earned_units: 0,
                 },
@@ -1005,6 +1044,20 @@ mod tests {
             },
             job_timeout_secs: 120,
         };
+
+        assign_pending_job(state.clone()).await;
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(state.pending_jobs.lock().await.len(), 1);
+        assert_eq!(
+            state.jobs.lock().await["job-single-assignment"].status,
+            "queued"
+        );
+        {
+            let mut providers = state.providers.lock().await;
+            let provider = providers.get_mut("test-provider-A").unwrap();
+            provider.accepting_jobs = true;
+            provider.status = "idle".to_string();
+        }
 
         let first = tokio::spawn(assign_pending_job(state.clone()));
         let second = tokio::spawn(assign_pending_job(state.clone()));
@@ -1020,4 +1073,3 @@ mod tests {
         );
     }
 }
-

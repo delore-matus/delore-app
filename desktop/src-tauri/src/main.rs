@@ -4,10 +4,12 @@ use std::sync::{
 };
 
 use provider_core::{
-    detect_gpu, effective_ollama_model, load_config, run_provider_managed, runtime_suitability,
-    set_ollama_model as save_ollama_model, FeeConfig, GpuInfo, ProviderConfig, ProviderEvent,
-    ProviderEventCallback, RuntimeDownloadPhase, RuntimeManager, RuntimeProgressCallback,
-    RuntimeState, RuntimeSuitability,
+    confirm_not_recommended_runtime, detect_gpu, effective_ollama_model, load_config,
+    provider_control_channel, run_provider_managed_with_control, runtime_suitability,
+    set_ollama_model as save_ollama_model, set_resource_settings as save_resource_settings,
+    FeeConfig, GpuInfo, PolicyDecision, PresetMapping, ProviderConfig, ProviderControl,
+    ProviderEvent, ProviderEventCallback, ResourceMetrics, ResourceSettings, RuntimeDownloadPhase,
+    RuntimeManager, RuntimeProgressCallback, RuntimeState, RuntimeSuitability,
 };
 use serde::Serialize;
 use tauri::{Emitter, Manager, State, WindowEvent};
@@ -48,16 +50,24 @@ struct StatusSnapshot {
     model_percent: u8,
     expected_total_download_bytes: Option<u64>,
     error_message: Option<String>,
+    resource_settings: ResourceSettings,
+    policy: PolicyDecision,
+    policy_diagnostic: Option<String>,
+    resource_metrics: ResourceMetrics,
+    preset_mapping: PresetMapping,
+    requires_restart: bool,
 }
 
 struct ProviderTask {
     stop: watch::Sender<bool>,
+    control: ProviderControl,
     join: tauri::async_runtime::JoinHandle<()>,
 }
 
 struct StateInner {
     snapshot: Mutex<StatusSnapshot>,
     task: AsyncMutex<Option<ProviderTask>>,
+    running_resource_settings: Mutex<Option<ResourceSettings>>,
     confirmation_granted: Mutex<bool>,
     close_started: AtomicBool,
     allow_window_close: AtomicBool,
@@ -90,6 +100,8 @@ impl DesktopState {
             _ => None,
         };
         let configured_model = config.ollama_model.clone();
+        let resource_settings = config.resource_settings.clone();
+        let preset_mapping = resource_preset_mapping(&resource_settings);
         let (effective_model, model_override_active, model_error) = model_status_selection(&config);
         let snapshot = StatusSnapshot {
             provider_running: false,
@@ -111,11 +123,24 @@ impl DesktopState {
             model_percent: 0,
             expected_total_download_bytes: None,
             error_message: error_message.or(runtime_error).or(model_error),
+            resource_settings,
+            policy: PolicyDecision::Paused("Provider is stopped".to_string()),
+            policy_diagnostic: None,
+            resource_metrics: ResourceMetrics {
+                runtime_cpu_percent: None,
+                runtime_ram_bytes: None,
+                gpu_utilization_percent: None,
+                gpu_vram_used_bytes: None,
+                gpu_device_wide: false,
+            },
+            preset_mapping,
+            requires_restart: false,
         };
         Self {
             inner: Arc::new(StateInner {
                 snapshot: Mutex::new(snapshot),
                 task: AsyncMutex::new(None),
+                running_resource_settings: Mutex::new(None),
                 confirmation_granted: Mutex::new(false),
                 close_started: AtomicBool::new(false),
                 allow_window_close: AtomicBool::new(false),
@@ -150,8 +175,13 @@ async fn get_status(state: State<'_, DesktopState>) -> Result<StatusSnapshot, St
 }
 
 #[tauri::command]
-fn confirm_runtime_download(state: State<'_, DesktopState>) -> Result<(), String> {
+fn confirm_runtime_download(
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+) -> Result<(), String> {
     if let RuntimeSuitability::NotRecommended { .. } = runtime_suitability() {
+        let config = confirm_not_recommended_runtime()
+            .map_err(|error| format!("Could not save hardware confirmation: {error:#}"))?;
         let mut granted = state
             .inner()
             .inner
@@ -159,6 +189,9 @@ fn confirm_runtime_download(state: State<'_, DesktopState>) -> Result<(), String
             .lock()
             .map_err(|error| format!("Could not record runtime confirmation: {error}"))?;
         *granted = true;
+        update_status(&state.inner().inner, &app, |snapshot| {
+            snapshot.resource_settings = config.resource_settings;
+        });
     }
     Ok(())
 }
@@ -172,10 +205,8 @@ async fn start_provider(
         .map_err(|error| format!("Could not load provider configuration: {error:#}"))?
         .unwrap_or_else(ProviderConfig::defaults);
     let selection = effective_ollama_model(&config).map_err(|error| format!("{error:#}"))?;
-    let runtime_manager =
-        RuntimeManager::new().map_err(|error| format!("Runtime paths unavailable: {error:#}"))?;
-    let requires_confirmation = requires_runtime_confirmation(
-        runtime_manager.runtime_dir().exists(),
+    let requires_confirmation = requires_provider_confirmation(
+        config.resource_settings.not_recommended_confirmed,
         &runtime_suitability(),
     );
     let confirmed = {
@@ -186,11 +217,9 @@ async fn start_provider(
             .lock()
             .map_err(|error| format!("Could not check runtime confirmation: {error}"))?;
         if requires_confirmation && !*granted {
-            return Err(
-                "Runtime preparation on this hardware requires explicit confirmation.".into(),
-            );
+            return Err("Provider use on this hardware requires explicit confirmation.".into());
         }
-        std::mem::take(&mut *granted)
+        std::mem::take(&mut *granted) || config.resource_settings.not_recommended_confirmed
     };
 
     let mut task_slot = state.inner().inner.task.lock().await;
@@ -218,10 +247,15 @@ async fn start_provider(
         snapshot.runtime_percent = 0;
         snapshot.model_percent = 0;
         snapshot.expected_total_download_bytes = None;
+        snapshot.resource_settings = config.resource_settings.clone();
+        snapshot.preset_mapping = resource_preset_mapping(&config.resource_settings);
+        snapshot.requires_restart = false;
     }
     emit_status(&app, state.inner());
 
+    let active_resource_settings = config.resource_settings.clone();
     let (stop, stop_rx) = watch::channel(false);
+    let (control, pause_rx) = provider_control_channel();
     let runtime_state = state.inner().inner.clone();
     let runtime_app = app.clone();
     let runtime_callback: RuntimeProgressCallback = Arc::new(move |runtime| {
@@ -272,19 +306,43 @@ async fn start_provider(
                     error: result.error,
                 }
             }
+            ProviderEvent::Policy {
+                decision,
+                diagnostic,
+            } => {
+                snapshot.policy = decision;
+                snapshot.policy_diagnostic = diagnostic;
+            }
+            ProviderEvent::ResourceMonitor { metrics } => {
+                snapshot.resource_metrics = metrics;
+            }
             ProviderEvent::Error { message } => snapshot.error_message = Some(message),
         });
     });
 
     let task_state = state.inner().inner.clone();
     let task_app = app.clone();
+    *state
+        .inner()
+        .inner
+        .running_resource_settings
+        .lock()
+        .map_err(|error| format!("Could not track active resource settings: {error}"))? =
+        Some(active_resource_settings);
     let join = tauri::async_runtime::spawn(async move {
-        let result =
-            run_provider_managed(config, confirmed, stop_rx, runtime_callback, event_callback)
-                .await;
+        let result = run_provider_managed_with_control(
+            config,
+            confirmed,
+            stop_rx,
+            pause_rx,
+            runtime_callback,
+            event_callback,
+        )
+        .await;
         update_status(&task_state, &task_app, |snapshot| {
             snapshot.provider_running = false;
             snapshot.connection = provider_core::ConnectionState::Disconnected;
+            snapshot.policy = PolicyDecision::Paused("Provider is stopped".to_string());
             if matches!(&snapshot.current_job, CurrentJob::Running { .. }) {
                 snapshot.current_job = CurrentJob::Idle;
             }
@@ -304,8 +362,15 @@ async fn start_provider(
                 snapshot.error_message = Some(format!("{error:#}"));
             }
         });
+        if let Ok(mut running) = task_state.running_resource_settings.lock() {
+            *running = None;
+        }
     });
-    *task_slot = Some(ProviderTask { stop, join });
+    *task_slot = Some(ProviderTask {
+        stop,
+        control,
+        join,
+    });
     Ok(())
 }
 
@@ -315,6 +380,56 @@ async fn stop_provider(
     state: State<'_, DesktopState>,
 ) -> Result<(), String> {
     stop_provider_task(&app, state.inner()).await
+}
+
+#[tauri::command]
+async fn pause_provider(state: State<'_, DesktopState>) -> Result<(), String> {
+    let task_slot = state.inner().inner.task.lock().await;
+    let task = task_slot
+        .as_ref()
+        .ok_or_else(|| "Provider is not running.".to_string())?;
+    task.control.pause().map_err(|error| format!("{error:#}"))
+}
+
+#[tauri::command]
+async fn resume_provider(state: State<'_, DesktopState>) -> Result<(), String> {
+    let task_slot = state.inner().inner.task.lock().await;
+    let task = task_slot
+        .as_ref()
+        .ok_or_else(|| "Provider is not running.".to_string())?;
+    task.control.resume().map_err(|error| format!("{error:#}"))
+}
+
+#[tauri::command]
+fn set_resource_settings(
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    settings: ResourceSettings,
+) -> Result<StatusSnapshot, String> {
+    settings
+        .validate()
+        .map_err(|error| format!("Invalid resource settings: {error:#}"))?;
+    let requires_restart = state
+        .inner()
+        .inner
+        .running_resource_settings
+        .lock()
+        .map_err(|error| format!("Could not inspect active resource settings: {error}"))?
+        .as_ref()
+        .is_some_and(|active| active.requires_restart(&settings));
+    let config = save_resource_settings(settings).map_err(|error| format!("{error:#}"))?;
+    update_status(&state.inner().inner, &app, |snapshot| {
+        snapshot.resource_settings = config.resource_settings;
+        snapshot.preset_mapping = resource_preset_mapping(&snapshot.resource_settings);
+        snapshot.requires_restart = requires_restart;
+    });
+    state
+        .inner()
+        .inner
+        .snapshot
+        .lock()
+        .map(|snapshot| snapshot.clone())
+        .map_err(|error| format!("Provider status is unavailable: {error}"))
 }
 
 #[tauri::command]
@@ -370,6 +485,16 @@ fn model_status_selection(config: &ProviderConfig) -> (String, bool, Option<Stri
     }
 }
 
+fn resource_preset_mapping(settings: &ResourceSettings) -> PresetMapping {
+    let logical_cpu_count = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1);
+    settings.preset.mapping(
+        logical_cpu_count,
+        settings.mode == provider_core::ResourceMode::AlwaysOnLowPriority,
+    )
+}
+
 async fn populate_model_download_sizes(snapshot: &mut StatusSnapshot) {
     let manager = match RuntimeManager::new() {
         Ok(manager) => manager,
@@ -410,6 +535,7 @@ async fn stop_provider_task(app: &tauri::AppHandle, state: &DesktopState) -> Res
     update_status(&state.inner, app, |snapshot| {
         snapshot.provider_running = false;
         snapshot.connection = provider_core::ConnectionState::Disconnected;
+        snapshot.policy = PolicyDecision::Paused("Provider is stopped".to_string());
         if matches!(&snapshot.current_job, CurrentJob::Running { .. }) {
             snapshot.current_job = CurrentJob::Idle;
         }
@@ -433,11 +559,11 @@ async fn stop_provider_task_and_join(state: &StateInner) -> Result<(), String> {
     Ok(())
 }
 
-fn requires_runtime_confirmation(
-    runtime_installed: bool,
+fn requires_provider_confirmation(
+    already_confirmed: bool,
     suitability: &RuntimeSuitability,
 ) -> bool {
-    !runtime_installed && matches!(suitability, RuntimeSuitability::NotRecommended { .. })
+    !already_confirmed && matches!(suitability, RuntimeSuitability::NotRecommended { .. })
 }
 
 fn initial_runtime_state(manager: &RuntimeManager) -> RuntimeState {
@@ -488,6 +614,9 @@ fn main() {
             get_status,
             start_provider,
             stop_provider,
+            pause_provider,
+            resume_provider,
+            set_resource_settings,
             confirm_runtime_download,
             set_payout_address,
             set_ollama_model
@@ -523,8 +652,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        initial_runtime_state, requires_runtime_confirmation, stop_provider_task_and_join,
-        DesktopState, ProviderTask,
+        initial_runtime_state, provider_control_channel, requires_provider_confirmation,
+        stop_provider_task_and_join, DesktopState, ProviderTask,
     };
     use provider_core::{
         RuntimeManager, RuntimeProgressCallback, RuntimeState, RuntimeSuitability,
@@ -540,6 +669,7 @@ mod tests {
         tauri::async_runtime::block_on(async {
             let state = DesktopState::new();
             let (stop, mut stop_rx) = watch::channel(false);
+            let (control, _) = provider_control_channel();
             let task_stopped = Arc::new(AtomicBool::new(false));
             let observed_stop = task_stopped.clone();
             let join = tauri::async_runtime::spawn(async move {
@@ -547,7 +677,11 @@ mod tests {
                     observed_stop.store(true, Ordering::Release);
                 }
             });
-            *state.inner.task.lock().await = Some(ProviderTask { stop, join });
+            *state.inner.task.lock().await = Some(ProviderTask {
+                stop,
+                control,
+                join,
+            });
 
             stop_provider_task_and_join(&state.inner).await.unwrap();
 
@@ -569,12 +703,17 @@ mod tests {
 
             let state = DesktopState::new();
             let (stop, mut stop_rx) = watch::channel(false);
+            let (control, _) = provider_control_channel();
             let join = tauri::async_runtime::spawn(async move {
                 if stop_rx.changed().await.is_ok() && *stop_rx.borrow() {
                     runtime.shutdown(runtime_callback).await.unwrap();
                 }
             });
-            *state.inner.task.lock().await = Some(ProviderTask { stop, join });
+            *state.inner.task.lock().await = Some(ProviderTask {
+                stop,
+                control,
+                join,
+            });
 
             stop_provider_task_and_join(&state.inner).await.unwrap();
             println!("close-test managed runtime stopped");
@@ -590,19 +729,19 @@ mod tests {
         let manager = RuntimeManager::with_data_dir(data_dir.clone()).unwrap();
         assert!(!manager.runtime_dir().exists());
         assert_eq!(initial_runtime_state(&manager), RuntimeState::NotInstalled);
-        assert!(requires_runtime_confirmation(
+        assert!(requires_provider_confirmation(
             false,
             &RuntimeSuitability::NotRecommended {
                 reason: "integrated Intel GPU".to_string()
             }
         ));
-        assert!(!requires_runtime_confirmation(
+        assert!(!requires_provider_confirmation(
             true,
             &RuntimeSuitability::NotRecommended {
                 reason: "integrated Intel GPU".to_string()
             }
         ));
-        assert!(!requires_runtime_confirmation(
+        assert!(!requires_provider_confirmation(
             false,
             &RuntimeSuitability::Suitable
         ));

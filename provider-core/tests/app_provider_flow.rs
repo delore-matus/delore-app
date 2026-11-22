@@ -7,7 +7,7 @@ use std::{
 
 use provider_core::{
     run_provider_managed, ConnectionState, ProviderConfig, ProviderEvent, ProviderEventCallback,
-    RuntimeManager, RuntimeProgressCallback, RuntimeState,
+    ResourceMode, ResourceSettings, RuntimeManager, RuntimeProgressCallback, RuntimeState,
 };
 use serde_json::Value;
 use tokio::sync::{mpsc, watch};
@@ -44,6 +44,10 @@ async fn app_managed_provider_runs_a_job_and_stops() {
         provider_id,
         coordinator_ws,
         ollama_model: "llama3.2:1b".to_string(),
+        resource_settings: ResourceSettings {
+            mode: ResourceMode::AlwaysOnLowPriority,
+            ..ResourceSettings::default()
+        },
     };
 
     let (stop, stop_rx) = watch::channel(false);

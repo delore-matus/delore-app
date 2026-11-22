@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::{process::Child, process::Command, time::timeout};
 
+use crate::resource::{ProcessPriority, ResourceSettings};
+
 pub const OLLAMA_VERSION: &str = "0.40.17";
 const CHECKSUMS_URL: &str =
     "https://github.com/ollama/ollama/releases/download/v0.40.17/sha256sum.txt";
@@ -51,6 +53,20 @@ pub enum RuntimeState {
 pub enum RuntimeSuitability {
     Suitable,
     NotRecommended { reason: String },
+}
+
+pub fn ensure_provider_confirmation(
+    suitability: &RuntimeSuitability,
+    confirmed: bool,
+) -> Result<()> {
+    if let RuntimeSuitability::NotRecommended { reason } = suitability {
+        if !confirmed {
+            bail!(
+                "provider cannot accept jobs on this hardware until the user explicitly confirms runtime use: {reason}"
+            );
+        }
+    }
+    Ok(())
 }
 
 pub type RuntimeProgressCallback = Arc<dyn Fn(RuntimeState) + Send + Sync + 'static>;
@@ -365,7 +381,16 @@ impl RuntimeManager {
     }
 
     pub async fn start(&self, callback: RuntimeProgressCallback) -> Result<RunningRuntime> {
-        match self.start_inner(&callback).await {
+        self.start_with_settings(&ResourceSettings::default(), callback)
+            .await
+    }
+
+    pub async fn start_with_settings(
+        &self,
+        settings: &ResourceSettings,
+        callback: RuntimeProgressCallback,
+    ) -> Result<RunningRuntime> {
+        match self.start_inner(settings, &callback).await {
             Ok(runtime) => Ok(runtime),
             Err(error) => {
                 callback(RuntimeState::Error {
@@ -376,7 +401,11 @@ impl RuntimeManager {
         }
     }
 
-    async fn start_inner(&self, callback: &RuntimeProgressCallback) -> Result<RunningRuntime> {
+    async fn start_inner(
+        &self,
+        settings: &ResourceSettings,
+        callback: &RuntimeProgressCallback,
+    ) -> Result<RunningRuntime> {
         callback(RuntimeState::Starting);
         let executable = self.executable_path()?;
         tokio::fs::create_dir_all(self.models_dir())
@@ -384,11 +413,26 @@ impl RuntimeManager {
             .context("failed to create the private model directory")?;
         let port = select_localhost_port()?;
         let api_url = format!("http://127.0.0.1:{port}");
+        let logical_cpu_count = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1);
+        let mapping = settings.preset.mapping(
+            logical_cpu_count,
+            settings.mode == crate::resource::ResourceMode::AlwaysOnLowPriority,
+        );
         let mut child = Command::new(&executable)
             .arg("serve")
             .env("OLLAMA_HOST", format!("127.0.0.1:{port}"))
             .env("OLLAMA_MODELS", self.models_dir())
             .env("OLLAMA_NO_CLOUD", "1")
+            .env(
+                "OLLAMA_NUM_PARALLEL",
+                mapping.ollama_num_parallel.to_string(),
+            )
+            .env(
+                "OLLAMA_MAX_LOADED_MODELS",
+                mapping.max_loaded_models.to_string(),
+            )
             .current_dir(self.runtime_dir())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -400,6 +444,14 @@ impl RuntimeManager {
                     executable.display()
                 )
             })?;
+        if let Some(process_id) = child.id() {
+            if let Err(error) =
+                RunningRuntime::apply_process_priority(process_id, mapping.process_priority)
+            {
+                let _ = child.kill().await;
+                return Err(error).context("could not apply managed Ollama process priority");
+            }
+        }
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             if let Some(status) = child
@@ -454,6 +506,10 @@ impl RunningRuntime {
         self.port
     }
 
+    pub fn process_id(&self) -> Option<u32> {
+        self.child.id()
+    }
+
     pub async fn ensure_model(
         &self,
         model: &str,
@@ -462,6 +518,43 @@ impl RunningRuntime {
     ) -> Result<()> {
         self.ensure_model_with_total(model, expected_model_bytes, expected_model_bytes, callback)
             .await
+    }
+
+    #[cfg(target_os = "windows")]
+    fn apply_process_priority(process_id: u32, priority: ProcessPriority) -> Result<()> {
+        use windows_sys::Win32::{
+            Foundation::CloseHandle,
+            System::Threading::{
+                OpenProcess, SetPriorityClass, BELOW_NORMAL_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS,
+                PROCESS_SET_INFORMATION,
+            },
+        };
+
+        let handle = unsafe { OpenProcess(PROCESS_SET_INFORMATION, 0, process_id) };
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to open managed Ollama process for priority update");
+        }
+        let priority_class = match priority {
+            ProcessPriority::Normal => NORMAL_PRIORITY_CLASS,
+            ProcessPriority::BelowNormal => BELOW_NORMAL_PRIORITY_CLASS,
+        };
+        let result = unsafe { SetPriorityClass(handle, priority_class) };
+        let close_result = unsafe { CloseHandle(handle) };
+        if result == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("Windows rejected the managed Ollama process priority");
+        }
+        if close_result == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to close managed Ollama process handle");
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn apply_process_priority(_process_id: u32, _priority: ProcessPriority) -> Result<()> {
+        Ok(())
     }
 
     pub async fn ensure_model_with_total(
@@ -1124,9 +1217,9 @@ mod tests {
 
     use super::{
         download_resumable, ensure_available_space, ensure_download_confirmation,
-        mach_header_supports_arch, parse_checksum_file, process_pull_progress,
-        select_localhost_port, verify_sha256, RuntimeDownloadPhase, RuntimeProgressCallback,
-        RuntimeState, RuntimeSuitability,
+        ensure_provider_confirmation, mach_header_supports_arch, parse_checksum_file,
+        process_pull_progress, select_localhost_port, verify_sha256, RuntimeDownloadPhase,
+        RuntimeProgressCallback, RuntimeState, RuntimeSuitability,
     };
 
     #[test]
@@ -1190,6 +1283,16 @@ mod tests {
         assert!(ensure_download_confirmation(suitability.clone(), false).is_err());
         assert!(ensure_download_confirmation(suitability, true).is_ok());
         assert!(ensure_download_confirmation(RuntimeSuitability::Suitable, false).is_ok());
+    }
+
+    #[test]
+    fn provider_cannot_run_on_not_recommended_hardware_without_persistent_consent() {
+        let suitability = RuntimeSuitability::NotRecommended {
+            reason: "integrated Intel GPU".to_string(),
+        };
+        assert!(ensure_provider_confirmation(&suitability, false).is_err());
+        assert!(ensure_provider_confirmation(&suitability, true).is_ok());
+        assert!(ensure_provider_confirmation(&RuntimeSuitability::Suitable, false).is_ok());
     }
 
     #[test]
