@@ -68,7 +68,7 @@ try {
     $config | ConvertTo-Json -Depth 8 | Set-Content -Path $configPath -Encoding UTF8
 
     $provider = Start-Process -FilePath "cargo" `
-        -ArgumentList "run", "-p", "provider-daemon" `
+        -ArgumentList "run", "-p", "provider-daemon", "--", "start" `
         -WorkingDirectory $PSScriptRoot `
         -RedirectStandardOutput $providerLog `
         -RedirectStandardError $providerErrorLog `

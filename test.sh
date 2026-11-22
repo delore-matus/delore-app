@@ -25,7 +25,7 @@ done
 curl -fsS http://127.0.0.1:8080/fees
 echo
 
-cargo run -p provider-daemon >"$PROVIDER_LOG" 2>&1 &
+cargo run -p provider-daemon -- start >"$PROVIDER_LOG" 2>&1 &
 PROVIDER_PID=$!
 
 echo "Waiting for provider registration..."
