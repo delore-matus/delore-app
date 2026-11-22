@@ -13,9 +13,12 @@ Tauri prerequisites for your OS, then run `npm install` in `desktop/` and
 builds the Vite frontend.
 
 This shell currently covers provider status, runtime/model progress, coordinator
-fees and connection state, job state, and validated payout-address editing.
-System tray, autostart, installers/bundles, and CI are intentionally not part
-of this step.
+fees and connection state, job state, and validated payout-address editing. Its
+resource settings include idle, scheduled, and low-priority modes; workload
+presets, battery protection, Pause/Resume, and managed-runtime monitoring.
+Metrics unavailable on the current GPU or OS are shown as unavailable. System
+tray, autostart, installers/bundles, and CI are intentionally not part of this
+step.
 The minimal Windows development icon is only a build resource; final platform
 icons remain part of the later bundling step.
 

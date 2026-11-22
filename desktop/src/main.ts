@@ -23,6 +23,43 @@ type CurrentJob =
   | { state: 'running'; job_id: string }
   | { state: 'finished'; job_id: string; result_data: string; error: string | null }
 
+type ResourceMode = 'only_when_idle' | 'always_on_low_priority' | 'scheduled_hours'
+type ResourcePreset = 'low' | 'balanced' | 'high'
+
+interface ResourceSchedule {
+  weekdays: number[]
+  start: string
+  end: string
+}
+
+interface ResourceSettings {
+  mode: ResourceMode
+  idle_threshold_minutes: number
+  schedule: ResourceSchedule | null
+  preset: ResourcePreset
+  do_not_run_on_battery: boolean
+  not_recommended_confirmed: boolean
+}
+
+type PolicyDecision = { state: 'run' } | { state: 'paused'; reason: string }
+
+interface PresetMapping {
+  num_thread: number
+  keep_alive: string
+  ollama_num_parallel: number
+  max_loaded_models: number
+  process_priority: 'normal' | 'below_normal'
+  priority_supported: boolean
+}
+
+interface ResourceMetrics {
+  runtime_cpu_percent: number | null
+  runtime_ram_bytes: number | null
+  gpu_utilization_percent: number | null
+  gpu_vram_used_bytes: number | null
+  gpu_device_wide: boolean
+}
+
 interface StatusSnapshot {
   provider_running: boolean
   runtime: RuntimeState
@@ -36,6 +73,7 @@ interface StatusSnapshot {
     fee_address: string
   } | null
   current_job: CurrentJob
+  user_paused: boolean
   payout_address: string | null
   coordinator_ws: string
   configured_model: string
@@ -48,6 +86,12 @@ interface StatusSnapshot {
   model_percent: number
   expected_total_download_bytes: number | null
   error_message: string | null
+  resource_settings: ResourceSettings
+  policy: PolicyDecision
+  policy_diagnostic: string | null
+  resource_metrics: ResourceMetrics
+  preset_mapping: PresetMapping
+  requires_restart: boolean
 }
 
 const root = document.querySelector<HTMLDivElement>('#app')
@@ -58,6 +102,8 @@ let addressError = ''
 let addressSuccess = ''
 let modelError = ''
 let modelSuccess = ''
+let resourceError = ''
+let resourceSuccess = ''
 let working = false
 
 root.innerHTML = `
@@ -144,6 +190,86 @@ root.innerHTML = `
       <p class="job-detail" id="job-detail">No active job.</p>
     </section>
 
+    <section class="panel resource-panel" aria-labelledby="resource-title">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">RESOURCE POLICY</p>
+          <h2 id="resource-title">Settings</h2>
+        </div>
+        <span class="state-chip" id="policy-state">Paused</span>
+      </div>
+      <p class="policy-reason" id="policy-reason" aria-live="polite">Waiting for policy status…</p>
+      <p class="muted policy-diagnostic" id="policy-diagnostic" hidden></p>
+
+      <div class="resource-grid">
+        <form id="resource-form" novalidate>
+          <label for="resource-mode">Run mode</label>
+          <select id="resource-mode" name="mode">
+            <option value="only_when_idle">Only when idle</option>
+            <option value="always_on_low_priority">Always on (low priority)</option>
+            <option value="scheduled_hours">Scheduled hours</option>
+          </select>
+
+          <div class="resource-field" id="idle-threshold-field">
+            <label for="idle-threshold">Idle threshold (minutes)</label>
+            <input id="idle-threshold" name="idle-threshold" type="number" min="1" max="60" step="1" />
+            <p class="field-error" id="idle-threshold-error" role="alert" hidden></p>
+          </div>
+
+          <div class="resource-field" id="schedule-fields" hidden>
+            <p class="field-label">Schedule in local time</p>
+            <div class="schedule-times">
+              <label for="schedule-start">Start
+                <input id="schedule-start" name="schedule-start" type="time" />
+              </label>
+              <label for="schedule-end">End
+                <input id="schedule-end" name="schedule-end" type="time" />
+              </label>
+            </div>
+            <p class="muted" id="schedule-timezone"></p>
+            <p class="field-error" id="schedule-error" role="alert" hidden></p>
+          </div>
+
+          <label for="resource-preset">Preset</label>
+          <select id="resource-preset" name="preset">
+            <option value="low">Low</option>
+            <option value="balanced">Balanced</option>
+            <option value="high">High</option>
+          </select>
+          <p class="muted" id="preset-mapping"></p>
+
+          <label class="checkbox-label" for="do-not-run-on-battery">
+            <input id="do-not-run-on-battery" name="do-not-run-on-battery" type="checkbox" />
+            Do not run on battery
+          </label>
+          <p class="muted">Enabled by default. Unknown power on a device with a battery blocks jobs.</p>
+
+          <p class="field-error" id="resource-error" role="alert" hidden></p>
+          <p class="field-success" id="resource-success" role="status" hidden></p>
+          <button class="button button-secondary resource-save" id="save-resource-settings" type="submit">
+            Save resource settings
+          </button>
+        </form>
+
+        <div class="resource-monitor" aria-labelledby="monitor-title">
+          <p class="eyebrow">MANAGED RUNTIME</p>
+          <h3 id="monitor-title">Resource monitor</h3>
+          <dl class="metric-list">
+            <div><dt>Runtime CPU</dt><dd id="runtime-cpu">Unavailable</dd></div>
+            <div><dt>Runtime RAM</dt><dd id="runtime-ram">Unavailable</dd></div>
+            <div><dt>GPU utilization · device-wide</dt><dd id="gpu-utilization">Unavailable</dd></div>
+            <div><dt>VRAM · device-wide</dt><dd id="gpu-vram">Unavailable</dd></div>
+          </dl>
+        </div>
+      </div>
+
+      <p class="notice restart-notice" id="restart-notice" role="status" hidden>
+        A runtime restart is required to apply the selected preset and priority.
+        <button class="button button-primary" id="restart-provider" type="button">Restart provider</button>
+      </p>
+      <p class="muted suitability-detail" id="suitability-detail"></p>
+    </section>
+
     <section class="panel payout-panel" aria-labelledby="payout-title">
       <div>
         <p class="eyebrow">PROVIDER SETTINGS</p>
@@ -165,6 +291,7 @@ root.innerHTML = `
     <footer class="actions">
       <p class="muted" id="suitability-note"></p>
       <div class="action-buttons">
+        <button class="button button-secondary" id="pause-provider" type="button" disabled>Pause</button>
         <button class="button button-secondary" id="stop-provider" type="button" disabled>Stop</button>
         <button class="button button-primary" id="start-provider" type="button">Start provider</button>
       </div>
@@ -203,6 +330,7 @@ function renderStatus(): void {
   if (document.activeElement !== input) input.value = status.payout_address ?? ''
   const modelInput = $<HTMLInputElement>('ollama-model')
   if (document.activeElement !== modelInput) modelInput.value = status.configured_model
+  renderResourceSettings(status)
 
   const connected = status.connection === 'connected'
   $<HTMLElement>('connection').classList.toggle('is-connected', connected)
@@ -237,13 +365,124 @@ function renderStatus(): void {
     status.runtime_suitability.status === 'not_recommended'
       ? status.runtime_suitability.reason
       : 'GPU suitability: supported path detected.'
+  const suitabilityDetail = $<HTMLElement>('suitability-detail')
+  if (status.runtime_suitability.status === 'not_recommended') {
+    suitabilityDetail.textContent = status.resource_settings.not_recommended_confirmed
+      ? 'This hardware is not recommended. Your one-time confirmation is saved; inference will use CPU.'
+      : 'This hardware is not recommended. The app will ask for one-time confirmation before preparing the runtime.'
+    suitabilityDetail.classList.add('warning-text')
+  } else {
+    suitabilityDetail.textContent = 'Runtime suitability: suitable.'
+    suitabilityDetail.classList.remove('warning-text')
+  }
   $<HTMLButtonElement>('start-provider').disabled = status.provider_running || working
   $<HTMLButtonElement>('stop-provider').disabled = !status.provider_running || working
+  const pauseButton = $<HTMLButtonElement>('pause-provider')
+  pauseButton.textContent = status.user_paused ? 'Resume' : 'Pause'
+  pauseButton.disabled = !status.provider_running || working
   $<HTMLButtonElement>('save-address').disabled = working
   modelInput.disabled = status.provider_running || working
   $<HTMLButtonElement>('save-model').disabled = status.provider_running || working
+  $<HTMLButtonElement>('restart-provider').disabled =
+    !status.provider_running || working || status.current_job.state === 'running'
+  $<HTMLButtonElement>('save-resource-settings').disabled = working
   updateAddressFeedback()
   updateModelFeedback(status)
+}
+
+function renderResourceSettings(status: StatusSnapshot): void {
+  const settings = status.resource_settings
+  const mode = $<HTMLSelectElement>('resource-mode')
+  const threshold = $<HTMLInputElement>('idle-threshold')
+  const preset = $<HTMLSelectElement>('resource-preset')
+  const battery = $<HTMLInputElement>('do-not-run-on-battery')
+  const schedule = settings.schedule ?? {
+    weekdays: [1, 2, 3, 4, 5, 6, 7],
+    start: '09:00',
+    end: '17:00',
+  }
+  if (document.activeElement !== mode) mode.value = settings.mode
+  if (document.activeElement !== threshold) threshold.value = String(settings.idle_threshold_minutes)
+  if (document.activeElement !== preset) preset.value = settings.preset
+  if (document.activeElement !== battery) battery.checked = settings.do_not_run_on_battery
+  const start = $<HTMLInputElement>('schedule-start')
+  const end = $<HTMLInputElement>('schedule-end')
+  if (document.activeElement !== start) start.value = schedule.start
+  if (document.activeElement !== end) end.value = schedule.end
+
+  $<HTMLDivElement>('idle-threshold-field').hidden = settings.mode !== 'only_when_idle'
+  $<HTMLDivElement>('schedule-fields').hidden = settings.mode !== 'scheduled_hours'
+  $<HTMLElement>('schedule-timezone').textContent =
+    `Timezone: ${Intl.DateTimeFormat().resolvedOptions().timeZone || 'local time'} · ` +
+    `days: ${formatWeekdays(schedule.weekdays)}`
+
+  const priority = status.preset_mapping.process_priority === 'below_normal'
+    ? 'Below normal'
+    : 'Normal'
+  const priorityDescription = status.preset_mapping.priority_supported
+    ? `${priority} priority`
+    : `${priority} priority (not supported on this OS)`
+  $<HTMLElement>('preset-mapping').textContent =
+    `${status.preset_mapping.num_thread} threads · keep-alive ${status.preset_mapping.keep_alive} · ` +
+    `${priorityDescription} · concurrency ${status.preset_mapping.ollama_num_parallel} · ` +
+    `max loaded models ${status.preset_mapping.max_loaded_models}`
+
+  const policyChip = $<HTMLElement>('policy-state')
+  const policyReason = $<HTMLElement>('policy-reason')
+  policyChip.className = 'state-chip'
+  if (!status.provider_running) {
+    policyChip.textContent = 'Stopped'
+    policyReason.textContent = 'Provider is stopped.'
+  } else if (status.policy.state === 'paused') {
+    policyChip.textContent = 'Paused'
+    policyReason.textContent = status.policy.reason
+    if (status.policy.reason === 'Paused by user') policyChip.classList.add('state-paused')
+  } else if (status.user_paused) {
+    policyChip.textContent = 'Pausing'
+    policyReason.textContent = 'Pausing after the current job finishes.'
+  } else {
+    policyChip.textContent = 'Ready'
+    policyReason.textContent = status.provider_running ? 'Ready to accept jobs.' : 'Provider is stopped.'
+  }
+  const diagnostic = $<HTMLParagraphElement>('policy-diagnostic')
+  diagnostic.textContent = status.policy_diagnostic ?? ''
+  diagnostic.hidden = !status.policy_diagnostic
+
+  const metrics = status.resource_metrics
+  $<HTMLElement>('runtime-cpu').textContent = metrics.runtime_cpu_percent === null
+    ? 'Unavailable'
+    : `${metrics.runtime_cpu_percent.toFixed(1)}%`
+  $<HTMLElement>('runtime-ram').textContent = metrics.runtime_ram_bytes === null
+    ? 'Unavailable'
+    : formatBytes(metrics.runtime_ram_bytes)
+  const nvidiaMetricsAvailable =
+    status.gpu.support === 'nvidia-supported' && metrics.gpu_device_wide
+  $<HTMLElement>('gpu-utilization').textContent =
+    nvidiaMetricsAvailable && metrics.gpu_utilization_percent !== null
+      ? `${metrics.gpu_utilization_percent}%`
+      : 'Unavailable'
+  $<HTMLElement>('gpu-vram').textContent =
+    nvidiaMetricsAvailable && metrics.gpu_vram_used_bytes !== null
+      ? formatBytes(metrics.gpu_vram_used_bytes)
+      : 'Unavailable'
+
+  $<HTMLParagraphElement>('resource-error').textContent = resourceError
+  $<HTMLParagraphElement>('resource-error').hidden = !resourceError
+  $<HTMLParagraphElement>('resource-success').textContent = resourceSuccess
+  $<HTMLParagraphElement>('resource-success').hidden = !resourceSuccess
+  $<HTMLParagraphElement>('idle-threshold-error').hidden =
+    !resourceError.startsWith('Idle threshold:')
+  $<HTMLParagraphElement>('idle-threshold-error').textContent =
+    resourceError.startsWith('Idle threshold:') ? resourceError : ''
+  $<HTMLParagraphElement>('schedule-error').hidden =
+    !resourceError.startsWith('Schedule:')
+  $<HTMLParagraphElement>('schedule-error').textContent =
+    resourceError.startsWith('Schedule:') ? resourceError : ''
+  $<HTMLParagraphElement>('resource-error').hidden =
+    !resourceError || resourceError.startsWith('Idle threshold:') || resourceError.startsWith('Schedule:')
+
+  const restartNotice = $<HTMLParagraphElement>('restart-notice')
+  restartNotice.hidden = !status.requires_restart
 }
 
 function renderRuntime(status: StatusSnapshot): void {
@@ -329,6 +568,11 @@ function formatBytes(bytes: number): string {
   return gib >= 1 ? `${gib.toFixed(2)} GiB` : `${(bytes / 1024 ** 2).toFixed(0)} MiB`
 }
 
+function formatWeekdays(days: number[]): string {
+  const names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+  return days.length === 7 ? 'every day' : days.map((day) => names[day - 1] ?? '?').join(', ')
+}
+
 function updateAddressFeedback(): void {
   const error = $<HTMLParagraphElement>('address-error')
   const saved = $<HTMLParagraphElement>('address-success')
@@ -372,8 +616,8 @@ function updateModelFeedback(status: StatusSnapshot): void {
 async function startProvider(): Promise<void> {
   if (!snapshot || working) return
   if (
-    (snapshot.runtime.state === 'not_installed' || snapshot.runtime.state === 'error') &&
-    snapshot.runtime_suitability.status === 'not_recommended'
+    snapshot.runtime_suitability.status === 'not_recommended' &&
+    !snapshot.resource_settings.not_recommended_confirmed
   ) {
     $<HTMLElement>('confirm-reason').textContent = snapshot.runtime_suitability.reason
     $<HTMLDialogElement>('runtime-confirmation').showModal()
@@ -395,6 +639,91 @@ async function invokeProviderStart(confirmed: boolean): Promise<void> {
     if (snapshot) renderStatus()
   }
 }
+
+$<HTMLSelectElement>('resource-mode').addEventListener('change', () => {
+  const mode = $<HTMLSelectElement>('resource-mode').value
+  $<HTMLDivElement>('idle-threshold-field').hidden = mode !== 'only_when_idle'
+  $<HTMLDivElement>('schedule-fields').hidden = mode !== 'scheduled_hours'
+})
+
+$<HTMLFormElement>('resource-form').addEventListener('submit', async (event) => {
+  event.preventDefault()
+  if (!snapshot || working) return
+  resourceError = ''
+  resourceSuccess = ''
+  const thresholdInput = $<HTMLInputElement>('idle-threshold')
+  const idleThreshold = thresholdInput.valueAsNumber
+  if (
+    (!Number.isInteger(idleThreshold) || idleThreshold < 1 || idleThreshold > 60)
+  ) {
+    resourceError = 'Idle threshold: enter a whole number from 1 to 60.'
+    renderStatus()
+    return
+  }
+  const mode = $<HTMLSelectElement>('resource-mode').value as ResourceMode
+  const start = $<HTMLInputElement>('schedule-start').value
+  const end = $<HTMLInputElement>('schedule-end').value
+  if (mode === 'scheduled_hours' && (!start || !end || start === end)) {
+    resourceError = 'Schedule: choose valid, different start and end times.'
+    renderStatus()
+    return
+  }
+  const currentSchedule = snapshot.resource_settings.schedule
+  const settings: ResourceSettings = {
+    ...snapshot.resource_settings,
+    mode,
+    idle_threshold_minutes: idleThreshold,
+    schedule: mode === 'scheduled_hours'
+      ? {
+          weekdays: currentSchedule?.weekdays ?? [1, 2, 3, 4, 5, 6, 7],
+          start,
+          end,
+        }
+      : currentSchedule,
+    preset: $<HTMLSelectElement>('resource-preset').value as ResourcePreset,
+    do_not_run_on_battery: $<HTMLInputElement>('do-not-run-on-battery').checked,
+  }
+  working = true
+  renderStatus()
+  try {
+    const next = await invoke<StatusSnapshot>('set_resource_settings', { settings })
+    updateStatus(next)
+    resourceSuccess = 'Resource settings saved.'
+  } catch (error) {
+    resourceError = errorMessage(error)
+  } finally {
+    working = false
+    if (snapshot) renderStatus()
+  }
+})
+
+$<HTMLButtonElement>('pause-provider').addEventListener('click', async () => {
+  if (!snapshot || working) return
+  working = true
+  renderStatus()
+  try {
+    await invoke(snapshot.user_paused ? 'resume_provider' : 'pause_provider')
+  } catch (error) {
+    setCommandError(error)
+  } finally {
+    working = false
+    if (snapshot) renderStatus()
+  }
+})
+
+$<HTMLButtonElement>('restart-provider').addEventListener('click', async () => {
+  if (!snapshot || working || snapshot.current_job.state === 'running') return
+  working = true
+  renderStatus()
+  try {
+    await invoke('restart_provider')
+  } catch (error) {
+    setCommandError(error)
+  } finally {
+    working = false
+    if (snapshot) renderStatus()
+  }
+})
 
 $<HTMLButtonElement>('start-provider').addEventListener('click', () => void startProvider())
 $<HTMLButtonElement>('stop-provider').addEventListener('click', async () => {

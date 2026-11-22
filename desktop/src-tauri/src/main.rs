@@ -14,6 +14,7 @@ use provider_core::{
 use serde::Serialize;
 use tauri::{Emitter, Manager, State, WindowEvent};
 use tokio::sync::{watch, Mutex as AsyncMutex};
+use tokio::time::{sleep, timeout, Duration};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -38,6 +39,7 @@ struct StatusSnapshot {
     connection: provider_core::ConnectionState,
     fee_config: Option<FeeConfig>,
     current_job: CurrentJob,
+    user_paused: bool,
     payout_address: Option<String>,
     coordinator_ws: String,
     configured_model: String,
@@ -111,6 +113,7 @@ impl DesktopState {
             connection: provider_core::ConnectionState::Disconnected,
             fee_config: None,
             current_job: CurrentJob::Idle,
+            user_paused: false,
             payout_address: config.payout_address,
             coordinator_ws: config.coordinator_ws,
             configured_model,
@@ -239,6 +242,7 @@ async fn start_provider(
             .map_err(|error| format!("Provider status is unavailable: {error}"))?;
         snapshot.provider_running = true;
         snapshot.current_job = CurrentJob::Idle;
+        snapshot.user_paused = false;
         snapshot.error_message = None;
         snapshot.coordinator_ws = config.coordinator_ws.clone();
         snapshot.configured_model = selection.configured;
@@ -256,6 +260,10 @@ async fn start_provider(
     let active_resource_settings = config.resource_settings.clone();
     let (stop, stop_rx) = watch::channel(false);
     let (control, pause_rx) = provider_control_channel();
+    control
+        .update_resource_settings(active_resource_settings.clone())
+        .map_err(|error| format!("Invalid active resource settings: {error:#}"))?;
+    let settings_rx = control.subscribe_resource_settings();
     let runtime_state = state.inner().inner.clone();
     let runtime_app = app.clone();
     let runtime_callback: RuntimeProgressCallback = Arc::new(move |runtime| {
@@ -335,6 +343,7 @@ async fn start_provider(
             confirmed,
             stop_rx,
             pause_rx,
+            settings_rx,
             runtime_callback,
             event_callback,
         )
@@ -342,6 +351,7 @@ async fn start_provider(
         update_status(&task_state, &task_app, |snapshot| {
             snapshot.provider_running = false;
             snapshot.connection = provider_core::ConnectionState::Disconnected;
+            snapshot.user_paused = false;
             snapshot.policy = PolicyDecision::Paused("Provider is stopped".to_string());
             if matches!(&snapshot.current_job, CurrentJob::Running { .. }) {
                 snapshot.current_job = CurrentJob::Idle;
@@ -383,34 +393,62 @@ async fn stop_provider(
 }
 
 #[tauri::command]
-async fn pause_provider(state: State<'_, DesktopState>) -> Result<(), String> {
-    let task_slot = state.inner().inner.task.lock().await;
-    let task = task_slot
-        .as_ref()
-        .ok_or_else(|| "Provider is not running.".to_string())?;
-    task.control.pause().map_err(|error| format!("{error:#}"))
-}
-
-#[tauri::command]
-async fn resume_provider(state: State<'_, DesktopState>) -> Result<(), String> {
-    let task_slot = state.inner().inner.task.lock().await;
-    let task = task_slot
-        .as_ref()
-        .ok_or_else(|| "Provider is not running.".to_string())?;
-    task.control.resume().map_err(|error| format!("{error:#}"))
-}
-
-#[tauri::command]
-fn set_resource_settings(
+async fn pause_provider(
     app: tauri::AppHandle,
     state: State<'_, DesktopState>,
+) -> Result<(), String> {
+    set_provider_paused(state.inner(), true).await?;
+    emit_status(&app, state.inner());
+    Ok(())
+}
+
+#[tauri::command]
+async fn resume_provider(
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+) -> Result<(), String> {
+    set_provider_paused(state.inner(), false).await?;
+    emit_status(&app, state.inner());
+    Ok(())
+}
+
+#[tauri::command]
+async fn set_resource_settings(
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    settings: ResourceSettings,
+) -> Result<StatusSnapshot, String> {
+    let snapshot = apply_resource_settings(state.inner(), settings).await?;
+    emit_status(&app, state.inner());
+    Ok(snapshot)
+}
+
+async fn set_provider_paused(state: &DesktopState, paused: bool) -> Result<(), String> {
+    let task_slot = state.inner.task.lock().await;
+    let task = task_slot
+        .as_ref()
+        .ok_or_else(|| "Provider is not running.".to_string())?;
+    task.control
+        .set_paused(paused)
+        .map_err(|error| format!("{error:#}"))?;
+    drop(task_slot);
+    let mut snapshot = state
+        .inner
+        .snapshot
+        .lock()
+        .map_err(|error| format!("Provider status is unavailable: {error}"))?;
+    snapshot.user_paused = paused;
+    Ok(())
+}
+
+async fn apply_resource_settings(
+    state: &DesktopState,
     settings: ResourceSettings,
 ) -> Result<StatusSnapshot, String> {
     settings
         .validate()
         .map_err(|error| format!("Invalid resource settings: {error:#}"))?;
     let requires_restart = state
-        .inner()
         .inner
         .running_resource_settings
         .lock()
@@ -418,18 +456,26 @@ fn set_resource_settings(
         .as_ref()
         .is_some_and(|active| active.requires_restart(&settings));
     let config = save_resource_settings(settings).map_err(|error| format!("{error:#}"))?;
-    update_status(&state.inner().inner, &app, |snapshot| {
-        snapshot.resource_settings = config.resource_settings;
-        snapshot.preset_mapping = resource_preset_mapping(&snapshot.resource_settings);
-        snapshot.requires_restart = requires_restart;
-    });
-    state
-        .inner()
+    {
+        let task_slot = state.inner.task.lock().await;
+        if let Some(task) = task_slot
+            .as_ref()
+            .filter(|task| !task.join.inner().is_finished())
+        {
+            task.control
+                .update_resource_settings(config.resource_settings.clone())
+                .map_err(|error| format!("Could not update active resource policy: {error:#}"))?;
+        }
+    }
+    let mut snapshot = state
         .inner
         .snapshot
         .lock()
-        .map(|snapshot| snapshot.clone())
-        .map_err(|error| format!("Provider status is unavailable: {error}"))
+        .map_err(|error| format!("Provider status is unavailable: {error}"))?;
+    snapshot.resource_settings = config.resource_settings;
+    snapshot.preset_mapping = resource_preset_mapping(&snapshot.resource_settings);
+    snapshot.requires_restart = requires_restart;
+    Ok(snapshot.clone())
 }
 
 #[tauri::command]
@@ -535,12 +581,87 @@ async fn stop_provider_task(app: &tauri::AppHandle, state: &DesktopState) -> Res
     update_status(&state.inner, app, |snapshot| {
         snapshot.provider_running = false;
         snapshot.connection = provider_core::ConnectionState::Disconnected;
+        snapshot.user_paused = false;
         snapshot.policy = PolicyDecision::Paused("Provider is stopped".to_string());
         if matches!(&snapshot.current_job, CurrentJob::Running { .. }) {
             snapshot.current_job = CurrentJob::Idle;
         }
     });
     Ok(())
+}
+
+#[tauri::command]
+async fn restart_provider(
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+) -> Result<(), String> {
+    let (provider_running, current_job, requires_restart, connected) = {
+        let snapshot = state
+            .inner()
+            .inner
+            .snapshot
+            .lock()
+            .map_err(|error| format!("Provider status is unavailable: {error}"))?;
+        (
+            snapshot.provider_running,
+            snapshot.current_job.clone(),
+            snapshot.requires_restart,
+            snapshot.connection == provider_core::ConnectionState::Connected,
+        )
+    };
+    if !provider_running {
+        return Err(
+            "The provider is not running; changed settings will apply on its next start.".into(),
+        );
+    }
+    if !requires_restart {
+        return Err("No runtime restart is currently required.".into());
+    }
+    if matches!(current_job, CurrentJob::Running { .. }) {
+        return Err("Wait for the current job to finish before restarting the provider.".into());
+    }
+
+    if connected {
+        {
+            let task_slot = state.inner().inner.task.lock().await;
+            let task = task_slot
+                .as_ref()
+                .ok_or_else(|| "Provider is not running.".to_string())?;
+            task.control
+                .pause()
+                .map_err(|error| format!("Could not pause provider before restart: {error:#}"))?;
+        }
+        update_status(&state.inner().inner, &app, |snapshot| {
+            snapshot.user_paused = true;
+        });
+
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let is_paused =
+                    {
+                        let snapshot =
+                            state.inner().inner.snapshot.lock().map_err(|error| {
+                                format!("Provider status is unavailable: {error}")
+                            })?;
+                        snapshot.user_paused
+                            && matches!(
+                                snapshot.policy,
+                                PolicyDecision::Paused(ref reason) if reason == "Paused by user"
+                            )
+                            && !matches!(snapshot.current_job, CurrentJob::Running { .. })
+                    };
+                if is_paused {
+                    return Ok::<(), String>(());
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .map_err(|_| "Timed out waiting for the provider to pause safely.".to_string())??;
+    }
+
+    stop_provider_task(&app, state.inner()).await?;
+    start_provider(app, state).await
 }
 
 async fn stop_provider_task_and_join(state: &StateInner) -> Result<(), String> {
@@ -617,6 +738,7 @@ fn main() {
             pause_provider,
             resume_provider,
             set_resource_settings,
+            restart_provider,
             confirm_runtime_download,
             set_payout_address,
             set_ollama_model
@@ -652,17 +774,168 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        initial_runtime_state, provider_control_channel, requires_provider_confirmation,
-        stop_provider_task_and_join, DesktopState, ProviderTask,
+        apply_resource_settings, initial_runtime_state, provider_control_channel,
+        requires_provider_confirmation, set_provider_paused, stop_provider_task_and_join,
+        DesktopState, ProviderTask,
     };
     use provider_core::{
-        RuntimeManager, RuntimeProgressCallback, RuntimeState, RuntimeSuitability,
+        ResourceMode, ResourcePreset, ResourceSchedule, ResourceSettings, RuntimeManager,
+        RuntimeProgressCallback, RuntimeState, RuntimeSuitability,
     };
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     };
-    use tokio::sync::watch;
+    use std::{
+        ffi::OsString,
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+    use tokio::sync::{mpsc, watch};
+
+    struct IsolatedConfig {
+        key: &'static str,
+        previous: Option<OsString>,
+        root: PathBuf,
+    }
+
+    impl IsolatedConfig {
+        fn new() -> Self {
+            let key = if cfg!(windows) {
+                "APPDATA"
+            } else if cfg!(target_os = "macos") {
+                "HOME"
+            } else {
+                "XDG_CONFIG_HOME"
+            };
+            let suffix = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "gpuswarm-desktop-settings-test-{}-{suffix}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&root).unwrap();
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, &root);
+            Self {
+                key,
+                previous,
+                root,
+            }
+        }
+    }
+
+    impl Drop for IsolatedConfig {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn pause_and_resume_commands_update_provider_control() {
+        tauri::async_runtime::block_on(async {
+            let state = DesktopState::new();
+            let (control, mut pause_rx) = provider_control_channel();
+            let (stop, mut stop_rx) = watch::channel(false);
+            let (observed_tx, mut observed_rx) = mpsc::unbounded_channel();
+            let join = tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::select! {
+                        changed = pause_rx.changed() => {
+                            if changed.is_err() {
+                                break;
+                            }
+                            if observed_tx.send(*pause_rx.borrow()).is_err() {
+                                break;
+                            }
+                        }
+                        changed = stop_rx.changed() => {
+                            if changed.is_ok() && *stop_rx.borrow() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+            *state.inner.task.lock().await = Some(ProviderTask {
+                stop,
+                control,
+                join,
+            });
+
+            set_provider_paused(&state, true).await.unwrap();
+            assert_eq!(observed_rx.recv().await, Some(true));
+            assert!(state.inner.snapshot.lock().unwrap().user_paused);
+
+            set_provider_paused(&state, false).await.unwrap();
+            assert_eq!(observed_rx.recv().await, Some(false));
+            assert!(!state.inner.snapshot.lock().unwrap().user_paused);
+
+            stop_provider_task_and_join(&state.inner).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn resource_settings_command_validates_persists_and_sets_restart_required() {
+        tauri::async_runtime::block_on(async {
+            let _config = IsolatedConfig::new();
+            let state = DesktopState::new();
+            *state.inner.running_resource_settings.lock().unwrap() =
+                Some(ResourceSettings::default());
+            let (control, _) = provider_control_channel();
+            let mut active_settings = control.subscribe_resource_settings();
+            let (stop, mut stop_rx) = watch::channel(false);
+            let join = tauri::async_runtime::spawn(async move {
+                let _ = stop_rx.changed().await;
+            });
+            *state.inner.task.lock().await = Some(ProviderTask {
+                stop,
+                control,
+                join,
+            });
+
+            let settings = ResourceSettings {
+                mode: ResourceMode::ScheduledHours,
+                schedule: Some(ResourceSchedule {
+                    weekdays: vec![1, 2, 3, 4, 5],
+                    start: "20:00".into(),
+                    end: "06:00".into(),
+                }),
+                preset: ResourcePreset::High,
+                ..ResourceSettings::default()
+            };
+            let saved = apply_resource_settings(&state, settings.clone())
+                .await
+                .unwrap();
+            assert!(saved.requires_restart);
+            assert_eq!(saved.resource_settings, settings);
+            active_settings.changed().await.unwrap();
+            assert_eq!(*active_settings.borrow_and_update(), settings);
+
+            let config_path = provider_core::config_path().unwrap();
+            let before_invalid_update = fs::read(&config_path).unwrap();
+            let invalid = ResourceSettings {
+                idle_threshold_minutes: 61,
+                ..settings
+            };
+            assert!(apply_resource_settings(&state, invalid).await.is_err());
+            assert_eq!(fs::read(config_path).unwrap(), before_invalid_update);
+
+            let restored = apply_resource_settings(&state, ResourceSettings::default())
+                .await
+                .unwrap();
+            assert!(!restored.requires_restart);
+            stop_provider_task_and_join(&state.inner).await.unwrap();
+        });
+    }
 
     #[test]
     fn close_shutdown_helper_signals_and_joins_provider_task() {

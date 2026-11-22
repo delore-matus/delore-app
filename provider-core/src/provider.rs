@@ -65,6 +65,7 @@ pub type ProviderEventCallback = Arc<dyn Fn(ProviderEvent) + Send + Sync + 'stat
 #[derive(Clone)]
 pub struct ProviderControl {
     pause_tx: watch::Sender<bool>,
+    resource_settings_tx: watch::Sender<ResourceSettings>,
 }
 
 impl ProviderControl {
@@ -81,11 +82,28 @@ impl ProviderControl {
     pub fn resume(&self) -> Result<()> {
         self.set_paused(false)
     }
+
+    pub fn update_resource_settings(&self, settings: ResourceSettings) -> Result<()> {
+        settings.validate()?;
+        self.resource_settings_tx.send_replace(settings);
+        Ok(())
+    }
+
+    pub fn subscribe_resource_settings(&self) -> watch::Receiver<ResourceSettings> {
+        self.resource_settings_tx.subscribe()
+    }
 }
 
 pub fn provider_control_channel() -> (ProviderControl, watch::Receiver<bool>) {
     let (pause_tx, pause_rx) = watch::channel(false);
-    (ProviderControl { pause_tx }, pause_rx)
+    let (resource_settings_tx, _) = watch::channel(ResourceSettings::default());
+    (
+        ProviderControl {
+            pause_tx,
+            resource_settings_tx,
+        },
+        pause_rx,
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -96,12 +114,19 @@ struct ProviderRunOptions {
     use_cli_environment_overrides: bool,
 }
 
+struct ProviderControlReceivers {
+    stop: watch::Receiver<bool>,
+    pause: watch::Receiver<bool>,
+    resource_settings: watch::Receiver<ResourceSettings>,
+}
+
 struct ProviderConnectionContext<'a> {
     runtime: &'a RunningRuntime,
     options: ProviderRunOptions,
     stop_rx: &'a mut watch::Receiver<bool>,
     pause_rx: &'a mut watch::Receiver<bool>,
-    resource_settings: &'a ResourceSettings,
+    resource_settings: ResourceSettings,
+    settings_rx: &'a mut watch::Receiver<ResourceSettings>,
     system_probe: &'a dyn SystemProbe,
     event_callback: &'a ProviderEventCallback,
 }
@@ -117,7 +142,9 @@ pub async fn run_provider_with_confirmation(
     runtime_callback: RuntimeProgressCallback,
 ) -> Result<()> {
     let (stop_tx, stop_rx) = watch::channel(false);
-    let (_control, pause_rx) = provider_control_channel();
+    let (control, pause_rx) = provider_control_channel();
+    control.update_resource_settings(config.resource_settings.clone())?;
+    let settings_rx = control.subscribe_resource_settings();
     let result = run_provider_inner(
         config,
         ProviderRunOptions {
@@ -126,8 +153,11 @@ pub async fn run_provider_with_confirmation(
             handle_ctrl_c: true,
             use_cli_environment_overrides: true,
         },
-        stop_rx,
-        pause_rx,
+        ProviderControlReceivers {
+            stop: stop_rx,
+            pause: pause_rx,
+            resource_settings: settings_rx,
+        },
         Arc::new(NativeSystemProbe),
         runtime_callback,
         Arc::new(|_| {}),
@@ -144,12 +174,15 @@ pub async fn run_provider_managed(
     runtime_callback: RuntimeProgressCallback,
     event_callback: ProviderEventCallback,
 ) -> Result<()> {
-    let (_control, pause_rx) = provider_control_channel();
+    let (control, pause_rx) = provider_control_channel();
+    control.update_resource_settings(config.resource_settings.clone())?;
+    let settings_rx = control.subscribe_resource_settings();
     run_provider_managed_with_control(
         config,
         confirmed_not_recommended,
         stop_rx,
         pause_rx,
+        settings_rx,
         runtime_callback,
         event_callback,
     )
@@ -161,14 +194,23 @@ pub async fn run_provider_managed_with_control(
     confirmed_not_recommended: bool,
     stop_rx: watch::Receiver<bool>,
     pause_rx: watch::Receiver<bool>,
+    settings_rx: watch::Receiver<ResourceSettings>,
     runtime_callback: RuntimeProgressCallback,
     event_callback: ProviderEventCallback,
 ) -> Result<()> {
-    run_provider_managed_with_probe(
+    run_provider_inner(
         config,
-        confirmed_not_recommended,
-        stop_rx,
-        pause_rx,
+        ProviderRunOptions {
+            confirmed_not_recommended,
+            stop_after_job: false,
+            handle_ctrl_c: false,
+            use_cli_environment_overrides: false,
+        },
+        ProviderControlReceivers {
+            stop: stop_rx,
+            pause: pause_rx,
+            resource_settings: settings_rx,
+        },
         Arc::new(NativeSystemProbe),
         runtime_callback,
         event_callback,
@@ -185,6 +227,9 @@ pub async fn run_provider_managed_with_probe(
     runtime_callback: RuntimeProgressCallback,
     event_callback: ProviderEventCallback,
 ) -> Result<()> {
+    let (control, _) = provider_control_channel();
+    control.update_resource_settings(config.resource_settings.clone())?;
+    let settings_rx = control.subscribe_resource_settings();
     run_provider_inner(
         config,
         ProviderRunOptions {
@@ -193,8 +238,11 @@ pub async fn run_provider_managed_with_probe(
             handle_ctrl_c: false,
             use_cli_environment_overrides: false,
         },
-        stop_rx,
-        pause_rx,
+        ProviderControlReceivers {
+            stop: stop_rx,
+            pause: pause_rx,
+            resource_settings: settings_rx,
+        },
         system_probe,
         runtime_callback,
         event_callback,
@@ -205,12 +253,16 @@ pub async fn run_provider_managed_with_probe(
 async fn run_provider_inner(
     mut config: ProviderConfig,
     options: ProviderRunOptions,
-    mut stop_rx: watch::Receiver<bool>,
-    mut pause_rx: watch::Receiver<bool>,
+    control_receivers: ProviderControlReceivers,
     system_probe: Arc<dyn SystemProbe>,
     runtime_callback: RuntimeProgressCallback,
     event_callback: ProviderEventCallback,
 ) -> Result<()> {
+    let ProviderControlReceivers {
+        stop: mut stop_rx,
+        pause: mut pause_rx,
+        resource_settings: mut settings_rx,
+    } = control_receivers;
     config.resource_settings.validate()?;
     let model = effective_ollama_model(&config)?.effective;
     let runtime_manager = RuntimeManager::new()?;
@@ -270,7 +322,7 @@ async fn run_provider_inner(
             runtime_callback.clone(),
         ) => result?,
     };
-    let resource_settings = config.resource_settings.clone();
+    let resource_settings = settings_rx.borrow_and_update().clone();
     println!(
         "Managed Ollama runtime listening on 127.0.0.1:{}",
         runtime.port()
@@ -299,7 +351,8 @@ async fn run_provider_inner(
                 options,
                 stop_rx: &mut stop_rx,
                 pause_rx: &mut pause_rx,
-                resource_settings: &resource_settings,
+                resource_settings,
+                settings_rx: &mut settings_rx,
                 system_probe: system_probe.as_ref(),
                 event_callback: &event_callback,
             },
@@ -338,7 +391,8 @@ async fn run_provider_connection(
         options,
         stop_rx,
         pause_rx,
-        resource_settings,
+        settings_rx,
+        mut resource_settings,
         system_probe,
         event_callback,
     } = context;
@@ -355,7 +409,7 @@ async fn run_provider_connection(
     let gpu = detect_gpu();
     let initial_sample = system_probe.sample();
     let mut policy_decision = decide_current_policy(
-        resource_settings,
+        &resource_settings,
         initial_sample.idle,
         initial_sample.power,
         *pause_rx.borrow(),
@@ -411,6 +465,7 @@ async fn run_provider_connection(
     let mut policy_refresh = tokio::time::interval(Duration::from_secs(2));
     let mut resource_monitor = ResourceMonitor::default();
     let mut pause_control_open = true;
+    let mut settings_channel_open = true;
     'connection: loop {
         let deferred = if matches!(&policy_decision, PolicyDecision::Run) {
             deferred_job.take()
@@ -435,7 +490,7 @@ async fn run_provider_connection(
                 }
                 _ = policy_refresh.tick() => {
                     refresh_policy(
-                        resource_settings,
+                        &resource_settings,
                         pause_rx,
                         system_probe,
                         &mut policy_decision,
@@ -451,7 +506,7 @@ async fn run_provider_connection(
                 changed = pause_rx.changed(), if pause_control_open => {
                     if changed.is_ok() {
                         refresh_policy(
-                            resource_settings,
+                            &resource_settings,
                             pause_rx,
                             system_probe,
                             &mut policy_decision,
@@ -461,6 +516,24 @@ async fn run_provider_connection(
                         .await?;
                     } else {
                         pause_control_open = false;
+                    }
+                    continue;
+                }
+                changed = settings_rx.changed(), if settings_channel_open => {
+                    if changed.is_ok() {
+                        resource_settings = settings_rx.borrow_and_update().clone();
+                        resource_settings.validate()?;
+                        refresh_policy(
+                            &resource_settings,
+                            pause_rx,
+                            system_probe,
+                            &mut policy_decision,
+                            &mut sender,
+                            event_callback,
+                        )
+                        .await?;
+                    } else {
+                        settings_channel_open = false;
                     }
                     continue;
                 }
@@ -480,7 +553,7 @@ async fn run_provider_connection(
                 match message {
                     WsMessage::Job(job) => {
                         refresh_policy(
-                            resource_settings,
+                            &resource_settings,
                             pause_rx,
                             system_probe,
                             &mut policy_decision,
@@ -506,7 +579,7 @@ async fn run_provider_connection(
                             &provider_id,
                             &model,
                             &job.prompt,
-                            resource_settings,
+                            &resource_settings,
                         );
                         tokio::pin!(inference);
                         let result = loop {
@@ -519,7 +592,7 @@ async fn run_provider_connection(
                                 result = &mut inference => break result,
                                 _ = policy_refresh.tick() => {
                                     refresh_policy(
-                                        resource_settings,
+                                        &resource_settings,
                                         pause_rx,
                                         system_probe,
                                         &mut policy_decision,
@@ -534,7 +607,7 @@ async fn run_provider_connection(
                                 changed = pause_rx.changed(), if pause_control_open => {
                                     if changed.is_ok() {
                                         refresh_policy(
-                                            resource_settings,
+                                            &resource_settings,
                                             pause_rx,
                                             system_probe,
                                             &mut policy_decision,
@@ -563,7 +636,7 @@ async fn run_provider_connection(
                         };
 
                         refresh_policy(
-                            resource_settings,
+                            &resource_settings,
                             pause_rx,
                             system_probe,
                             &mut policy_decision,
@@ -753,12 +826,36 @@ fn emit_failure(callback: &ProviderEventCallback, error: &anyhow::Error) {
 #[cfg(test)]
 mod tests {
     use super::{
-        connect_with_retry, run_provider_managed, ConnectionState, ProviderConfig, ProviderEvent,
-        ProviderEventCallback, RuntimeProgressCallback, RuntimeState,
+        connect_with_retry, provider_control_channel, run_provider_managed, ConnectionState,
+        ProviderConfig, ProviderEvent, ProviderEventCallback, RuntimeProgressCallback,
+        RuntimeState,
     };
+    use crate::{ResourceMode, ResourceSettings};
     use std::sync::{Arc, Mutex};
     use tokio::{net::TcpListener, sync::watch, time::timeout};
     use tokio_tungstenite::accept_async;
+
+    #[tokio::test]
+    async fn provider_control_publishes_valid_resource_settings_updates() {
+        let (control, _) = provider_control_channel();
+        let mut settings_rx = control.subscribe_resource_settings();
+        let settings = ResourceSettings {
+            mode: ResourceMode::AlwaysOnLowPriority,
+            idle_threshold_minutes: 1,
+            ..ResourceSettings::default()
+        };
+
+        control.update_resource_settings(settings.clone()).unwrap();
+        settings_rx.changed().await.unwrap();
+
+        assert_eq!(*settings_rx.borrow_and_update(), settings);
+        assert!(control
+            .update_resource_settings(ResourceSettings {
+                idle_threshold_minutes: 0,
+                ..ResourceSettings::default()
+            })
+            .is_err());
+    }
 
     #[tokio::test]
     async fn managed_provider_honors_stop_before_runtime_install() {

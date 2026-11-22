@@ -152,6 +152,7 @@ h2 {
 
 .runtime-panel,
 .job-panel,
+.resource-panel,
 .payout-panel {
   margin-bottom: 14px;
 }
@@ -253,6 +254,131 @@ h2 {
   margin: 8px 0 0;
   font-size: 11px;
   line-height: 1.6;
+}
+
+.resource-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 0.8fr);
+  gap: 28px;
+  margin-top: 20px;
+}
+
+.resource-grid form {
+  min-width: 0;
+}
+
+.resource-grid select {
+  width: 100%;
+  min-height: 38px;
+  padding: 9px 10px;
+  border: 1px solid #383838;
+  border-radius: 0;
+  color: #f2f2f2;
+  background: #090909;
+  font: inherit;
+  font-size: 11px;
+}
+
+.resource-field {
+  margin: 16px 0;
+}
+
+.resource-field input[type="number"],
+.schedule-times input[type="time"] {
+  width: 100%;
+  min-height: 38px;
+}
+
+.schedule-times {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.field-label {
+  margin-bottom: 8px;
+  color: #c8c8c8;
+  font-size: 11px;
+}
+
+.checkbox-label {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin: 18px 0 7px;
+}
+
+.checkbox-label input {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 auto;
+  accent-color: var(--accent);
+}
+
+.resource-save {
+  margin-top: 16px;
+}
+
+.resource-monitor h3 {
+  margin: 0;
+  font-size: 13px;
+}
+
+.policy-reason {
+  margin: 0;
+  color: #dedede;
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+.policy-diagnostic,
+.suitability-detail {
+  margin-top: 7px;
+}
+
+.state-paused {
+  border-color: #ffd166;
+  color: #ffd166;
+}
+
+.metric-list {
+  margin: 16px 0 0;
+}
+
+.metric-list > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 0;
+  border-top: 1px solid var(--line);
+  font-size: 11px;
+}
+
+.metric-list dt {
+  color: var(--muted);
+}
+
+.metric-list dd {
+  margin: 0;
+  text-align: right;
+}
+
+.restart-notice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin: 20px 0 0;
+  border-color: rgba(255, 209, 102, 0.5);
+  color: #ffd166;
+}
+
+.restart-notice[hidden] {
+  display: none;
+}
+
+.suitability-detail {
+  line-height: 1.65;
 }
 
 .payout-panel {
@@ -386,8 +512,13 @@ input {
   }
 
   .details-grid,
+  .resource-grid,
   .payout-panel {
     grid-template-columns: 1fr;
+  }
+
+  .resource-grid {
+    gap: 24px;
   }
 
   .payout-panel {
@@ -416,6 +547,11 @@ input {
   }
 
   .address-form {
+    flex-direction: column;
+  }
+
+  .restart-notice {
+    align-items: flex-start;
     flex-direction: column;
   }
 }
