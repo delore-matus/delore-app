@@ -1,18 +1,23 @@
 use std::{
     fs,
-    path::Path,
+    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use provider_core::{
-    run_provider_managed, ConnectionState, ProviderConfig, ProviderEvent, ProviderEventCallback,
-    ResourceMode, ResourceSettings, RuntimeManager, RuntimeProgressCallback, RuntimeState,
+    config_dir, run_provider_managed, ConnectionState, ProviderConfig, ProviderEvent,
+    ProviderEventCallback, ResourceMode, ResourceSettings, RuntimeManager, RuntimeProgressCallback,
+    RuntimeState,
 };
 use serde_json::Value;
 use tokio::sync::{mpsc, watch};
 
 const FEE_ADDRESS: &str = "0x20759eE366409B7dFE73a5325bfe0Dd57B6d7850";
+
+fn utc_timestamp() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
 
 #[tokio::test]
 #[ignore = "requires a running local coordinator and cached llama3.2:1b runtime model"]
@@ -80,7 +85,11 @@ async fn app_managed_provider_runs_a_job_and_stops() {
         tokio::select! {
             state = runtime_rx.recv() => {
                 if let Some(state) = state {
-                    println!("provider-status runtime={}", serde_json::to_string(&state).unwrap());
+                    println!(
+                        "provider-status runtime={} at={}",
+                        serde_json::to_string(&state).unwrap(),
+                        utc_timestamp()
+                    );
                     runtime_states.push(state);
                 }
             }
@@ -88,13 +97,18 @@ async fn app_managed_provider_runs_a_job_and_stops() {
                 if let Some(event) = event {
                     match event {
                         ProviderEvent::Connection { state, message } => {
-                            println!("provider-status connection={state:?} message={message:?}");
+                            println!(
+                                "provider-status connection={state:?} message={message:?} at={}",
+                                utc_timestamp()
+                            );
                             connected = matches!(state, ConnectionState::Connected);
                         }
                         ProviderEvent::FeeConfig { config } => {
                             println!(
-                                "provider-status fee_bps={} fee_address={}",
-                                config.fee_bps, config.fee_address
+                                "provider-status fee_bps={} fee_address={} at={}",
+                                config.fee_bps,
+                                config.fee_address,
+                                utc_timestamp()
                             );
                             fee_config = Some(config);
                         }
@@ -110,8 +124,9 @@ async fn app_managed_provider_runs_a_job_and_stops() {
     assert_eq!(fee_config.fee_address, FEE_ADDRESS);
     while let Ok(state) = runtime_rx.try_recv() {
         println!(
-            "provider-status runtime={}",
-            serde_json::to_string(&state).unwrap()
+            "provider-status runtime={} at={}",
+            serde_json::to_string(&state).unwrap(),
+            utc_timestamp()
         );
         runtime_states.push(state);
     }
@@ -126,10 +141,9 @@ async fn app_managed_provider_runs_a_job_and_stops() {
         .any(|state| matches!(state, RuntimeState::Running)));
 
     let job_id = format!("desktop-e2e-job-{}", uuid::Uuid::new_v4());
-    let earnings_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("earnings.log");
+    let earnings_path = std::env::var_os("GPUSWARM_E2E_EARNINGS_LOG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| config_dir().unwrap().join("earnings.log"));
     let earnings_start = fs::metadata(&earnings_path)
         .map(|metadata| metadata.len())
         .unwrap_or(0);
@@ -162,15 +176,20 @@ async fn app_managed_provider_runs_a_job_and_stops() {
         match event {
             ProviderEvent::JobStarted { job_id: started_id } if started_id == job_id => {
                 saw_running = true;
-                println!("provider-status job=running id={started_id}");
+                println!(
+                    "provider-status job=running id={started_id} at={}",
+                    utc_timestamp()
+                );
             }
             ProviderEvent::JobFinished { result } if result.job_id == job_id => {
                 assert_eq!(result.error, None);
                 assert_eq!(result.result_data.trim(), "ok");
                 finished = true;
                 println!(
-                    "provider-status job=finished id={} result={:?}",
-                    result.job_id, result.result_data
+                    "provider-status job=finished id={} result={:?} at={}",
+                    result.job_id,
+                    result.result_data,
+                    utc_timestamp()
                 );
             }
             event => println!("provider-status event={event:?}"),
@@ -193,7 +212,7 @@ async fn app_managed_provider_runs_a_job_and_stops() {
         result["result"]["result_data"].as_str().unwrap().trim(),
         "ok"
     );
-    println!("GET /jobs/{job_id} {result}");
+    println!("GET /jobs/{job_id} {result} at={}", utc_timestamp());
 
     let earnings_deadline = Instant::now() + Duration::from_secs(5);
     let earnings_line = loop {
@@ -216,9 +235,9 @@ async fn app_managed_provider_runs_a_job_and_stops() {
     assert!(earnings_line.contains(&format!("fee_address={FEE_ADDRESS}")));
     assert!(earnings_line.contains("gross_price=10000"));
     assert!(earnings_line.contains("fee_amount=1000"));
-    println!("earnings.log {earnings_line}");
+    println!("earnings.log {earnings_line} at={}", utc_timestamp());
 
     stop.send(true).unwrap();
     provider.await.unwrap().unwrap();
-    println!("provider-status provider=stopped");
+    println!("provider-status provider=stopped at={}", utc_timestamp());
 }

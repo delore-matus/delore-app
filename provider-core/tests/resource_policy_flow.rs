@@ -11,9 +11,13 @@ use provider_core::{
 use serde_json::Value;
 use tokio::sync::{mpsc, watch};
 
+fn utc_timestamp() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
 #[tokio::test]
 #[ignore = "requires a running coordinator, installed runtime, and cached model"]
-async fn zero_performance_keeps_job_queued_until_slider_increases() {
+async fn performance_slider_controls_registration_and_job_flow() {
     let runtime = RuntimeManager::new().unwrap();
     assert!(
         runtime.runtime_dir().exists(),
@@ -32,9 +36,10 @@ async fn zero_performance_keeps_job_queued_until_slider_increases() {
     let coordinator_ws =
         std::env::var("GPUSWARM_E2E_WS").unwrap_or_else(|_| "ws://127.0.0.1:8081/ws".into());
     let expected_fee_address = std::env::var("GPUSWARM_EXPECTED_FEE_ADDRESS").ok();
+    let provider_id = format!("performance-zero-provider-{}", uuid::Uuid::new_v4());
     let job_id = format!("performance-zero-{}", uuid::Uuid::new_v4());
     let mut config = ProviderConfig::defaults();
-    config.provider_id = format!("performance-zero-provider-{}", uuid::Uuid::new_v4());
+    config.provider_id = provider_id.clone();
     config.coordinator_ws = coordinator_ws;
     config.ollama_model = "llama3.2:1b".into();
     config.resource_settings = provider_core::ResourceSettings {
@@ -110,6 +115,28 @@ async fn zero_performance_keeps_job_queued_until_slider_increases() {
         }
     }
 
+    let providers: Value = client
+        .get(format!("{coordinator_http}/providers"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let provider_entry = providers
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|provider| provider["provider_id"] == provider_id)
+        .expect("provider must be listed while paused at 0%");
+    assert_eq!(provider_entry["status"], "paused");
+    assert_eq!(provider_entry["accepting_jobs"], false);
+    println!(
+        "GET /providers provider_id={} status=paused accepting_jobs=false at={}",
+        provider_id,
+        utc_timestamp()
+    );
+
     let response = client
         .post(format!("{coordinator_http}/request-job"))
         .header("X-Payment", "mock")
@@ -136,10 +163,10 @@ async fn zero_performance_keeps_job_queued_until_slider_increases() {
             .unwrap();
         if job["status"] == "queued" {
             println!(
-                "job while performance=0: status={} job_id={} at={:?}",
+                "job while performance=0: status={} job_id={} at={}",
                 job["status"],
                 job_id,
-                chrono::Local::now()
+                utc_timestamp()
             );
             queued = true;
             break;
@@ -157,7 +184,7 @@ async fn zero_performance_keeps_job_queued_until_slider_increases() {
     resumed_settings.do_not_run_on_battery = false;
     resumed_settings.not_recommended_confirmed = true;
     control.update_resource_settings(resumed_settings).unwrap();
-    println!("slider changed to 50% at {}", chrono::Local::now());
+    println!("slider changed to 50% at {}", utc_timestamp());
 
     let run_deadline = Instant::now() + Duration::from_secs(180);
     let mut saw_run = false;
@@ -181,7 +208,7 @@ async fn zero_performance_keeps_job_queued_until_slider_increases() {
                 ProviderEvent::JobStarted { job_id: started_id } => {
                     println!(
                         "provider-status job=running id={started_id} at={}",
-                        chrono::Local::now()
+                        utc_timestamp()
                     );
                     job_started_before_run |= !saw_run;
                     saw_started |= started_id == job_id;
@@ -191,7 +218,7 @@ async fn zero_performance_keeps_job_queued_until_slider_increases() {
                         "provider-status job=finished id={} error={:?} at={}",
                         result.job_id,
                         result.error,
-                        chrono::Local::now()
+                        utc_timestamp()
                     );
                     saw_finished |= result.job_id == job_id;
                 }
@@ -203,13 +230,6 @@ async fn zero_performance_keeps_job_queued_until_slider_increases() {
             }
         }
     }
-
-    let _ = stop.send(true);
-    let provider_result = tokio::time::timeout(Duration::from_secs(20), provider)
-        .await
-        .expect("provider should stop promptly")
-        .expect("provider task should join");
-    assert!(provider_result.is_ok(), "{provider_result:?}");
 
     let completed_deadline = Instant::now() + Duration::from_secs(10);
     let job_result = loop {
@@ -235,7 +255,7 @@ async fn zero_performance_keeps_job_queued_until_slider_increases() {
         "GET /jobs/{job_id}: status={} result={:?} at={}",
         job_result["status"],
         job_result["result"]["result_data"],
-        chrono::Local::now()
+        utc_timestamp()
     );
     assert!(saw_initial_paused);
     assert!(saw_fee_config, "coordinator did not send its FeeConfig");
@@ -251,4 +271,220 @@ async fn zero_performance_keeps_job_queued_until_slider_increases() {
             .trim(),
         "ok"
     );
+
+    let zero_settings = provider_core::ResourceSettings {
+        mode: ResourceMode::AlwaysOnLowPriority,
+        preset: ResourcePreset::Low,
+        do_not_run_on_battery: false,
+        not_recommended_confirmed: true,
+        performance_percent: 0,
+        ..provider_core::ResourceSettings::default()
+    };
+    control.update_resource_settings(zero_settings).unwrap();
+    let pause_deadline = Instant::now() + Duration::from_secs(40);
+    let mut saw_zero_pause = false;
+    while !saw_zero_pause {
+        assert!(
+            Instant::now() < pause_deadline,
+            "provider did not publish paused state after changing back to 0%"
+        );
+        if let Some(ProviderEvent::Policy {
+            decision: PolicyDecision::Paused(ref reason),
+            ..
+        }) = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .unwrap_or(None)
+        {
+            saw_zero_pause = reason == "Performance is set to 0%, no work is accepted";
+        }
+    }
+
+    let paused_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let providers: Value = client
+            .get(format!("{coordinator_http}/providers"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let provider_entry = providers
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provider| provider["provider_id"] == provider_id)
+            .expect("provider should remain connected");
+        if provider_entry["status"] == "paused" && provider_entry["accepting_jobs"] == false {
+            println!(
+                "GET /providers provider_id={} status=paused accepting_jobs=false at={}",
+                provider_id,
+                utc_timestamp()
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < paused_deadline,
+            "coordinator did not mark provider paused: {provider_entry}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let second_job_id = format!("performance-zero-second-{}", uuid::Uuid::new_v4());
+    let second_response = client
+        .post(format!("{coordinator_http}/request-job"))
+        .header("X-Payment", "mock")
+        .json(&serde_json::json!({
+            "id": second_job_id,
+            "prompt": "Respond with exactly: ok"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second_response.status(), reqwest::StatusCode::ACCEPTED);
+    let second_job_url = format!("{coordinator_http}/jobs/{second_job_id}");
+    let second_queued_deadline = Instant::now() + Duration::from_secs(5);
+    let mut second_queued = false;
+    while Instant::now() < second_queued_deadline {
+        let job: Value = client
+            .get(&second_job_url)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if job["status"] == "queued" {
+            println!(
+                "job while performance=0: status=queued job_id={second_job_id} at={}",
+                utc_timestamp()
+            );
+            second_queued = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(second_queued, "second job must stay queued at 0%");
+
+    let full_settings = provider_core::ResourceSettings {
+        mode: ResourceMode::AlwaysOnLowPriority,
+        preset: ResourcePreset::Low,
+        do_not_run_on_battery: false,
+        not_recommended_confirmed: true,
+        performance_percent: 100,
+        ..provider_core::ResourceSettings::default()
+    };
+    control.update_resource_settings(full_settings).unwrap();
+    let run_deadline = Instant::now() + Duration::from_secs(8);
+    let mut saw_full_run = false;
+    while !saw_full_run {
+        assert!(
+            Instant::now() < run_deadline,
+            "provider did not resume after changing to 100%"
+        );
+        if let Some(ProviderEvent::Policy {
+            decision: PolicyDecision::Run,
+            ..
+        }) = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .unwrap_or(None)
+        {
+            saw_full_run = true;
+        }
+    }
+    println!(
+        "provider-status policy=Run performance=100 at={}",
+        utc_timestamp()
+    );
+    let full_job_ids = [
+        format!("performance-full-a-{}", uuid::Uuid::new_v4()),
+        format!("performance-full-b-{}", uuid::Uuid::new_v4()),
+    ];
+    for full_job_id in &full_job_ids {
+        let response = client
+            .post(format!("{coordinator_http}/request-job"))
+            .header("X-Payment", "mock")
+            .json(&serde_json::json!({
+                "id": full_job_id,
+                "prompt": "Respond with exactly: ok"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+        println!(
+            "job submitted at performance=100 id={full_job_id} at={}",
+            utc_timestamp()
+        );
+    }
+
+    let mut full_jobs_finished = Vec::new();
+    let full_run_deadline = Instant::now() + Duration::from_secs(180);
+    while full_jobs_finished.len() < full_job_ids.len() {
+        assert!(
+            Instant::now() < full_run_deadline,
+            "100% jobs did not finish: {full_jobs_finished:?}"
+        );
+        if let Some(ProviderEvent::JobFinished { result }) =
+            tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+                .await
+                .unwrap_or(None)
+        {
+            if full_job_ids.contains(&result.job_id) {
+                assert_eq!(result.error, None);
+                full_jobs_finished.push(result.job_id.clone());
+                println!(
+                    "provider-status job=finished id={} at={}",
+                    result.job_id,
+                    utc_timestamp()
+                );
+            }
+        }
+    }
+
+    let config_dir = provider_core::config_dir().unwrap();
+    let log_path = config_dir.join("logs").join("delore.log");
+    let technical_log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    for full_job_id in &full_job_ids {
+        assert!(
+            !technical_log.contains(&format!("Performance cooldown start: job_id={full_job_id}")),
+            "100% must not emit a cooldown for {full_job_id}"
+        );
+    }
+    for completed_id in std::iter::once(&second_job_id).chain(full_job_ids.iter()) {
+        let job_url = format!("{coordinator_http}/jobs/{completed_id}");
+        let completed_deadline = Instant::now() + Duration::from_secs(10);
+        let job = loop {
+            let job: Value = client
+                .get(&job_url)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if job["status"] == "completed" {
+                break job;
+            }
+            assert!(
+                Instant::now() < completed_deadline,
+                "coordinator did not complete job {completed_id}: {job}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert_eq!(job["fee_breakdown"]["gross_price"], 10_000);
+        assert_eq!(job["fee_breakdown"]["provider_payout"], 9_000);
+        assert_eq!(job["fee_breakdown"]["platform_fee"], 1_000);
+        println!(
+            "GET /jobs/{completed_id}: status=completed payout=9000 fee=1000 at={}",
+            utc_timestamp()
+        );
+    }
+
+    let _ = stop.send(true);
+    let provider_result = tokio::time::timeout(Duration::from_secs(20), provider)
+        .await
+        .expect("provider should stop promptly")
+        .expect("provider task should join");
+    assert!(provider_result.is_ok(), "{provider_result:?}");
 }
