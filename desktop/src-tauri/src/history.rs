@@ -298,6 +298,11 @@ mod tests {
         assert_eq!(earnings.entries[0].gross_units, Some(10_000));
         assert_eq!(earnings.entries[0].provider_payout_units, Some(9_000));
         assert_eq!(earnings.entries[0].fee_units, Some(1_000));
+        println!(
+            "desktop-history-file={} content={}",
+            path.display(),
+            fs::read_to_string(&path).unwrap()
+        );
         remove_test_dir(&path);
     }
 }
