@@ -65,7 +65,12 @@ try {
     } else {
         $config.resource_settings.not_recommended_confirmed = $true
     }
-    $config | ConvertTo-Json -Depth 8 | Set-Content -Path $configPath -Encoding UTF8
+    $configJson = $config | ConvertTo-Json -Depth 8
+    [System.IO.File]::WriteAllText(
+        $configPath,
+        $configJson,
+        [System.Text.UTF8Encoding]::new($false)
+    )
 
     $provider = Start-Process -FilePath "cargo" `
         -ArgumentList "run", "-p", "provider-daemon", "--", "start" `
