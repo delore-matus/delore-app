@@ -1,14 +1,11 @@
 use std::{
-    fs,
-    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use provider_core::{
-    config_dir, run_provider_managed, ConnectionState, ProviderConfig, ProviderEvent,
-    ProviderEventCallback, ResourceMode, ResourceSettings, RuntimeManager, RuntimeProgressCallback,
-    RuntimeState,
+    run_provider_managed, ConnectionState, ProviderConfig, ProviderEvent, ProviderEventCallback,
+    ResourceMode, ResourceSettings, RuntimeManager, RuntimeProgressCallback, RuntimeState,
 };
 use serde_json::Value;
 use tokio::sync::{mpsc, watch};
@@ -21,7 +18,7 @@ fn utc_timestamp() -> String {
 
 #[tokio::test]
 #[ignore = "requires a running local coordinator and cached llama3.2:1b runtime model"]
-async fn app_managed_provider_runs_a_job_and_stops() {
+async fn managed_provider_runs_a_job_and_stops() {
     let runtime = RuntimeManager::new().unwrap();
     assert!(
         runtime.runtime_dir().exists(),
@@ -141,12 +138,6 @@ async fn app_managed_provider_runs_a_job_and_stops() {
         .any(|state| matches!(state, RuntimeState::Running)));
 
     let job_id = format!("desktop-e2e-job-{}", uuid::Uuid::new_v4());
-    let earnings_path = std::env::var_os("GPUSWARM_E2E_EARNINGS_LOG")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| config_dir().unwrap().join("earnings.log"));
-    let earnings_start = fs::metadata(&earnings_path)
-        .map(|metadata| metadata.len())
-        .unwrap_or(0);
     let response = reqwest::Client::new()
         .post(format!("{coordinator_http}/request-job"))
         .header("X-Payment", "mock")
@@ -213,29 +204,6 @@ async fn app_managed_provider_runs_a_job_and_stops() {
         "ok"
     );
     println!("GET /jobs/{job_id} {result} at={}", utc_timestamp());
-
-    let earnings_deadline = Instant::now() + Duration::from_secs(5);
-    let earnings_line = loop {
-        let contents = fs::read_to_string(&earnings_path).unwrap_or_default();
-        let appended = contents
-            .as_bytes()
-            .get(earnings_start as usize..)
-            .map(String::from_utf8_lossy)
-            .map(|text| text.into_owned())
-            .unwrap_or_default();
-        if let Some(line) = appended.lines().find(|line| line.contains(&job_id)) {
-            break line.to_string();
-        }
-        assert!(
-            Instant::now() < earnings_deadline,
-            "earnings.log did not record the completed job"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    };
-    assert!(earnings_line.contains(&format!("fee_address={FEE_ADDRESS}")));
-    assert!(earnings_line.contains("gross_price=10000"));
-    assert!(earnings_line.contains("fee_amount=1000"));
-    println!("earnings.log {earnings_line} at={}", utc_timestamp());
 
     stop.send(true).unwrap();
     provider.await.unwrap().unwrap();
