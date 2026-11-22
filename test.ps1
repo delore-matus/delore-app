@@ -1,0 +1,107 @@
+$ErrorActionPreference = "Stop"
+Set-Location $PSScriptRoot
+
+if (-not $env:GPUSWARM_FEE_ADDRESS) {
+    $env:GPUSWARM_FEE_ADDRESS = "0x20759eE366409B7dFE73a5325bfe0Dd57B6d7850"
+}
+if (-not $env:OLLAMA_MODEL) {
+    $env:OLLAMA_MODEL = "llama3.2:1b"
+}
+
+$coordinatorLog = Join-Path $PSScriptRoot "coordinator-test.log"
+$providerLog = Join-Path $PSScriptRoot "provider-test.log"
+Set-Content -Path $coordinatorLog -Value ""
+Set-Content -Path $providerLog -Value ""
+
+$coordinator = Start-Process -FilePath "cargo" `
+    -ArgumentList "run", "-p", "coordinator" `
+    -WorkingDirectory $PSScriptRoot `
+    -RedirectStandardOutput $coordinatorLog `
+    -RedirectStandardError $coordinatorLog `
+    -PassThru
+
+try {
+    $httpReady = $false
+    for ($attempt = 0; $attempt -lt 100; $attempt++) {
+        try {
+            $fees = Invoke-RestMethod -Uri "http://127.0.0.1:8080/fees" -TimeoutSec 1
+            $httpReady = $true
+            break
+        } catch {
+            Start-Sleep -Milliseconds 100
+        }
+    }
+    if (-not $httpReady) {
+        throw "Coordinator HTTP server did not become ready"
+    }
+    $fees | ConvertTo-Json -Compress
+
+    $provider = Start-Process -FilePath "cargo" `
+        -ArgumentList "run", "-p", "provider-daemon" `
+        -WorkingDirectory $PSScriptRoot `
+        -RedirectStandardOutput $providerLog `
+        -RedirectStandardError $providerLog `
+        -PassThru
+
+    Write-Output "Waiting for provider registration..."
+    $registered = $false
+    for ($attempt = 0; $attempt -lt 300; $attempt++) {
+        try {
+            $providers = Invoke-RestMethod -Uri "http://127.0.0.1:8080/providers" -TimeoutSec 1
+            if ($providers.Count -gt 0) {
+                $providers | ConvertTo-Json -Compress
+                $registered = $true
+                break
+            }
+        } catch {}
+        Start-Sleep -Milliseconds 100
+    }
+    if (-not $registered) {
+        Write-Output "FAIL: no provider registered"
+        Get-Content $providerLog -Tail 80
+        exit 1
+    }
+
+    Write-Output "Testing missing X-Payment header:"
+    try {
+        Invoke-WebRequest -Method Post -Uri "http://127.0.0.1:8080/request-job" `
+            -ContentType "application/json" `
+            -Body '{"id":"job-missing-payment","prompt":"Respond with exactly: ok"}'
+    } catch {
+        $_.Exception.Response.StatusCode.value__ 
+        $_.ErrorDetails.Message
+    }
+
+    $jobId = "job-$([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())"
+    Write-Output "Testing accepted job: $jobId"
+    $accepted = Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8080/request-job" `
+        -Headers @{ "X-Payment" = "mock-payment-ok" } `
+        -ContentType "application/json" `
+        -Body (@{ id = $jobId; prompt = "Respond with exactly: ok" } | ConvertTo-Json -Compress)
+    $accepted | ConvertTo-Json -Compress
+
+    Write-Output "Polling $jobId..."
+    for ($attempt = 0; $attempt -lt 600; $attempt++) {
+        try {
+            $job = Invoke-RestMethod -Uri "http://127.0.0.1:8080/jobs/$jobId" -TimeoutSec 1
+            if ($job.status -eq "completed") {
+                $job | ConvertTo-Json -Compress -Depth 8
+                exit 0
+            }
+            if ($job.status -eq "failed") {
+                $job | ConvertTo-Json -Compress -Depth 8
+                exit 1
+            }
+        } catch {}
+        Start-Sleep -Milliseconds 100
+    }
+    Write-Output "FAIL: job did not finish"
+    exit 1
+} finally {
+    if ($provider -and -not $provider.HasExited) {
+        Stop-Process -Id $provider.Id -Force
+    }
+    if ($coordinator -and -not $coordinator.HasExited) {
+        Stop-Process -Id $coordinator.Id -Force
+    }
+}
