@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
+import { isValidPerformancePercent } from './performance.ts'
 import './style.css'
 
 type Theme = 'dark' | 'light' | 'system'
@@ -618,7 +619,7 @@ document.querySelectorAll<HTMLButtonElement>('[data-screen]').forEach((button) =
 
 $<HTMLInputElement>('performance-slider').addEventListener('change', async (event) => {
   const percent = Number((event.currentTarget as HTMLInputElement).value)
-  if (!Number.isInteger(percent) || percent < 10 || percent > 100) return
+  if (!isValidPerformancePercent(percent)) return
   working = true
   renderStatus()
   try {
