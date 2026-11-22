@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { isValidPerformancePercent } from './performance.ts'
+import { providerDisplayState } from './provider-state.ts'
 import './style.css'
 
 type Theme = 'dark' | 'light' | 'system'
@@ -341,22 +342,16 @@ function renderStatus(): void {
   const policyReason = status.policy.state === 'paused' ? status.policy.reason : ''
   const providerState = $('provider-state')
   providerState.className = 'state-chip'
-  if (!status.provider_running) {
-    providerState.textContent = 'Offline'
-    $('provider-detail').textContent = 'Start DeLore to accept work.'
-  } else if (job.state === 'running') {
-    providerState.textContent = 'Running a job'
-    $('provider-detail').textContent = `Job ${job.job_id} is in progress.`
-  } else if (policyReason) {
-    providerState.textContent = 'Paused'
-    $('provider-detail').textContent = policyReason
-  } else if (status.user_paused) {
-    providerState.textContent = 'Pausing'
-    $('provider-detail').textContent = 'The current job will finish before new work pauses.'
-  } else {
-    providerState.textContent = 'Online'
-    $('provider-detail').textContent = 'Ready to accept work.'
-  }
+  const displayState = providerDisplayState({
+    running: status.provider_running,
+    confirmationRequired:
+      status.hardware_support.status === 'not_recommended' && !status.hardware_confirmed,
+    jobId: job.state === 'running' ? job.job_id : null,
+    policyReason,
+    userPaused: status.user_paused,
+  })
+  providerState.textContent = displayState.label
+  $('provider-detail').textContent = displayState.detail
   renderJob(job)
   renderPreparation(status)
   renderEarnings(status.earnings)

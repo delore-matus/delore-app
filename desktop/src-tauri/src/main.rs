@@ -14,7 +14,7 @@ use provider_core::{
     set_desktop_preferences as save_desktop_preferences, set_payout_address as save_payout_address,
     set_performance_percent as save_performance_percent, DesktopPreferences, FeeConfig, GpuInfo,
     JobResult, PolicyDecision, ProviderConfig, ProviderControl, ProviderEvent,
-    ProviderEventCallback, ResourceSettings, RuntimeDownloadPhase, RuntimeManager,
+    ProviderEventCallback, ResourceMode, ResourceSettings, RuntimeDownloadPhase, RuntimeManager,
     RuntimeProgressCallback, RuntimeState, RuntimeSuitability,
 };
 use serde::Serialize;
@@ -804,6 +804,7 @@ fn requires_provider_confirmation(
 
 fn desktop_resource_settings(saved: &ResourceSettings) -> ResourceSettings {
     ResourceSettings {
+        mode: ResourceMode::AlwaysOnLowPriority,
         performance_percent: saved.performance_percent,
         not_recommended_confirmed: saved.not_recommended_confirmed,
         ..ResourceSettings::default()
@@ -1246,7 +1247,7 @@ mod tests {
         let active = desktop_resource_settings(&saved);
         assert_eq!(active.performance_percent, 72);
         assert!(active.not_recommended_confirmed);
-        assert_eq!(active.mode, ResourceSettings::default().mode);
+        assert_eq!(active.mode, ResourceMode::AlwaysOnLowPriority);
         assert_eq!(
             active.do_not_run_on_battery,
             ResourceSettings::default().do_not_run_on_battery
