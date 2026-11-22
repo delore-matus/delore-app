@@ -1,7 +1,11 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { isValidPerformancePercent } from './performance.ts'
-import { coordinatorDisplayState, providerDisplayState } from './provider-state.ts'
+import {
+  coordinatorDisplayState,
+  preparationDisplayState,
+  providerDisplayState,
+} from './provider-state.ts'
 import './style.css'
 
 type Theme = 'dark' | 'light' | 'system'
@@ -24,6 +28,7 @@ interface UiError {
 interface DesktopPreferences {
   theme: Theme
   language: 'english'
+  onboarding_complete: boolean
   start_on_login: boolean
   start_minimized_to_tray: boolean
   keep_running_in_tray: boolean
@@ -187,7 +192,8 @@ root.innerHTML = `
           <section class="panel progress-panel" id="preparation-panel" hidden>
             <p class="eyebrow">PREPARING DELORE</p>
             <h2 id="preparation-label">Preparing provider resources</h2>
-            <div class="progress-track" role="progressbar" aria-label="Provider preparation">
+            <div class="progress-track" id="preparation-progress" role="progressbar"
+              aria-label="Provider preparation" aria-valuemin="0" aria-valuemax="100">
               <span id="preparation-bar"></span>
             </div>
             <p class="muted" id="setup-size"></p>
@@ -276,6 +282,15 @@ root.innerHTML = `
           </section>
 
           <section class="panel">
+            <p class="eyebrow">LOCAL DATA</p>
+            <h2>On this device</h2>
+            <p class="muted">Settings and job history are stored locally. Open this folder to review or back up your files.</p>
+            <div class="about-links">
+              <button class="button button-secondary" id="open-data-folder" type="button">Open data folder</button>
+            </div>
+          </section>
+
+          <section class="panel">
             <p class="eyebrow">ABOUT</p>
             <h2>DeLore</h2>
             <p class="muted">Version 0.1.0</p>
@@ -288,6 +303,20 @@ root.innerHTML = `
         </section>
       </div>
     </div>
+
+    <dialog class="confirm-dialog" id="welcome-dialog" aria-labelledby="welcome-title">
+      <div>
+        <p class="eyebrow">WELCOME</p>
+        <h2 id="welcome-title">Welcome to DeLore</h2>
+        <p>This app is for testnet use. It does not make real payouts.</p>
+        <p>Active work can use your computer's processing, memory, network, and electricity. You can start, pause, or stop work at any time.</p>
+        <p>Your settings and job history stay on this device. Open Settings to review or back up the local files.</p>
+        <p class="field-error" id="welcome-error" role="alert" hidden></p>
+        <div class="dialog-actions">
+          <button class="button button-primary" id="complete-onboarding" type="button">Continue</button>
+        </div>
+      </div>
+    </dialog>
 
     <dialog class="confirm-dialog" id="hardware-confirmation" aria-labelledby="confirm-title">
       <form method="dialog">
@@ -344,6 +373,7 @@ function renderStatus(): void {
   const displayState = providerDisplayState({
     running: status.provider_running,
     connection: status.connection,
+    preparing: status.provider_running && status.setup_state.state === 'starting',
     confirmationRequired:
       status.hardware_support.status === 'not_recommended' && !status.hardware_confirmed,
     jobId: job.state === 'running' ? job.job_id : null,
@@ -388,6 +418,7 @@ function renderStatus(): void {
   if (document.activeElement !== theme) theme.value = preferences.theme
   updatePayoutFeedback()
   renderSettingsError()
+  renderOnboarding()
 }
 
 function renderJob(job: StatusSnapshot['current_job']): void {
@@ -415,11 +446,30 @@ function renderPreparation(status: StatusSnapshot): void {
   panel.hidden = !active
   if (!active) return
   const percent = Math.round((status.setup_progress_percent + status.artifact_progress_percent) / 2)
-  $('preparation-label').textContent = `Preparing DeLore (${percent}%)`
-  $<HTMLSpanElement>('preparation-bar').style.width = `${Math.max(0, Math.min(100, percent))}%`
-  $('setup-size').textContent = status.expected_setup_bytes
+  const preparation = preparationDisplayState(status.setup_state.state, percent)
+  panel.classList.toggle('is-indeterminate', preparation.indeterminate)
+  $('preparation-label').textContent = preparation.label
+  const progress = $('preparation-progress')
+  const bar = $<HTMLSpanElement>('preparation-bar')
+  if (preparation.indeterminate) {
+    bar.style.width = ''
+    progress.removeAttribute('aria-valuenow')
+    progress.setAttribute('aria-valuetext', preparation.detail)
+  } else {
+    bar.style.width = `${Math.max(0, Math.min(100, percent))}%`
+    progress.setAttribute('aria-valuenow', String(Math.max(0, Math.min(100, percent))))
+    progress.setAttribute('aria-valuetext', preparation.label)
+  }
+  $('setup-size').textContent = preparation.detail || (status.expected_setup_bytes
     ? `Estimated total setup size: ${formatBytes(status.expected_setup_bytes)}`
-    : 'Calculating setup size…'
+    : 'Calculating setup size…')
+}
+
+function renderOnboarding(): void {
+  const dialog = $<HTMLDialogElement>('welcome-dialog')
+  if (!snapshot) return
+  if (!snapshot.desktop_preferences.onboarding_complete && !dialog.open) dialog.showModal()
+  else if (snapshot.desktop_preferences.onboarding_complete && dialog.open) dialog.close()
 }
 
 function renderEarnings(earnings: EarningsSnapshot): void {
@@ -703,6 +753,36 @@ $<HTMLButtonElement>('open-logs').addEventListener('click', async () => {
     settingsError = errorMessage(error)
     renderSettingsError()
   }
+})
+$<HTMLButtonElement>('open-data-folder').addEventListener('click', async () => {
+  try {
+    await invoke('open_data_folder')
+  } catch (error) {
+    settingsError = errorMessage(error)
+    renderSettingsError()
+  }
+})
+$<HTMLButtonElement>('complete-onboarding').addEventListener('click', async () => {
+  if (!snapshot) return
+  const button = $<HTMLButtonElement>('complete-onboarding')
+  const error = $<HTMLParagraphElement>('welcome-error')
+  button.disabled = true
+  error.textContent = ''
+  error.hidden = true
+  try {
+    const next = await invoke<StatusSnapshot>('set_desktop_preferences', {
+      preferences: { ...snapshot.desktop_preferences, onboarding_complete: true },
+    })
+    updateStatus(next)
+  } catch (reason) {
+    error.textContent = errorMessage(reason)
+    error.hidden = false
+  } finally {
+    button.disabled = false
+  }
+})
+$<HTMLDialogElement>('welcome-dialog').addEventListener('cancel', (event) => {
+  event.preventDefault()
 })
 document.querySelectorAll<HTMLAnchorElement>('.placeholder-link').forEach((link) => {
   link.addEventListener('click', (event) => event.preventDefault())

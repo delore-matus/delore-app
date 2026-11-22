@@ -4,7 +4,7 @@
 |---|---|---|
 | 1. Zero-percent slider regression | PASS | Real Tauri window/CDP and expanded ignored integration flow verified against owned coordinators; details below. |
 | 2. Connection resilience and single instance | PASS | Reconnect backoff, in-flight result discard, explicit connection state, and focus/restore on second launch verified. |
-| 3. First-run onboarding and data management | TODO | |
+| 3. First-run onboarding and data management | PASS | Adaptive startup readiness, first-run welcome, and local data-folder access verified. |
 | 4. Coordinator hardening (SQLite) | TODO | |
 | 5. Coordinator URL and TLS | TODO | |
 | 6. Network-selected model | TODO | |
@@ -28,4 +28,13 @@ Phase 2 evidence (all timestamps UTC):
 - With the rebuilt desktop app, a second launch while the existing window was minimized exited as a separate process and restored/focused the original window at `21:34:47.023Z`. The app and managed engine each remained a single process, and the coordinator still listed one provider.
 - `cargo test --workspace`: 88 passed, 0 failed, 4 ignored. `cargo clippy --workspace --all-targets`: passed with the existing coordinator `while_let_loop` warning. `cargo fmt --all -- --check` and `npm --prefix desktop run build` passed. The focused provider disconnect integration test passed earlier against the cached local runtime/model.
 
-Next: Phase 3 — first-run onboarding and data management.
+Phase 3 evidence (all timestamps UTC):
+- Engine readiness now retries adaptively (200 ms up to 2 s) for a maximum of 180 seconds. A fake local engine that became ready after 31 seconds passed the regression test (`waits_for_a_slow_starting_fake_engine_past_the_previous_timeout`; 31.54 s), proving startup no longer fails at the old 30-second limit.
+- Recovered Phase 2 measurement: Start clicked at `2026-11-22T21:31:37.540Z`; engine ready at `21:31:49.350Z` (11.810 s); provider online at `21:31:50.636Z` (13.096 s).
+- In a real rebuilt Windows desktop window with an isolated `%TEMP%` config, the welcome dialog opened and Continue persisted `onboarding_complete=true` only in that isolated config. Settings → Open data folder returned without a UI error.
+- Real Start click at `2026-11-22T22:50:13.422Z` showed `Preparing` by `22:50:14.996Z`, with accessible text “Starting DeLore. This can take up to 3 minutes.” At `22:50:18.044Z`, the UI showed Online and Coordinator connected (4.622 s from click). The machine requests reduced motion, so the indeterminate indicator used a static 32% bar rather than falsely showing 100%; the Preparing label remained explicit. The provider was stopped through the UI at `22:50:32.257Z`; no managed `ollama.exe` remained.
+- Pre-build disk space: C: 26.69 GB free; Q: 4.27 GB free. Cargo used isolated `Q:\gpu-swarm-phase3-88e391cb1c1c460d98e7`; application configs used isolated `%TEMP%` folders. The real `%APPDATA%\GpuSwarm\config.json` was not accessed.
+- `cargo test --workspace`: 90 passed, 0 failed, 4 ignored. `cargo clippy --workspace --all-targets`: passed with the existing coordinator `while_let_loop` warning. `cargo fmt --all` and frontend tests (5 passed) and build passed.
+- All four ignored tests were explicitly run and passed: `close_shutdown_helper_stops_the_managed_runtime`, `managed_provider_runs_a_job_and_stops`, `disconnect_during_job_discards_result_and_reconnects`, and `performance_slider_controls_registration_and_job_flow`. A stale assertion in the provider-core flow test expected the CLI path to write desktop history; that test-only mismatch was corrected in separate commit `2dd15c1`.
+
+Next: Phase 4 — coordinator hardening (SQLite).

@@ -21,6 +21,9 @@ const CHECKSUMS_URL: &str =
     "https://github.com/ollama/ollama/releases/download/v0.40.17/sha256sum.txt";
 const REGISTRY_URL: &str = "https://registry.ollama.ai/v2";
 const UNPACKED_SPACE_MULTIPLIER: u64 = 4;
+const RUNTIME_STARTUP_TIMEOUT: Duration = Duration::from_secs(180);
+const INITIAL_STARTUP_PROBE_INTERVAL: Duration = Duration::from_millis(200);
+const MAX_STARTUP_PROBE_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -467,40 +470,69 @@ impl RuntimeManager {
                 return Err(error).context("could not apply managed Ollama process priority");
             }
         }
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            if let Some(status) = child
+        let ready = wait_for_runtime_ready(&self.http, &api_url, RUNTIME_STARTUP_TIMEOUT, || {
+            child
                 .try_wait()
-                .context("failed to check managed Ollama process")?
-            {
-                bail!("managed Ollama process exited during startup with {status}");
-            }
-            if self
-                .http
-                .get(format!("{api_url}/api/version"))
-                .timeout(Duration::from_secs(1))
-                .send()
+                .context("failed to check managed Ollama process")
+                .map(|status| status.map(|status| status.to_string()))
+        })
+        .await?;
+        if !ready {
+            child
+                .kill()
                 .await
-                .is_ok_and(|response| response.status().is_success())
-            {
-                callback(RuntimeState::Running);
-                return Ok(RunningRuntime {
-                    child,
-                    api_url,
-                    port,
-                    http: self.http.clone(),
-                    models_dir: self.models_dir(),
-                });
-            }
-            if Instant::now() >= deadline {
-                child
-                    .kill()
-                    .await
-                    .context("failed to stop Ollama after its startup timeout")?;
-                bail!("managed Ollama runtime did not become ready within 30 seconds");
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
+                .context("failed to stop Ollama after its startup timeout")?;
+            bail!(
+                "managed Ollama runtime did not become ready within {} seconds",
+                RUNTIME_STARTUP_TIMEOUT.as_secs()
+            );
         }
+        callback(RuntimeState::Running);
+        Ok(RunningRuntime {
+            child,
+            api_url,
+            port,
+            http: self.http.clone(),
+            models_dir: self.models_dir(),
+        })
+    }
+}
+
+async fn wait_for_runtime_ready(
+    http: &reqwest::Client,
+    api_url: &str,
+    startup_timeout: Duration,
+    mut process_status: impl FnMut() -> Result<Option<String>>,
+) -> Result<bool> {
+    let deadline = Instant::now() + startup_timeout;
+    let mut probe_interval = INITIAL_STARTUP_PROBE_INTERVAL;
+    loop {
+        if let Some(status) = process_status()? {
+            bail!("managed Ollama process exited during startup with {status}");
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        if http
+            .get(format!("{api_url}/api/version"))
+            .timeout(remaining.min(Duration::from_secs(1)))
+            .send()
+            .await
+            .is_ok_and(|response| response.status().is_success())
+        {
+            return Ok(true);
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        tokio::time::sleep(probe_interval.min(remaining)).await;
+        probe_interval = probe_interval
+            .saturating_mul(2)
+            .min(MAX_STARTUP_PROBE_INTERVAL);
     }
 }
 
@@ -1223,7 +1255,11 @@ fn fat_mach_supports_arch(header: &[u8], expected_cpu: u32, fat64: bool) -> bool
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, sync::Arc};
+    use std::{
+        fs,
+        sync::Arc,
+        time::{Duration, Instant},
+    };
 
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -1233,8 +1269,9 @@ mod tests {
     use super::{
         download_resumable, ensure_available_space, ensure_download_confirmation,
         ensure_provider_confirmation, mach_header_supports_arch, parse_checksum_file,
-        process_pull_progress, select_localhost_port, verify_sha256, RuntimeDownloadPhase,
-        RuntimeProgressCallback, RuntimeState, RuntimeSuitability,
+        process_pull_progress, select_localhost_port, verify_sha256, wait_for_runtime_ready,
+        RuntimeDownloadPhase, RuntimeProgressCallback, RuntimeState, RuntimeSuitability,
+        RUNTIME_STARTUP_TIMEOUT,
     };
 
     #[test]
@@ -1288,6 +1325,42 @@ mod tests {
         let port = select_localhost_port().unwrap();
         assert_ne!(port, 0);
         assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_ok());
+    }
+
+    #[tokio::test]
+    async fn waits_for_a_slow_starting_fake_engine_past_the_previous_timeout() {
+        let reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = reservation.local_addr().unwrap();
+        drop(reservation);
+
+        let fake_engine = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(31)).await;
+            let listener = TcpListener::bind(address).await.unwrap();
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 1024];
+            let bytes_read = socket.read(&mut request).await.unwrap();
+            assert!(
+                String::from_utf8_lossy(&request[..bytes_read]).starts_with("GET /api/version ")
+            );
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .await
+                .unwrap();
+        });
+
+        let started = Instant::now();
+        let ready = wait_for_runtime_ready(
+            &reqwest::Client::new(),
+            &format!("http://{address}"),
+            RUNTIME_STARTUP_TIMEOUT,
+            || Ok(None),
+        )
+        .await
+        .unwrap();
+
+        assert!(ready);
+        assert!(started.elapsed() >= Duration::from_secs(31));
+        fake_engine.await.unwrap();
     }
 
     #[test]

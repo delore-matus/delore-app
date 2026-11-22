@@ -94,6 +94,16 @@ registry. Any system Ollama installation is ignored.
 For a single-job integration test, run `gpuswarm start --once`; the provider
 shuts the managed runtime down after returning that job result.
 
+The app checks for readiness with an adaptive probe interval and allows up to
+three minutes for startup. While it waits, the Status screen shows an animated
+Preparing state; only after the limit is reached does it show a friendly
+startup error.
+
+On first launch, a welcome screen explains the testnet and local resource use.
+Settings and earnings history stay in the app's local configuration folder.
+Use Settings → Local Data → Open data folder to review or back up those files;
+the app does not delete them automatically.
+
 Intel integrated graphics, unsupported/unknown GPUs, and CPU-only systems are
 marked not recommended. The CLI asks for explicit confirmation before runtime
 download on those machines; inference can then run on CPU. The macOS archive

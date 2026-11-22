@@ -48,6 +48,7 @@ pub enum AppLanguage {
 pub struct DesktopPreferences {
     pub theme: Theme,
     pub language: AppLanguage,
+    pub onboarding_complete: bool,
     pub start_on_login: bool,
     pub start_minimized_to_tray: bool,
     pub keep_running_in_tray: bool,
@@ -59,6 +60,7 @@ impl Default for DesktopPreferences {
         Self {
             theme: Theme::Dark,
             language: AppLanguage::English,
+            onboarding_complete: false,
             start_on_login: false,
             start_minimized_to_tray: false,
             keep_running_in_tray: false,
@@ -551,6 +553,7 @@ mod tests {
         let config = load_config_from(&path).unwrap().unwrap();
         assert_eq!(config.resource_settings, ResourceSettings::default());
         assert_eq!(config.desktop_preferences, DesktopPreferences::default());
+        assert!(!config.desktop_preferences.onboarding_complete);
         assert_eq!(fs::read_to_string(&path).unwrap(), old_json);
         remove_test_config(&path);
     }
@@ -600,6 +603,7 @@ mod tests {
         let preferences = DesktopPreferences {
             theme: Theme::Light,
             language: AppLanguage::English,
+            onboarding_complete: true,
             start_on_login: true,
             start_minimized_to_tray: true,
             keep_running_in_tray: true,

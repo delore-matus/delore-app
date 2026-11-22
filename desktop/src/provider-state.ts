@@ -1,6 +1,7 @@
 export interface ProviderDisplayInput {
   running: boolean
   connection: 'connecting' | 'connected' | 'disconnected'
+  preparing: boolean
   confirmationRequired: boolean
   jobId: string | null
   policyReason: string
@@ -15,6 +16,30 @@ export interface ProviderDisplayState {
 export interface CoordinatorDisplayState {
   label: string
   status: string
+}
+
+export interface PreparationDisplayState {
+  label: string
+  detail: string
+  indeterminate: boolean
+}
+
+export function preparationDisplayState(
+  state: string,
+  percent: number,
+): PreparationDisplayState {
+  if (state === 'starting') {
+    return {
+      label: 'Preparing DeLore',
+      detail: 'Starting DeLore. This can take up to 3 minutes.',
+      indeterminate: true,
+    }
+  }
+  return {
+    label: `Preparing DeLore (${percent}%)`,
+    detail: '',
+    indeterminate: false,
+  }
 }
 
 export function coordinatorDisplayState(
@@ -39,6 +64,12 @@ export function providerDisplayState(input: ProviderDisplayInput): ProviderDispl
   }
   if (!input.running) {
     return { label: 'Offline', detail: 'Start DeLore to accept work.' }
+  }
+  if (input.preparing) {
+    return {
+      label: 'Preparing',
+      detail: 'Preparing DeLore before connecting to the coordinator.',
+    }
   }
   if (input.connection === 'connecting') {
     return { label: 'Connecting', detail: 'Waiting for the coordinator.' }

@@ -1,6 +1,7 @@
 use provider_core::config::append_technical_log;
 use std::{
     fs,
+    path::Path,
     process::Command,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -90,6 +91,11 @@ fn classify_error(technical: &str) -> UiError {
         (
             UiErrorCategory::InvalidSetting,
             "Enter a valid payout address with a 0x prefix and 40 hexadecimal characters.",
+        )
+    } else if lower.contains("did not become ready within") {
+        (
+            UiErrorCategory::SetupFailed,
+            "DeLore could not finish starting after a few minutes. Please try again or open the logs for details.",
         )
     } else if lower.contains("ollama_model")
         || lower.contains("invalid model")
@@ -748,6 +754,11 @@ fn open_logs() -> Result<(), String> {
 }
 
 #[tauri::command]
+fn open_data_folder() -> Result<(), String> {
+    open_data_directory().map_err(|error| map_invoke_error(&error))
+}
+
+#[tauri::command]
 fn set_payout_address(
     app: tauri::AppHandle,
     state: State<'_, DesktopState>,
@@ -897,28 +908,40 @@ fn open_logs_directory() -> Result<(), String> {
         .join("logs");
     fs::create_dir_all(&logs_dir)
         .map_err(|error| format!("Could not create logs directory: {error}"))?;
+    open_directory(&logs_dir, "logs directory")
+}
+
+fn open_data_directory() -> Result<(), String> {
+    let data_dir = provider_core::config_dir()
+        .map_err(|error| format!("Could not locate data directory: {error:#}"))?;
+    fs::create_dir_all(&data_dir)
+        .map_err(|error| format!("Could not create data directory: {error}"))?;
+    open_directory(&data_dir, "data folder")
+}
+
+fn open_directory(directory: &Path, description: &str) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     let mut command = {
         let mut command = Command::new("explorer.exe");
-        command.arg(&logs_dir);
+        command.arg(directory);
         command
     };
     #[cfg(target_os = "macos")]
     let mut command = {
         let mut command = Command::new("open");
-        command.arg(&logs_dir);
+        command.arg(directory);
         command
     };
     #[cfg(all(unix, not(target_os = "macos")))]
     let mut command = {
         let mut command = Command::new("xdg-open");
-        command.arg(&logs_dir);
+        command.arg(directory);
         command
     };
     command
         .spawn()
         .map(|_| ())
-        .map_err(|error| format!("Could not open logs directory: {error}"))
+        .map_err(|error| format!("Could not open {description}: {error}"))
 }
 
 fn initial_runtime_state(manager: &RuntimeManager) -> RuntimeState {
@@ -1063,6 +1086,7 @@ fn main() {
             set_performance,
             set_desktop_preferences,
             open_logs,
+            open_data_folder,
             confirm_hardware_use,
             set_payout_address
         ])
@@ -1128,7 +1152,7 @@ mod tests {
         let errors = [
             "OLLAMA_MODEL contains invalid non-Unicode data.",
             "managed Ollama process exited during startup",
-            "managed Ollama runtime did not become ready within 30 seconds",
+            "managed Ollama runtime did not become ready within 180 seconds",
             "model download ended before Ollama reported completion",
             "Ollama model download failed",
             "runtime download requires explicit confirmation",
@@ -1167,6 +1191,17 @@ mod tests {
             ["ollama", "runtime", "sidecar", "model", "pull", "download"]
                 .iter()
                 .all(|word| !message.contains(word))
+        );
+    }
+
+    #[test]
+    fn long_startup_timeout_maps_to_a_friendly_message() {
+        let mapped =
+            classify_error("managed Ollama runtime did not become ready within 180 seconds");
+        assert_eq!(mapped.category, super::UiErrorCategory::SetupFailed);
+        assert_eq!(
+            mapped.message,
+            "DeLore could not finish starting after a few minutes. Please try again or open the logs for details."
         );
     }
 

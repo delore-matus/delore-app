@@ -94,6 +94,11 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
 .job-panel { margin-bottom: 0; }
 .progress-track { height: 5px; margin-top: 16px; overflow: hidden; background: color-mix(in srgb, currentColor 12%, transparent); }
 .progress-track span { display: block; width: 0; height: 100%; background: var(--accent); transition: width 180ms ease-out; }
+.progress-panel.is-indeterminate .progress-track span { width: 32%; animation: preparation-sweep 1.5s ease-in-out infinite; }
+@keyframes preparation-sweep {
+  from { transform: translateX(-110%); }
+  to { transform: translateX(320%); }
+}
 .actions { align-items: flex-end; margin-top: 6px; }
 .actions > .muted { max-width: 420px; }
 .action-buttons { justify-content: flex-end; }
@@ -136,6 +141,14 @@ input[type="text"], select {
 .confirm-dialog::backdrop { background: rgba(0, 0, 0, 0.72); }
 .confirm-dialog p:not(.eyebrow) { margin-top: 14px; font-size: 12px; line-height: 1.65; }
 .dialog-actions { justify-content: flex-end; margin-top: 22px; }
+
+@media (prefers-reduced-motion: reduce) {
+  .progress-panel.is-indeterminate .progress-track span {
+    width: 32%;
+    animation: none;
+    opacity: 0.6;
+  }
+}
 
 [hidden] { display: none !important; }
 
