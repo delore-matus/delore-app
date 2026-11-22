@@ -18,7 +18,96 @@ pub struct NativeSystemProbe;
 
 impl SystemProbe for NativeSystemProbe {
     fn sample(&self) -> SystemSample {
+        #[cfg(debug_assertions)]
+        if let Some(sample) = test_probe_override() {
+            return sample;
+        }
         native_sample()
+    }
+}
+
+#[cfg(debug_assertions)]
+fn test_probe_override() -> Option<SystemSample> {
+    let idle_override = std::env::var("GPUSWARM_TEST_IDLE_STATE").ok();
+    let power_override = std::env::var("GPUSWARM_TEST_POWER_STATE").ok();
+    if idle_override.is_none() && power_override.is_none() {
+        return None;
+    }
+
+    let mut sample = native_sample();
+    if let Some(value) = idle_override {
+        match parse_test_idle_state(&value) {
+            Some(idle) => sample.idle = idle,
+            None => eprintln!("Ignoring invalid GPUSWARM_TEST_IDLE_STATE value"),
+        }
+    }
+    if let Some(value) = power_override {
+        match parse_test_power_state(&value) {
+            Some(power) => sample.power = power,
+            None => eprintln!("Ignoring invalid GPUSWARM_TEST_POWER_STATE value"),
+        }
+    }
+    Some(sample)
+}
+
+#[cfg(debug_assertions)]
+fn parse_test_idle_state(value: &str) -> Option<IdleState> {
+    match value {
+        "active" => Some(IdleState::Active),
+        "idle" => Some(IdleState::IdleFor(Duration::from_secs(86_400))),
+        "unknown" => Some(IdleState::Unknown),
+        _ => None,
+    }
+}
+
+#[cfg(debug_assertions)]
+fn parse_test_power_state(value: &str) -> Option<PowerState> {
+    match value {
+        "ac" => Some(PowerState::Ac),
+        "battery" => Some(PowerState::OnBattery),
+        "unknown_battery" => Some(PowerState::Unknown {
+            battery_present: true,
+        }),
+        "unknown_desktop" => Some(PowerState::Unknown {
+            battery_present: false,
+        }),
+        _ => None,
+    }
+}
+
+#[cfg(all(test, debug_assertions))]
+mod test_override_tests {
+    use super::{parse_test_idle_state, parse_test_power_state};
+    use crate::resource::{IdleState, PowerState};
+    use std::time::Duration;
+
+    #[test]
+    fn test_probe_override_parses_idle_and_power_states() {
+        assert_eq!(parse_test_idle_state("active"), Some(IdleState::Active));
+        assert_eq!(
+            parse_test_idle_state("idle"),
+            Some(IdleState::IdleFor(Duration::from_secs(86_400)))
+        );
+        assert_eq!(parse_test_idle_state("unknown"), Some(IdleState::Unknown));
+        assert_eq!(parse_test_idle_state("invalid"), None);
+        assert_eq!(parse_test_power_state("ac"), Some(PowerState::Ac));
+        assert_eq!(
+            parse_test_power_state("battery"),
+            Some(PowerState::OnBattery)
+        );
+        assert_eq!(
+            parse_test_power_state("unknown_battery"),
+            Some(PowerState::Unknown {
+                battery_present: true
+            })
+        );
+        assert_eq!(
+            parse_test_power_state("unknown_desktop"),
+            Some(PowerState::Unknown {
+                battery_present: false
+            })
+        );
+        assert_eq!(parse_test_power_state("invalid"), None);
     }
 }
 
