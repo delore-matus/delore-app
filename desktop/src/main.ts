@@ -2,109 +2,83 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import './style.css'
 
-type RuntimeState =
-  | { state: 'not_installed' }
-  | {
-      state: 'downloading'
-      phase: 'runtime' | 'model'
-      percent: number
-      bytes: number
-      expected_total_download_bytes: number
-    }
-  | { state: 'error'; message: string }
-  | { state: 'verifying' | 'ready' | 'starting' | 'running' | 'stopping' }
-
-type Suitability =
-  | { status: 'suitable' }
-  | { status: 'not_recommended'; reason: string }
-
-type CurrentJob =
-  | { state: 'idle' }
-  | { state: 'running'; job_id: string }
-  | { state: 'finished'; job_id: string; result_data: string; error: string | null }
-
-type ResourceMode = 'only_when_idle' | 'always_on_low_priority' | 'scheduled_hours'
-type ResourcePreset = 'low' | 'balanced' | 'high'
-
-interface ResourceSchedule {
-  weekdays: number[]
-  start: string
-  end: string
-}
-
-interface ResourceSettings {
-  mode: ResourceMode
-  idle_threshold_minutes: number
-  schedule: ResourceSchedule | null
-  preset: ResourcePreset
-  do_not_run_on_battery: boolean
-  not_recommended_confirmed: boolean
-}
-
+type Theme = 'dark' | 'light' | 'system'
+type ConnectionState = 'connecting' | 'connected' | 'disconnected'
 type PolicyDecision = { state: 'run' } | { state: 'paused'; reason: string }
 
-interface PresetMapping {
-  num_thread: number
-  keep_alive: string
-  ollama_num_parallel: number
-  max_loaded_models: number
-  process_priority: 'normal' | 'below_normal'
-  priority_supported: boolean
+interface DesktopPreferences {
+  theme: Theme
+  language: 'english'
+  start_on_login: boolean
+  start_minimized_to_tray: boolean
+  keep_running_in_tray: boolean
+  notifications_enabled: boolean
 }
 
-interface ResourceMetrics {
-  runtime_cpu_percent: number | null
-  runtime_ram_bytes: number | null
-  gpu_utilization_percent: number | null
-  gpu_vram_used_bytes: number | null
-  gpu_device_wide: boolean
+interface RuntimeState {
+  state: string
+  phase?: string
+  percent?: number
+  expected_total_download_bytes?: number
+  message?: string
 }
 
 interface StatusSnapshot {
   provider_running: boolean
   runtime: RuntimeState
-  runtime_suitability: Suitability
+  runtime_suitability: { status: 'suitable' | 'not_recommended'; reason?: string }
   gpu: { gpu_name: string; gpu_memory: string; support: string }
-  connection: 'connecting' | 'connected' | 'disconnected'
+  connection: ConnectionState
   fee_config: {
     fee_bps: number
     job_price_units: number
     provider_payout_units: number
     fee_address: string
   } | null
-  current_job: CurrentJob
+  current_job:
+    | { state: 'idle' }
+    | { state: 'running'; job_id: string }
+    | { state: 'finished'; job_id: string; succeeded: boolean }
   user_paused: boolean
   payout_address: string | null
-  coordinator_ws: string
-  configured_model: string
-  effective_model: string
-  model_override_active: boolean
-  configured_model_download_bytes: number | null
-  effective_model_download_bytes: number | null
-  model_size_error: string | null
   runtime_percent: number
   model_percent: number
   expected_total_download_bytes: number | null
   error_message: string | null
-  resource_settings: ResourceSettings
   policy: PolicyDecision
   policy_diagnostic: string | null
-  resource_metrics: ResourceMetrics
-  preset_mapping: PresetMapping
-  requires_restart: boolean
+  performance_percent: number
+  hardware_confirmed: boolean
+  desktop_preferences: DesktopPreferences
+  earnings: EarningsSnapshot
+  earnings_error: string | null
+}
+
+interface EarningsEntry {
+  job_id: string
+  timestamp_unix_ms: number
+  status: 'completed' | 'failed'
+  gross_units: number | null
+  provider_payout_units: number | null
+  fee_units: number | null
+}
+
+interface EarningsSnapshot {
+  entries: EarningsEntry[]
+  balance_units: number
+  job_count: number
+  recovered_corruption: boolean
 }
 
 const root = document.querySelector<HTMLDivElement>('#app')
 if (!root) throw new Error('App root element is missing')
 
 let snapshot: StatusSnapshot | null = null
-let addressError = ''
-let addressSuccess = ''
-let modelError = ''
-let modelSuccess = ''
-let resourceError = ''
-let resourceSuccess = ''
+let currentScreen: 'status' | 'earnings' | 'settings' = 'status'
 let working = false
+let payoutError = ''
+let payoutMessage = ''
+let settingsError = ''
 
 root.innerHTML = `
   <main class="shell">
@@ -113,203 +87,205 @@ root.innerHTML = `
       <span class="testnet-badge">TESTNET — no real payouts</span>
     </header>
 
-    <section class="page-heading" aria-labelledby="page-title">
-      <div>
-        <p class="eyebrow">PROVIDER</p>
-        <h1 id="page-title">Status</h1>
-      </div>
-      <div class="connection" id="connection" aria-live="polite">
-        <span class="connection-dot" aria-hidden="true"></span>
-        <span id="connection-label">Loading status…</span>
-      </div>
-    </section>
+    <div class="layout">
+      <nav class="navigation" aria-label="Main navigation">
+        <button class="nav-button active" data-screen="status">Status</button>
+        <button class="nav-button" data-screen="earnings">Earnings</button>
+        <button class="nav-button" data-screen="settings">Settings</button>
+      </nav>
 
-    <p class="notice error-notice" id="error-message" role="alert" hidden></p>
+      <div class="content">
+        <section class="page-heading">
+          <div>
+            <p class="eyebrow">DELORE PROVIDER</p>
+            <h1 id="page-title">Status</h1>
+          </div>
+          <div class="connection" id="connection" aria-live="polite">
+            <span class="connection-dot" aria-hidden="true"></span>
+            <span id="connection-label">Loading status…</span>
+          </div>
+        </section>
 
-    <section class="panel runtime-panel" aria-labelledby="runtime-title">
-      <div class="panel-heading">
-        <div>
-          <p class="eyebrow">INFERENCE RUNTIME</p>
-          <h2 id="runtime-title">Runtime and model</h2>
-        </div>
-        <span class="state-chip" id="runtime-chip">Checking</span>
+        <p class="notice error-notice" id="global-error" role="alert" hidden></p>
+
+        <section class="screen" id="screen-status">
+          <section class="panel">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">PROVIDER</p>
+                <h2>Current state</h2>
+              </div>
+              <span class="state-chip" id="provider-state">Offline</span>
+            </div>
+            <p class="muted" id="provider-detail">Start DeLore to accept work.</p>
+            <div class="status-grid">
+              <div>
+                <p class="eyebrow">GPU</p>
+                <p class="value" id="gpu-name">Detecting…</p>
+                <p class="muted" id="gpu-support"></p>
+              </div>
+              <div>
+                <p class="eyebrow">COORDINATOR</p>
+                <p class="value" id="coordinator-state">Disconnected</p>
+              </div>
+              <div>
+                <p class="eyebrow">PLATFORM FEE</p>
+                <p class="value" id="fee-percent">Waiting for coordinator</p>
+              </div>
+              <div>
+                <p class="eyebrow">FEE RECIPIENT</p>
+                <p class="address-value" id="fee-address">Read-only</p>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">PERFORMANCE</p>
+                <h2>GPU effort</h2>
+              </div>
+              <output class="state-chip" id="performance-value">50%</output>
+            </div>
+            <label class="slider-label" for="performance-slider">
+              Approximate limit on how hard DeLore works your GPU.
+            </label>
+            <input id="performance-slider" type="range" min="10" max="100" step="1" value="50" />
+            <div class="slider-limits"><span>10%</span><span>100%</span></div>
+            <p class="muted" id="performance-detail">
+              Approximate limit only; not a hard GPU cap. Where supported, this also adjusts GPU layer use.
+            </p>
+          </section>
+
+          <section class="panel job-panel">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">WORK</p>
+                <h2>Current job</h2>
+              </div>
+              <span class="state-chip" id="job-state">Idle</span>
+            </div>
+            <p class="job-detail" id="job-detail">No active job.</p>
+          </section>
+
+          <section class="panel progress-panel" id="preparation-panel" hidden>
+            <p class="eyebrow">PREPARING DELORE</p>
+            <h2 id="preparation-label">Preparing provider resources</h2>
+            <div class="progress-track" role="progressbar" aria-label="Provider preparation">
+              <span id="preparation-bar"></span>
+            </div>
+            <p class="muted" id="download-size"></p>
+          </section>
+
+          <div class="actions">
+            <p class="muted" id="suitability-note"></p>
+            <div class="action-buttons">
+              <button class="button button-secondary" id="pause-provider" type="button" disabled>Pause</button>
+              <button class="button button-secondary" id="stop-provider" type="button" disabled>Stop</button>
+              <button class="button button-primary" id="start-provider" type="button">Start</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="screen" id="screen-earnings" hidden>
+          <section class="panel">
+            <p class="eyebrow">TESTNET BALANCE</p>
+            <h2 class="money-value" id="earnings-balance">0 units</h2>
+            <span class="money-note">TESTNET - no real payouts</span>
+            <div class="earnings-summary">
+              <div><span class="muted">Job count</span><strong id="job-count">0</strong></div>
+              <div><span class="muted">Stored history</span><strong>On this device</strong></div>
+            </div>
+          </section>
+          <section class="panel">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">RECENT ACTIVITY</p>
+                <h2>Jobs</h2>
+              </div>
+            </div>
+            <div id="earnings-error" class="field-error" role="alert" hidden></div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr><th>Time</th><th>Status</th><th>Provider payout</th><th>Fee</th></tr>
+                </thead>
+                <tbody id="earnings-rows"></tbody>
+              </table>
+            </div>
+            <p class="empty-state" id="earnings-empty" hidden>No jobs recorded yet.</p>
+          </section>
+        </section>
+
+        <section class="screen" id="screen-settings" hidden>
+          <section class="panel">
+            <p class="eyebrow">PREFERENCES</p>
+            <h2>Appearance</h2>
+            <label for="theme-select">Theme</label>
+            <select id="theme-select">
+              <option value="dark">Dark</option>
+              <option value="light">Light</option>
+              <option value="system">System</option>
+            </select>
+            <label for="language-select">Language</label>
+            <select id="language-select" disabled>
+              <option value="english">English</option>
+            </select>
+            <p class="field-error" id="settings-error" role="alert" hidden></p>
+          </section>
+
+          <section class="panel">
+            <p class="eyebrow">PAYOUT</p>
+            <h2>Payout address</h2>
+            <p class="muted">Use a public address only. Never enter a private key or seed phrase.</p>
+            <form id="payout-form" novalidate>
+              <label for="payout-address">Ethereum address</label>
+              <div class="address-form">
+                <input id="payout-address" name="payout-address" type="text" autocomplete="off"
+                  spellcheck="false" placeholder="0x followed by 40 hex characters" />
+                <button class="button button-secondary" id="save-address" type="submit">Save address</button>
+              </div>
+              <p class="field-error" id="address-error" role="alert" hidden></p>
+              <p class="field-success" id="address-success" role="status" hidden></p>
+            </form>
+          </section>
+
+          <section class="panel">
+            <p class="eyebrow">STARTUP</p>
+            <h2>App behavior</h2>
+            <label class="checkbox-label"><input id="start-on-login" type="checkbox" /> Start on login</label>
+            <label class="checkbox-label"><input id="start-minimized" type="checkbox" /> Start minimized to tray</label>
+            <label class="checkbox-label"><input id="keep-in-tray" type="checkbox" /> Keep running in tray when the window is closed</label>
+            <label class="checkbox-label"><input id="notifications-enabled" type="checkbox" /> Notifications</label>
+          </section>
+
+          <section class="panel">
+            <p class="eyebrow">ABOUT</p>
+            <h2>DeLore</h2>
+            <p class="muted">Version 0.1.0</p>
+            <div class="about-links">
+              <a href="#" class="placeholder-link">Terms</a>
+              <a href="#" class="placeholder-link">Privacy</a>
+              <button class="button button-secondary" id="open-logs" type="button">Open logs</button>
+            </div>
+          </section>
+        </section>
       </div>
-      <div class="download-progress" id="download-progress" hidden>
-        <div class="progress-labels">
-          <span id="runtime-progress-label">Preparing runtime (0%)</span>
-          <span id="model-progress-label">Downloading model (0%)</span>
-        </div>
-        <div class="progress-track" role="progressbar" aria-label="Runtime and model download">
-          <span id="progress-bar"></span>
-        </div>
-        <p class="muted" id="download-size"></p>
-      </div>
-      <p class="muted" id="runtime-detail">Reading runtime state…</p>
-      <form class="model-form" id="model-form" novalidate>
-        <label for="ollama-model">Configured Ollama model</label>
-        <div class="address-form">
-          <input id="ollama-model" name="ollama-model" type="text" autocomplete="off"
-            spellcheck="false" placeholder="llama3.2:3b" />
-          <button class="button button-secondary" id="save-model" type="submit">Save model</button>
-        </div>
-        <p class="muted" id="configured-model-size">Checking model download size…</p>
-        <p class="warning-text" id="model-override" hidden></p>
-        <p class="muted" id="effective-model-size" hidden></p>
-        <p class="field-error" id="model-error" role="alert" hidden></p>
-        <p class="field-success" id="model-success" role="status" hidden></p>
-        <p class="muted" id="model-restart-note">Changes apply the next time the provider starts.</p>
-      </form>
-    </section>
-
-    <div class="details-grid">
-      <section class="panel" aria-labelledby="gpu-title">
-        <p class="eyebrow">HARDWARE</p>
-        <h2 id="gpu-title">GPU</h2>
-        <p class="value" id="gpu-name">Detecting…</p>
-        <p class="muted" id="gpu-memory"></p>
-        <p class="support-note" id="gpu-support"></p>
-      </section>
-
-      <section class="panel" aria-labelledby="fee-title">
-        <p class="eyebrow">COORDINATOR CONFIGURATION</p>
-        <h2 id="fee-title">Platform fee</h2>
-        <p class="value" id="fee-percent">Waiting for coordinator</p>
-        <p class="muted">Fee recipient</p>
-        <p class="address-value" id="fee-address">Read-only; received from coordinator</p>
-      </section>
     </div>
 
-    <section class="panel job-panel" aria-labelledby="job-title">
-      <div class="panel-heading">
-        <div>
-          <p class="eyebrow">WORK</p>
-          <h2 id="job-title">Current job</h2>
+    <dialog class="confirm-dialog" id="hardware-confirmation" aria-labelledby="confirm-title">
+      <form method="dialog">
+        <p class="eyebrow">HARDWARE NOTICE</p>
+        <h2 id="confirm-title">Continue on this hardware?</h2>
+        <p id="confirm-reason"></p>
+        <p class="muted">DeLore will use the CPU for jobs. You can change your mind later.</p>
+        <div class="dialog-actions">
+          <button class="button button-secondary" value="cancel">Cancel</button>
+          <button class="button button-primary" id="confirm-hardware" value="confirm">Continue</button>
         </div>
-        <span class="state-chip" id="job-state">Idle</span>
-      </div>
-      <p class="job-detail" id="job-detail">No active job.</p>
-    </section>
-
-    <section class="panel resource-panel" aria-labelledby="resource-title">
-      <div class="panel-heading">
-        <div>
-          <p class="eyebrow">RESOURCE POLICY</p>
-          <h2 id="resource-title">Settings</h2>
-        </div>
-        <span class="state-chip" id="policy-state">Paused</span>
-      </div>
-      <p class="policy-reason" id="policy-reason" aria-live="polite">Waiting for policy status…</p>
-      <p class="muted policy-diagnostic" id="policy-diagnostic" hidden></p>
-
-      <div class="resource-grid">
-        <form id="resource-form" novalidate>
-          <label for="resource-mode">Run mode</label>
-          <select id="resource-mode" name="mode">
-            <option value="only_when_idle">Only when idle</option>
-            <option value="always_on_low_priority">Always on (low priority)</option>
-            <option value="scheduled_hours">Scheduled hours</option>
-          </select>
-
-          <div class="resource-field" id="idle-threshold-field">
-            <label for="idle-threshold">Idle threshold (minutes)</label>
-            <input id="idle-threshold" name="idle-threshold" type="number" min="1" max="60" step="1" />
-            <p class="field-error" id="idle-threshold-error" role="alert" hidden></p>
-          </div>
-
-          <div class="resource-field" id="schedule-fields" hidden>
-            <p class="field-label">Schedule in local time</p>
-            <div class="schedule-times">
-              <label for="schedule-start">Start
-                <input id="schedule-start" name="schedule-start" type="time" />
-              </label>
-              <label for="schedule-end">End
-                <input id="schedule-end" name="schedule-end" type="time" />
-              </label>
-            </div>
-            <p class="muted" id="schedule-timezone"></p>
-            <p class="field-error" id="schedule-error" role="alert" hidden></p>
-          </div>
-
-          <label for="resource-preset">Preset</label>
-          <select id="resource-preset" name="preset">
-            <option value="low">Low</option>
-            <option value="balanced">Balanced</option>
-            <option value="high">High</option>
-          </select>
-          <p class="muted" id="preset-mapping"></p>
-
-          <label class="checkbox-label" for="do-not-run-on-battery">
-            <input id="do-not-run-on-battery" name="do-not-run-on-battery" type="checkbox" />
-            Do not run on battery
-          </label>
-          <p class="muted">Enabled by default. Unknown power on a device with a battery blocks jobs.</p>
-
-          <p class="field-error" id="resource-error" role="alert" hidden></p>
-          <p class="field-success" id="resource-success" role="status" hidden></p>
-          <button class="button button-secondary resource-save" id="save-resource-settings" type="submit">
-            Save resource settings
-          </button>
-        </form>
-
-        <div class="resource-monitor" aria-labelledby="monitor-title">
-          <p class="eyebrow">MANAGED RUNTIME</p>
-          <h3 id="monitor-title">Resource monitor</h3>
-          <dl class="metric-list">
-            <div><dt>Runtime CPU</dt><dd id="runtime-cpu">Unavailable</dd></div>
-            <div><dt>Runtime RAM</dt><dd id="runtime-ram">Unavailable</dd></div>
-            <div><dt>GPU utilization · device-wide</dt><dd id="gpu-utilization">Unavailable</dd></div>
-            <div><dt>VRAM · device-wide</dt><dd id="gpu-vram">Unavailable</dd></div>
-          </dl>
-        </div>
-      </div>
-
-      <p class="notice restart-notice" id="restart-notice" role="status" hidden>
-        A runtime restart is required to apply the selected preset and priority.
-        <button class="button button-primary" id="restart-provider" type="button">Restart provider</button>
-      </p>
-      <p class="muted suitability-detail" id="suitability-detail"></p>
-    </section>
-
-    <section class="panel payout-panel" aria-labelledby="payout-title">
-      <div>
-        <p class="eyebrow">PROVIDER SETTINGS</p>
-        <h2 id="payout-title">Payout address</h2>
-        <p class="muted">Use a public address only. Never enter a private key or seed phrase.</p>
-      </div>
-      <form id="payout-form" novalidate>
-        <label for="payout-address">Ethereum address</label>
-        <div class="address-form">
-          <input id="payout-address" name="payout-address" type="text" inputmode="text"
-            autocomplete="off" spellcheck="false" placeholder="0x followed by 40 hex characters" />
-          <button class="button button-secondary" id="save-address" type="submit">Save address</button>
-        </div>
-        <p class="field-error" id="address-error" role="alert" hidden></p>
-        <p class="field-success" id="address-success" role="status" hidden></p>
       </form>
-    </section>
-
-    <footer class="actions">
-      <p class="muted" id="suitability-note"></p>
-      <div class="action-buttons">
-        <button class="button button-secondary" id="pause-provider" type="button" disabled>Pause</button>
-        <button class="button button-secondary" id="stop-provider" type="button" disabled>Stop</button>
-        <button class="button button-primary" id="start-provider" type="button">Start provider</button>
-      </div>
-    </footer>
+    </dialog>
   </main>
-
-  <dialog class="confirm-dialog" id="runtime-confirmation" aria-labelledby="confirm-title">
-    <form method="dialog">
-      <p class="eyebrow">HARDWARE NOTICE</p>
-      <h2 id="confirm-title">Run inference on CPU?</h2>
-      <p id="confirm-reason"></p>
-      <p class="muted">The app will download its private runtime and model into its data directory. No system-wide installation is made.</p>
-      <div class="dialog-actions">
-        <button class="button button-secondary" value="cancel">Cancel</button>
-        <button class="button button-primary" id="confirm-runtime" value="confirm">Continue</button>
-      </div>
-    </form>
-  </dialog>
 `
 
 const $ = <T extends HTMLElement>(id: string) => {
@@ -326,207 +302,83 @@ function updateStatus(next: StatusSnapshot): void {
 function renderStatus(): void {
   if (!snapshot) return
   const status = snapshot
-  const input = $<HTMLInputElement>('payout-address')
-  if (document.activeElement !== input) input.value = status.payout_address ?? ''
-  const modelInput = $<HTMLInputElement>('ollama-model')
-  if (document.activeElement !== modelInput) modelInput.value = status.configured_model
-  renderResourceSettings(status)
-
+  const prefs = status.desktop_preferences
+  applyTheme(prefs.theme)
   const connected = status.connection === 'connected'
-  $<HTMLElement>('connection').classList.toggle('is-connected', connected)
-  $<HTMLElement>('connection-label').textContent =
-    status.connection === 'connected'
-      ? 'Coordinator connected'
-      : status.connection === 'connecting'
-        ? 'Connecting to coordinator'
-        : 'Coordinator disconnected'
+  $('connection').classList.toggle('is-connected', connected)
+  $('connection-label').textContent = connected
+    ? 'Coordinator connected'
+    : status.connection === 'connecting' ? 'Connecting to coordinator' : 'Coordinator disconnected'
+  $('coordinator-state').textContent = connected ? 'Connected' : 'Disconnected'
 
-  $<HTMLElement>('gpu-name').textContent = status.gpu.gpu_name
-  $<HTMLElement>('gpu-memory').textContent =
-    status.gpu.gpu_memory === 'unknown' ? 'Memory: unknown' : `Memory: ${status.gpu.gpu_memory}`
-  $<HTMLElement>('gpu-support').textContent = supportDescription(status.gpu.support)
-  $<HTMLElement>('gpu-support').classList.toggle('warning-text', status.gpu.support !== 'nvidia-supported' && status.gpu.support !== 'apple-silicon-best-effort')
-
-  $<HTMLElement>('fee-percent').textContent = status.fee_config
-    ? formatPercent(status.fee_config.fee_bps)
+  $('gpu-name').textContent = status.gpu.gpu_name
+  $('gpu-support').textContent = supportDescription(status.gpu.support)
+  $('gpu-support').classList.toggle(
+    'warning-text',
+    !['nvidia-supported', 'apple-silicon-best-effort'].includes(status.gpu.support),
+  )
+  $('fee-percent').textContent = status.fee_config
+    ? `${(status.fee_config.fee_bps / 100).toFixed(status.fee_config.fee_bps % 100 ? 2 : 0)}%`
     : 'Waiting for coordinator'
-  $<HTMLElement>('fee-address').textContent =
-    status.fee_config?.fee_address ?? 'Read-only; received from coordinator'
+  $('fee-address').textContent = status.fee_config?.fee_address ?? 'Read-only'
 
-  renderJob(status.current_job)
-  renderRuntime(status)
-
-  const error = status.error_message ?? (status.runtime.state === 'error' ? status.runtime.message : '')
-  const errorElement = $<HTMLParagraphElement>('error-message')
-  errorElement.textContent = error
-  errorElement.hidden = !error
-
-  $<HTMLElement>('suitability-note').textContent =
-    status.runtime_suitability.status === 'not_recommended'
-      ? status.runtime_suitability.reason
-      : 'GPU suitability: supported path detected.'
-  const suitabilityDetail = $<HTMLElement>('suitability-detail')
-  if (status.runtime_suitability.status === 'not_recommended') {
-    suitabilityDetail.textContent = status.resource_settings.not_recommended_confirmed
-      ? 'This hardware is not recommended. Your one-time confirmation is saved; inference will use CPU.'
-      : 'This hardware is not recommended. The app will ask for one-time confirmation before preparing the runtime.'
-    suitabilityDetail.classList.add('warning-text')
+  const job = status.current_job
+  const policyReason = status.policy.state === 'paused' ? status.policy.reason : ''
+  const providerState = $('provider-state')
+  providerState.className = 'state-chip'
+  if (!status.provider_running) {
+    providerState.textContent = 'Offline'
+    $('provider-detail').textContent = 'Start DeLore to accept work.'
+  } else if (job.state === 'running') {
+    providerState.textContent = 'Running a job'
+    $('provider-detail').textContent = `Job ${job.job_id} is in progress.`
+  } else if (policyReason) {
+    providerState.textContent = 'Paused'
+    $('provider-detail').textContent = policyReason
+  } else if (status.user_paused) {
+    providerState.textContent = 'Pausing'
+    $('provider-detail').textContent = 'The current job will finish before new work pauses.'
   } else {
-    suitabilityDetail.textContent = 'Runtime suitability: suitable.'
-    suitabilityDetail.classList.remove('warning-text')
+    providerState.textContent = 'Online'
+    $('provider-detail').textContent = 'Ready to accept work.'
   }
+  renderJob(job)
+  renderPreparation(status)
+  renderEarnings(status.earnings)
+
+  $('performance-value').textContent = `${status.performance_percent}%`
+  const slider = $<HTMLInputElement>('performance-slider')
+  if (document.activeElement !== slider) slider.value = String(status.performance_percent)
+  $('suitability-note').textContent =
+    status.runtime_suitability.status === 'not_recommended'
+      ? status.hardware_confirmed
+        ? `Hardware note: ${status.runtime_suitability.reason}. CPU processing is used.`
+        : `Confirmation is required before work can start: ${status.runtime_suitability.reason}.`
+      : 'Hardware suitability: supported path detected.'
+
+  const globalError = $('global-error')
+  globalError.textContent = status.error_message ? userFacingError(status.error_message) : ''
+  globalError.hidden = !status.error_message
+  $('pause-provider').textContent = status.user_paused ? 'Resume' : 'Pause'
   $<HTMLButtonElement>('start-provider').disabled = status.provider_running || working
   $<HTMLButtonElement>('stop-provider').disabled = !status.provider_running || working
-  const pauseButton = $<HTMLButtonElement>('pause-provider')
-  pauseButton.textContent = status.user_paused ? 'Resume' : 'Pause'
-  pauseButton.disabled = !status.provider_running || working
+  $<HTMLButtonElement>('pause-provider').disabled = !status.provider_running || working
   $<HTMLButtonElement>('save-address').disabled = working
-  modelInput.disabled = status.provider_running || working
-  $<HTMLButtonElement>('save-model').disabled = status.provider_running || working
-  $<HTMLButtonElement>('restart-provider').disabled =
-    !status.provider_running || working || status.current_job.state === 'running'
-  $<HTMLButtonElement>('save-resource-settings').disabled = working
-  updateAddressFeedback()
-  updateModelFeedback(status)
+
+  const preferences = status.desktop_preferences
+  setChecked('start-on-login', preferences.start_on_login)
+  setChecked('start-minimized', preferences.start_minimized_to_tray)
+  setChecked('keep-in-tray', preferences.keep_running_in_tray)
+  setChecked('notifications-enabled', preferences.notifications_enabled)
+  const theme = $<HTMLSelectElement>('theme-select')
+  if (document.activeElement !== theme) theme.value = preferences.theme
+  updatePayoutFeedback()
+  renderSettingsError()
 }
 
-function renderResourceSettings(status: StatusSnapshot): void {
-  const settings = status.resource_settings
-  const mode = $<HTMLSelectElement>('resource-mode')
-  const threshold = $<HTMLInputElement>('idle-threshold')
-  const preset = $<HTMLSelectElement>('resource-preset')
-  const battery = $<HTMLInputElement>('do-not-run-on-battery')
-  const schedule = settings.schedule ?? {
-    weekdays: [1, 2, 3, 4, 5, 6, 7],
-    start: '09:00',
-    end: '17:00',
-  }
-  if (document.activeElement !== mode) mode.value = settings.mode
-  if (document.activeElement !== threshold) threshold.value = String(settings.idle_threshold_minutes)
-  if (document.activeElement !== preset) preset.value = settings.preset
-  if (document.activeElement !== battery) battery.checked = settings.do_not_run_on_battery
-  const start = $<HTMLInputElement>('schedule-start')
-  const end = $<HTMLInputElement>('schedule-end')
-  if (document.activeElement !== start) start.value = schedule.start
-  if (document.activeElement !== end) end.value = schedule.end
-
-  $<HTMLDivElement>('idle-threshold-field').hidden = settings.mode !== 'only_when_idle'
-  $<HTMLDivElement>('schedule-fields').hidden = settings.mode !== 'scheduled_hours'
-  $<HTMLElement>('schedule-timezone').textContent =
-    `Timezone: ${Intl.DateTimeFormat().resolvedOptions().timeZone || 'local time'} · ` +
-    `days: ${formatWeekdays(schedule.weekdays)}`
-
-  const priority = status.preset_mapping.process_priority === 'below_normal'
-    ? 'Below normal'
-    : 'Normal'
-  const priorityDescription = status.preset_mapping.priority_supported
-    ? `${priority} priority`
-    : `${priority} priority (not supported on this OS)`
-  $<HTMLElement>('preset-mapping').textContent =
-    `${status.preset_mapping.num_thread} threads · keep-alive ${status.preset_mapping.keep_alive} · ` +
-    `${priorityDescription} · concurrency ${status.preset_mapping.ollama_num_parallel} · ` +
-    `max loaded models ${status.preset_mapping.max_loaded_models}`
-
-  const policyChip = $<HTMLElement>('policy-state')
-  const policyReason = $<HTMLElement>('policy-reason')
-  policyChip.className = 'state-chip'
-  if (!status.provider_running) {
-    policyChip.textContent = 'Stopped'
-    policyReason.textContent = 'Provider is stopped.'
-  } else if (status.policy.state === 'paused') {
-    policyChip.textContent = 'Paused'
-    policyReason.textContent = status.policy.reason
-    if (status.policy.reason === 'Paused by user') policyChip.classList.add('state-paused')
-  } else if (status.user_paused) {
-    policyChip.textContent = 'Pausing'
-    policyReason.textContent = 'Pausing after the current job finishes.'
-  } else {
-    policyChip.textContent = 'Ready'
-    policyReason.textContent = status.provider_running ? 'Ready to accept jobs.' : 'Provider is stopped.'
-  }
-  const diagnostic = $<HTMLParagraphElement>('policy-diagnostic')
-  diagnostic.textContent = status.policy_diagnostic ?? ''
-  diagnostic.hidden = !status.policy_diagnostic
-
-  const metrics = status.resource_metrics
-  $<HTMLElement>('runtime-cpu').textContent = metrics.runtime_cpu_percent === null
-    ? 'Unavailable'
-    : `${metrics.runtime_cpu_percent.toFixed(1)}%`
-  $<HTMLElement>('runtime-ram').textContent = metrics.runtime_ram_bytes === null
-    ? 'Unavailable'
-    : formatBytes(metrics.runtime_ram_bytes)
-  const nvidiaMetricsAvailable =
-    status.gpu.support === 'nvidia-supported' && metrics.gpu_device_wide
-  $<HTMLElement>('gpu-utilization').textContent =
-    nvidiaMetricsAvailable && metrics.gpu_utilization_percent !== null
-      ? `${metrics.gpu_utilization_percent}%`
-      : 'Unavailable'
-  $<HTMLElement>('gpu-vram').textContent =
-    nvidiaMetricsAvailable && metrics.gpu_vram_used_bytes !== null
-      ? formatBytes(metrics.gpu_vram_used_bytes)
-      : 'Unavailable'
-
-  $<HTMLParagraphElement>('resource-error').textContent = resourceError
-  $<HTMLParagraphElement>('resource-error').hidden = !resourceError
-  $<HTMLParagraphElement>('resource-success').textContent = resourceSuccess
-  $<HTMLParagraphElement>('resource-success').hidden = !resourceSuccess
-  $<HTMLParagraphElement>('idle-threshold-error').hidden =
-    !resourceError.startsWith('Idle threshold:')
-  $<HTMLParagraphElement>('idle-threshold-error').textContent =
-    resourceError.startsWith('Idle threshold:') ? resourceError : ''
-  $<HTMLParagraphElement>('schedule-error').hidden =
-    !resourceError.startsWith('Schedule:')
-  $<HTMLParagraphElement>('schedule-error').textContent =
-    resourceError.startsWith('Schedule:') ? resourceError : ''
-  $<HTMLParagraphElement>('resource-error').hidden =
-    !resourceError || resourceError.startsWith('Idle threshold:') || resourceError.startsWith('Schedule:')
-
-  const restartNotice = $<HTMLParagraphElement>('restart-notice')
-  restartNotice.hidden = !status.requires_restart
-}
-
-function renderRuntime(status: StatusSnapshot): void {
-  const runtime = status.runtime
-  const chip = $<HTMLElement>('runtime-chip')
-  const progress = $<HTMLDivElement>('download-progress')
-  const detail = $<HTMLParagraphElement>('runtime-detail')
-  chip.className = 'state-chip'
-  chip.textContent = runtime.state.replaceAll('_', ' ')
-  progress.hidden = true
-  detail.textContent = ''
-
-  const preparing =
-    runtime.state === 'downloading' ||
-    runtime.state === 'verifying' ||
-    (status.provider_running && status.expected_total_download_bytes !== null)
-  if (preparing) {
-    progress.hidden = false
-    $<HTMLElement>('runtime-progress-label').textContent =
-      `Preparing runtime (${status.runtime_percent}%)`
-    $<HTMLElement>('model-progress-label').textContent =
-      `Downloading model (${status.model_percent}%)`
-    $<HTMLElement>('download-size').textContent =
-      status.expected_total_download_bytes
-        ? `Expected total download: ${formatBytes(status.expected_total_download_bytes)}`
-        : 'Calculating download size…'
-    const combined = Math.round((status.runtime_percent + status.model_percent) / 2)
-    $<HTMLSpanElement>('progress-bar').style.width = `${Math.max(0, Math.min(100, combined))}%`
-    detail.textContent = runtime.state === 'downloading'
-      ? runtime.phase === 'runtime' ? 'Preparing the managed Ollama runtime.' : 'Downloading the configured model.'
-      : `Runtime ${runtime.state}.`
-  } else if (runtime.state === 'not_installed') {
-    detail.textContent = 'The private runtime and model will be prepared when the provider starts.'
-  } else if (runtime.state === 'error') {
-    chip.classList.add('state-error')
-    detail.textContent = runtime.message
-  } else {
-    detail.textContent = 'The managed runtime is installed in app data.'
-  }
-}
-
-function renderJob(job: CurrentJob): void {
-  const state = $<HTMLElement>('job-state')
-  const detail = $<HTMLElement>('job-detail')
+function renderJob(job: StatusSnapshot['current_job']): void {
+  const state = $('job-state')
+  const detail = $('job-detail')
   state.className = 'state-chip'
   if (job.state === 'idle') {
     state.textContent = 'Idle'
@@ -535,12 +387,66 @@ function renderJob(job: CurrentJob): void {
     state.textContent = 'Running'
     detail.textContent = `Job ${job.job_id} is running.`
   } else {
-    state.textContent = job.error ? 'Failed' : 'Complete'
-    if (job.error) state.classList.add('state-error')
-    detail.textContent = job.error
-      ? `Job ${job.job_id}: ${job.error}`
-      : `Job ${job.job_id}: ${job.result_data || 'Completed.'}`
+    state.textContent = job.succeeded ? 'Complete' : 'Failed'
+    if (!job.succeeded) state.classList.add('state-error')
+    detail.textContent = `Job ${job.job_id} ${job.succeeded ? 'completed.' : 'failed.'}`
   }
+}
+
+function renderPreparation(status: StatusSnapshot): void {
+  const panel = $<HTMLElement>('preparation-panel')
+  const active = status.provider_running &&
+    !['ready', 'running'].includes(status.runtime.state) &&
+    status.runtime.state !== 'error'
+  panel.hidden = !active
+  if (!active) return
+  const percent = Math.round((status.runtime_percent + status.model_percent) / 2)
+  $('preparation-label').textContent = `Preparing DeLore (${percent}%)`
+  $<HTMLSpanElement>('preparation-bar').style.width = `${Math.max(0, Math.min(100, percent))}%`
+  $('download-size').textContent = status.expected_total_download_bytes
+    ? `Expected total download: ${formatBytes(status.expected_total_download_bytes)}`
+    : 'Calculating expected download size…'
+}
+
+function renderEarnings(earnings: EarningsSnapshot): void {
+  $('earnings-balance').textContent = `${earnings.balance_units} units`
+  $('job-count').textContent = String(earnings.job_count)
+  const rows = $('earnings-rows')
+  rows.replaceChildren()
+  for (const entry of earnings.entries.slice().reverse()) {
+    const row = document.createElement('tr')
+    row.append(
+      cell(new Date(Number(entry.timestamp_unix_ms)).toLocaleString()),
+      cell(entry.status === 'completed' ? 'Completed' : 'Failed'),
+      moneyCell(entry.provider_payout_units),
+      moneyCell(entry.fee_units),
+    )
+    rows.append(row)
+  }
+  $('earnings-empty').hidden = earnings.entries.length !== 0
+  $('earnings-error').textContent = snapshot?.earnings_error ?? ''
+  $('earnings-error').hidden = !snapshot?.earnings_error
+}
+
+function cell(value: string): HTMLTableCellElement {
+  const td = document.createElement('td')
+  td.textContent = value
+  return td
+}
+
+function moneyCell(value: number | null): HTMLTableCellElement {
+  const td = document.createElement('td')
+  if (value === null) {
+    td.textContent = '—'
+    return td
+  }
+  const amount = document.createElement('span')
+  amount.textContent = `${value} units`
+  const note = document.createElement('small')
+  note.className = 'money-note'
+  note.textContent = 'TESTNET - no real payouts'
+  td.append(amount, note)
+  return td
 }
 
 function supportDescription(support: string): string {
@@ -551,16 +457,12 @@ function supportDescription(support: string): string {
     case 'none':
       return 'No supported GPU detected: jobs run on CPU'
     case 'nvidia-supported':
-      return 'NVIDIA GPU detected'
+      return 'NVIDIA GPU supported'
     case 'apple-silicon-best-effort':
-      return 'Apple Silicon detected; Ollama may use Metal'
+      return 'Apple Silicon detected; GPU use is best-effort'
     default:
       return 'GPU support is best-effort; jobs may run on CPU'
   }
-}
-
-function formatPercent(basisPoints: number): string {
-  return `${(basisPoints / 100).toFixed(basisPoints % 100 === 0 ? 0 : 2)}%`
 }
 
 function formatBytes(bytes: number): string {
@@ -568,157 +470,138 @@ function formatBytes(bytes: number): string {
   return gib >= 1 ? `${gib.toFixed(2)} GiB` : `${(bytes / 1024 ** 2).toFixed(0)} MiB`
 }
 
-function formatWeekdays(days: number[]): string {
-  const names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
-  return days.length === 7 ? 'every day' : days.map((day) => names[day - 1] ?? '?').join(', ')
+function updatePayoutFeedback(): void {
+  $('address-error').textContent = payoutError
+  $('address-error').hidden = !payoutError
+  $('address-success').textContent = payoutMessage
+  $('address-success').hidden = !payoutMessage
+  const input = $<HTMLInputElement>('payout-address')
+  if (document.activeElement !== input) input.value = snapshot?.payout_address ?? ''
 }
 
-function updateAddressFeedback(): void {
-  const error = $<HTMLParagraphElement>('address-error')
-  const saved = $<HTMLParagraphElement>('address-success')
-  error.textContent = addressError
-  error.hidden = !addressError
-  saved.textContent = addressSuccess
-  saved.hidden = !addressSuccess
+function renderSettingsError(): void {
+  $('settings-error').textContent = settingsError
+  $('settings-error').hidden = !settingsError
 }
 
-function updateModelFeedback(status: StatusSnapshot): void {
-  const configuredSize = $<HTMLParagraphElement>('configured-model-size')
-  configuredSize.textContent = status.configured_model_download_bytes === null
-    ? 'Configured model download size unavailable.'
-    : `Estimated download for ${status.configured_model}: ${formatBytes(status.configured_model_download_bytes)}`
-
-  const override = $<HTMLParagraphElement>('model-override')
-  override.hidden = !status.model_override_active
-  override.textContent = status.model_override_active
-    ? `OLLAMA_MODEL is set and overrides the saved config. Effective model: ${status.effective_model}.`
-    : ''
-
-  const effectiveSize = $<HTMLParagraphElement>('effective-model-size')
-  effectiveSize.hidden = !status.model_override_active
-  effectiveSize.textContent = status.model_override_active
-    ? status.effective_model_download_bytes === null
-      ? `Effective model download size unavailable for ${status.effective_model}.`
-      : `Estimated download for effective model ${status.effective_model}: ${formatBytes(status.effective_model_download_bytes)}`
-    : ''
-
-  const error = $<HTMLParagraphElement>('model-error')
-  error.textContent = modelError || status.model_size_error || ''
-  error.hidden = !error.textContent
-  const success = $<HTMLParagraphElement>('model-success')
-  success.textContent = modelSuccess
-  success.hidden = !modelSuccess
-  $<HTMLParagraphElement>('model-restart-note').textContent = status.provider_running
-    ? 'Stop the provider before changing the model.'
-    : 'Model changes apply the next time the provider starts.'
+function setChecked(id: string, value: boolean): void {
+  const input = $<HTMLInputElement>(id)
+  if (document.activeElement !== input) input.checked = value
 }
 
-async function startProvider(): Promise<void> {
+function applyTheme(theme: Theme): void {
+  const resolved = theme === 'system'
+    ? (window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark')
+    : theme
+  document.documentElement.dataset.theme = resolved
+}
+
+function showScreen(screen: 'status' | 'earnings' | 'settings'): void {
+  currentScreen = screen
+  for (const candidate of ['status', 'earnings', 'settings'] as const) {
+    $<HTMLElement>(`screen-${candidate}`).hidden = screen !== candidate
+    document.querySelector<HTMLButtonElement>(`[data-screen="${candidate}"]`)?.classList.toggle(
+      'active',
+      screen === candidate,
+    )
+  }
+  $('page-title').textContent = screen[0].toUpperCase() + screen.slice(1)
+  if (screen === 'earnings') void refreshEarnings()
+}
+
+async function refreshEarnings(): Promise<void> {
+  try {
+    const earnings = await invoke<EarningsSnapshot>('get_earnings')
+    if (snapshot) updateStatus({ ...snapshot, earnings, earnings_error: null })
+  } catch (error) {
+    if (snapshot) updateStatus({ ...snapshot, earnings_error: errorMessage(error) })
+  }
+}
+
+async function startProvider(confirmed = false): Promise<void> {
   if (!snapshot || working) return
   if (
     snapshot.runtime_suitability.status === 'not_recommended' &&
-    !snapshot.resource_settings.not_recommended_confirmed
+    !snapshot.hardware_confirmed &&
+    !confirmed
   ) {
-    $<HTMLElement>('confirm-reason').textContent = snapshot.runtime_suitability.reason
-    $<HTMLDialogElement>('runtime-confirmation').showModal()
+    $('confirm-reason').textContent = snapshot.runtime_suitability.reason ?? 'This hardware is not recommended.'
+    $<HTMLDialogElement>('hardware-confirmation').showModal()
     return
   }
-  await invokeProviderStart(false)
-}
-
-async function invokeProviderStart(confirmed: boolean): Promise<void> {
   working = true
   renderStatus()
   try {
     if (confirmed) await invoke('confirm_runtime_download')
     await invoke('start_provider')
   } catch (error) {
-    setCommandError(error)
+    showError(error)
   } finally {
     working = false
     if (snapshot) renderStatus()
   }
 }
 
-$<HTMLSelectElement>('resource-mode').addEventListener('change', () => {
-  const mode = $<HTMLSelectElement>('resource-mode').value
-  $<HTMLDivElement>('idle-threshold-field').hidden = mode !== 'only_when_idle'
-  $<HTMLDivElement>('schedule-fields').hidden = mode !== 'scheduled_hours'
-})
-
-$<HTMLFormElement>('resource-form').addEventListener('submit', async (event) => {
-  event.preventDefault()
+async function updatePreferences(update: Partial<DesktopPreferences>): Promise<void> {
   if (!snapshot || working) return
-  resourceError = ''
-  resourceSuccess = ''
-  const thresholdInput = $<HTMLInputElement>('idle-threshold')
-  const idleThreshold = thresholdInput.valueAsNumber
-  if (
-    (!Number.isInteger(idleThreshold) || idleThreshold < 1 || idleThreshold > 60)
-  ) {
-    resourceError = 'Idle threshold: enter a whole number from 1 to 60.'
-    renderStatus()
-    return
-  }
-  const mode = $<HTMLSelectElement>('resource-mode').value as ResourceMode
-  const start = $<HTMLInputElement>('schedule-start').value
-  const end = $<HTMLInputElement>('schedule-end').value
-  if (mode === 'scheduled_hours' && (!start || !end || start === end)) {
-    resourceError = 'Schedule: choose valid, different start and end times.'
-    renderStatus()
-    return
-  }
-  const currentSchedule = snapshot.resource_settings.schedule
-  const settings: ResourceSettings = {
-    ...snapshot.resource_settings,
-    mode,
-    idle_threshold_minutes: idleThreshold,
-    schedule: mode === 'scheduled_hours'
-      ? {
-          weekdays: currentSchedule?.weekdays ?? [1, 2, 3, 4, 5, 6, 7],
-          start,
-          end,
-        }
-      : currentSchedule,
-    preset: $<HTMLSelectElement>('resource-preset').value as ResourcePreset,
-    do_not_run_on_battery: $<HTMLInputElement>('do-not-run-on-battery').checked,
-  }
+  settingsError = ''
+  const preferences = { ...snapshot.desktop_preferences, ...update }
+  if (update.theme) applyTheme(update.theme)
   working = true
   renderStatus()
   try {
-    const next = await invoke<StatusSnapshot>('set_resource_settings', { settings })
+    const next = await invoke<StatusSnapshot>('set_desktop_preferences', { preferences })
     updateStatus(next)
-    resourceSuccess = 'Resource settings saved.'
   } catch (error) {
-    resourceError = errorMessage(error)
+    settingsError = errorMessage(error)
   } finally {
     working = false
     if (snapshot) renderStatus()
   }
-})
+}
 
-$<HTMLButtonElement>('pause-provider').addEventListener('click', async () => {
-  if (!snapshot || working) return
-  working = true
-  renderStatus()
-  try {
-    await invoke(snapshot.user_paused ? 'resume_provider' : 'pause_provider')
-  } catch (error) {
-    setCommandError(error)
-  } finally {
-    working = false
-    if (snapshot) renderStatus()
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+function userFacingError(detail: string): string {
+  const message = detail.toLowerCase()
+  if (message.includes('space') || message.includes('disk')) {
+    return 'There is not enough free disk space. Free some space and try again.'
   }
+  if (
+    message.includes('connect') ||
+    message.includes('network') ||
+    message.includes('offline') ||
+    message.includes('coordinator')
+  ) {
+    return 'DeLore could not reach the coordinator. Check your connection and try again.'
+  }
+  if (message.includes('checksum') || message.includes('hash') || message.includes('verify')) {
+    return 'A DeLore file could not be verified and was not started. Check the logs for details.'
+  }
+  return 'DeLore encountered a problem. Check the logs for technical details.'
+}
+
+function showError(error: unknown): void {
+  if (!snapshot) return
+  updateStatus({ ...snapshot, error_message: errorMessage(error) })
+}
+
+document.querySelectorAll<HTMLButtonElement>('[data-screen]').forEach((button) => {
+  button.addEventListener('click', () => showScreen(button.dataset.screen as typeof currentScreen))
 })
 
-$<HTMLButtonElement>('restart-provider').addEventListener('click', async () => {
-  if (!snapshot || working || snapshot.current_job.state === 'running') return
+$<HTMLInputElement>('performance-slider').addEventListener('change', async (event) => {
+  const percent = Number((event.currentTarget as HTMLInputElement).value)
+  if (!Number.isInteger(percent) || percent < 10 || percent > 100) return
   working = true
   renderStatus()
   try {
-    await invoke('restart_provider')
+    const next = await invoke<StatusSnapshot>('set_performance', { performancePercent: percent })
+    updateStatus(next)
   } catch (error) {
-    setCommandError(error)
+    showError(error)
   } finally {
     working = false
     if (snapshot) renderStatus()
@@ -726,73 +609,98 @@ $<HTMLButtonElement>('restart-provider').addEventListener('click', async () => {
 })
 
 $<HTMLButtonElement>('start-provider').addEventListener('click', () => void startProvider())
+$<HTMLButtonElement>('confirm-hardware').addEventListener('click', (event) => {
+  event.preventDefault()
+  $<HTMLDialogElement>('hardware-confirmation').close()
+  void startProvider(true)
+})
 $<HTMLButtonElement>('stop-provider').addEventListener('click', async () => {
   working = true
   renderStatus()
   try {
     await invoke('stop_provider')
   } catch (error) {
-    setCommandError(error)
+    showError(error)
   } finally {
     working = false
     if (snapshot) renderStatus()
   }
 })
-
-$<HTMLButtonElement>('confirm-runtime').addEventListener('click', (event) => {
-  event.preventDefault()
-  $<HTMLDialogElement>('runtime-confirmation').close()
-  void invokeProviderStart(true)
-})
-
-$<HTMLFormElement>('model-form').addEventListener('submit', async (event) => {
-  event.preventDefault()
-  if (!snapshot || snapshot.provider_running || working) return
-  const model = $<HTMLInputElement>('ollama-model').value.trim()
-  modelError = ''
-  modelSuccess = ''
+$<HTMLButtonElement>('pause-provider').addEventListener('click', async () => {
+  if (!snapshot) return
   working = true
   renderStatus()
   try {
-    const next = await invoke<StatusSnapshot>('set_ollama_model', { model })
-    updateStatus(next)
-    modelSuccess = 'Model saved.'
+    await invoke(snapshot.user_paused ? 'resume_provider' : 'pause_provider')
   } catch (error) {
-    modelError = errorMessage(error)
+    showError(error)
   } finally {
     working = false
     if (snapshot) renderStatus()
   }
 })
+
+$<HTMLInputElement>('performance-slider').addEventListener('input', (event) => {
+  $('performance-value').textContent = `${(event.currentTarget as HTMLInputElement).value}%`
+})
+$<HTMLSelectElement>('theme-select').addEventListener('change', (event) => {
+  void updatePreferences({ theme: (event.currentTarget as HTMLSelectElement).value as Theme })
+})
+for (const [id, key] of [
+  ['start-on-login', 'start_on_login'],
+  ['start-minimized', 'start_minimized_to_tray'],
+  ['keep-in-tray', 'keep_running_in_tray'],
+  ['notifications-enabled', 'notifications_enabled'],
+] as const) {
+  $<HTMLInputElement>(id).addEventListener('change', (event) => {
+    void updatePreferences({ [key]: (event.currentTarget as HTMLInputElement).checked })
+  })
+}
 
 $<HTMLFormElement>('payout-form').addEventListener('submit', async (event) => {
   event.preventDefault()
-  const address = $<HTMLInputElement>('payout-address').value.trim()
-  addressError = ''
-  addressSuccess = ''
+  payoutError = ''
+  payoutMessage = ''
   working = true
   renderStatus()
   try {
+    const address = $<HTMLInputElement>('payout-address').value.trim()
     const next = await invoke<StatusSnapshot>('set_payout_address', { address })
     updateStatus(next)
-    addressSuccess = 'Payout address saved.'
+    payoutMessage = 'Payout address saved.'
   } catch (error) {
-    addressError = errorMessage(error)
+    payoutError = errorMessage(error)
   } finally {
     working = false
     if (snapshot) renderStatus()
   }
 })
 
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error)
-}
+$<HTMLButtonElement>('open-logs').addEventListener('click', async () => {
+  try {
+    await invoke('open_logs')
+  } catch (error) {
+    settingsError = errorMessage(error)
+    renderSettingsError()
+  }
+})
+document.querySelectorAll<HTMLAnchorElement>('.placeholder-link').forEach((link) => {
+  link.addEventListener('click', (event) => event.preventDefault())
+})
+window.matchMedia('(prefers-color-scheme: light)').addEventListener('change', () => {
+  if (snapshot) applyTheme(snapshot.desktop_preferences.theme)
+})
 
-function setCommandError(error: unknown): void {
-  if (!snapshot) return
-  snapshot = { ...snapshot, error_message: errorMessage(error) }
-  renderStatus()
-}
-
-void listen<StatusSnapshot>('provider-status', (event) => updateStatus(event.payload)).catch(setCommandError)
-void invoke<StatusSnapshot>('get_status').then(updateStatus).catch(setCommandError)
+void listen<StatusSnapshot>('provider-status', (event) => updateStatus(event.payload)).catch(showError)
+void listen<string>('tray-action', (event) => {
+  if (event.payload === 'toggle-provider') {
+    if (snapshot?.provider_running) {
+      void invoke('stop_provider').catch(showError)
+    } else {
+      void startProvider()
+    }
+  } else if (event.payload === 'toggle-pause' && snapshot?.provider_running) {
+    void invoke(snapshot.user_paused ? 'resume_provider' : 'pause_provider').catch(showError)
+  }
+}).catch(showError)
+void invoke<StatusSnapshot>('get_status').then(updateStatus).catch(showError)
