@@ -5,6 +5,18 @@ import './style.css'
 type Theme = 'dark' | 'light' | 'system'
 type ConnectionState = 'connecting' | 'connected' | 'disconnected'
 type PolicyDecision = { state: 'run' } | { state: 'paused'; reason: string }
+type UiErrorCategory =
+  | 'connection'
+  | 'transfer_interrupted'
+  | 'not_enough_disk_space'
+  | 'unsupported_system'
+  | 'invalid_setting'
+  | 'setup_failed'
+
+interface UiError {
+  category: UiErrorCategory
+  message: string
+}
 
 interface DesktopPreferences {
   theme: Theme
@@ -15,18 +27,18 @@ interface DesktopPreferences {
   notifications_enabled: boolean
 }
 
-interface RuntimeState {
+interface SetupState {
   state: string
   phase?: string
   percent?: number
-  expected_total_download_bytes?: number
+  expected_setup_bytes?: number
   message?: string
 }
 
 interface StatusSnapshot {
   provider_running: boolean
-  runtime: RuntimeState
-  runtime_suitability: { status: 'suitable' | 'not_recommended'; reason?: string }
+  setup_state: SetupState
+  hardware_support: { status: 'suitable' | 'not_recommended'; reason?: string }
   gpu: { gpu_name: string; gpu_memory: string; support: string }
   connection: ConnectionState
   fee_config: {
@@ -41,17 +53,17 @@ interface StatusSnapshot {
     | { state: 'finished'; job_id: string; succeeded: boolean }
   user_paused: boolean
   payout_address: string | null
-  runtime_percent: number
-  model_percent: number
-  expected_total_download_bytes: number | null
-  error_message: string | null
+  setup_progress_percent: number
+  artifact_progress_percent: number
+  expected_setup_bytes: number | null
+  error_message: UiError | null
   policy: PolicyDecision
   policy_diagnostic: string | null
   performance_percent: number
   hardware_confirmed: boolean
   desktop_preferences: DesktopPreferences
   earnings: EarningsSnapshot
-  earnings_error: string | null
+  earnings_error: UiError | null
 }
 
 interface EarningsEntry {
@@ -174,7 +186,7 @@ root.innerHTML = `
             <div class="progress-track" role="progressbar" aria-label="Provider preparation">
               <span id="preparation-bar"></span>
             </div>
-            <p class="muted" id="download-size"></p>
+            <p class="muted" id="setup-size"></p>
           </section>
 
           <div class="actions">
@@ -350,14 +362,14 @@ function renderStatus(): void {
   const slider = $<HTMLInputElement>('performance-slider')
   if (document.activeElement !== slider) slider.value = String(status.performance_percent)
   $('suitability-note').textContent =
-    status.runtime_suitability.status === 'not_recommended'
+    status.hardware_support.status === 'not_recommended'
       ? status.hardware_confirmed
-        ? `Hardware note: ${status.runtime_suitability.reason}. CPU processing is used.`
-        : `Confirmation is required before work can start: ${status.runtime_suitability.reason}.`
+        ? `Hardware note: ${status.hardware_support.reason}. CPU processing is used.`
+        : `Confirmation is required before work can start: ${status.hardware_support.reason}.`
       : 'Hardware suitability: supported path detected.'
 
   const globalError = $('global-error')
-  globalError.textContent = status.error_message ? userFacingError(status.error_message) : ''
+  globalError.textContent = status.error_message?.message ?? ''
   globalError.hidden = !status.error_message
   $('pause-provider').textContent = status.user_paused ? 'Resume' : 'Pause'
   $<HTMLButtonElement>('start-provider').disabled = status.provider_running || working
@@ -396,16 +408,16 @@ function renderJob(job: StatusSnapshot['current_job']): void {
 function renderPreparation(status: StatusSnapshot): void {
   const panel = $<HTMLElement>('preparation-panel')
   const active = status.provider_running &&
-    !['ready', 'running'].includes(status.runtime.state) &&
-    status.runtime.state !== 'error'
+    !['ready', 'running'].includes(status.setup_state.state) &&
+    status.setup_state.state !== 'error'
   panel.hidden = !active
   if (!active) return
-  const percent = Math.round((status.runtime_percent + status.model_percent) / 2)
+  const percent = Math.round((status.setup_progress_percent + status.artifact_progress_percent) / 2)
   $('preparation-label').textContent = `Preparing DeLore (${percent}%)`
   $<HTMLSpanElement>('preparation-bar').style.width = `${Math.max(0, Math.min(100, percent))}%`
-  $('download-size').textContent = status.expected_total_download_bytes
-    ? `Expected total download: ${formatBytes(status.expected_total_download_bytes)}`
-    : 'Calculating expected download size…'
+  $('setup-size').textContent = status.expected_setup_bytes
+    ? `Estimated total setup size: ${formatBytes(status.expected_setup_bytes)}`
+    : 'Calculating setup size…'
 }
 
 function renderEarnings(earnings: EarningsSnapshot): void {
@@ -424,7 +436,7 @@ function renderEarnings(earnings: EarningsSnapshot): void {
     rows.append(row)
   }
   $('earnings-empty').hidden = earnings.entries.length !== 0
-  $('earnings-error').textContent = snapshot?.earnings_error ?? ''
+  $('earnings-error').textContent = snapshot?.earnings_error?.message ?? ''
   $('earnings-error').hidden = !snapshot?.earnings_error
 }
 
@@ -514,25 +526,25 @@ async function refreshEarnings(): Promise<void> {
     const earnings = await invoke<EarningsSnapshot>('get_earnings')
     if (snapshot) updateStatus({ ...snapshot, earnings, earnings_error: null })
   } catch (error) {
-    if (snapshot) updateStatus({ ...snapshot, earnings_error: errorMessage(error) })
+    if (snapshot) updateStatus({ ...snapshot, earnings_error: uiError(error) })
   }
 }
 
 async function startProvider(confirmed = false): Promise<void> {
   if (!snapshot || working) return
   if (
-    snapshot.runtime_suitability.status === 'not_recommended' &&
+    snapshot.hardware_support.status === 'not_recommended' &&
     !snapshot.hardware_confirmed &&
     !confirmed
   ) {
-    $('confirm-reason').textContent = snapshot.runtime_suitability.reason ?? 'This hardware is not recommended.'
+    $('confirm-reason').textContent = snapshot.hardware_support.reason ?? 'This hardware is not recommended.'
     $<HTMLDialogElement>('hardware-confirmation').showModal()
     return
   }
   working = true
   renderStatus()
   try {
-    if (confirmed) await invoke('confirm_runtime_download')
+    if (confirmed) await invoke('confirm_hardware_use')
     await invoke('start_provider')
   } catch (error) {
     showError(error)
@@ -560,32 +572,37 @@ async function updatePreferences(update: Partial<DesktopPreferences>): Promise<v
   }
 }
 
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error)
+const uiErrorCategories = new Set<UiErrorCategory>([
+  'connection',
+  'transfer_interrupted',
+  'not_enough_disk_space',
+  'unsupported_system',
+  'invalid_setting',
+  'setup_failed',
+])
+
+function uiError(error: unknown): UiError {
+  const detail = error instanceof Error ? error.message : String(error)
+  const separator = detail.indexOf('|')
+  if (separator > 0) {
+    const category = detail.slice(0, separator) as UiErrorCategory
+    if (uiErrorCategories.has(category)) {
+      return { category, message: detail.slice(separator + 1) }
+    }
+  }
+  return {
+    category: 'setup_failed',
+    message: 'DeLore encountered a problem. Check the logs for technical details.',
+  }
 }
 
-function userFacingError(detail: string): string {
-  const message = detail.toLowerCase()
-  if (message.includes('space') || message.includes('disk')) {
-    return 'There is not enough free disk space. Free some space and try again.'
-  }
-  if (
-    message.includes('connect') ||
-    message.includes('network') ||
-    message.includes('offline') ||
-    message.includes('coordinator')
-  ) {
-    return 'DeLore could not reach the coordinator. Check your connection and try again.'
-  }
-  if (message.includes('checksum') || message.includes('hash') || message.includes('verify')) {
-    return 'A DeLore file could not be verified and was not started. Check the logs for details.'
-  }
-  return 'DeLore encountered a problem. Check the logs for technical details.'
+function errorMessage(error: unknown): string {
+  return uiError(error).message
 }
 
 function showError(error: unknown): void {
   if (!snapshot) return
-  updateStatus({ ...snapshot, error_message: errorMessage(error) })
+  updateStatus({ ...snapshot, error_message: uiError(error) })
 }
 
 document.querySelectorAll<HTMLButtonElement>('[data-screen]').forEach((button) => {

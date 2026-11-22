@@ -30,6 +30,115 @@ use tokio::sync::{watch, Mutex as AsyncMutex};
 mod history;
 use history::{EarningsSnapshot, EarningsStore};
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum UiErrorCategory {
+    Connection,
+    TransferInterrupted,
+    NotEnoughDiskSpace,
+    UnsupportedSystem,
+    InvalidSetting,
+    SetupFailed,
+}
+
+impl UiErrorCategory {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Connection => "connection",
+            Self::TransferInterrupted => "transfer_interrupted",
+            Self::NotEnoughDiskSpace => "not_enough_disk_space",
+            Self::UnsupportedSystem => "unsupported_system",
+            Self::InvalidSetting => "invalid_setting",
+            Self::SetupFailed => "setup_failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct UiError {
+    category: UiErrorCategory,
+    message: String,
+}
+
+fn classify_error(technical: &str) -> UiError {
+    let lower = technical.to_ascii_lowercase();
+    let (category, message) = if lower.contains("disk")
+        || lower.contains("space")
+        || lower.contains("insufficient free")
+    {
+        (
+            UiErrorCategory::NotEnoughDiskSpace,
+            "There is not enough free disk space. Free some space, then try again.",
+        )
+    } else if lower.contains("unsupported on this platform") || lower.contains("unsupported system")
+    {
+        (
+            UiErrorCategory::UnsupportedSystem,
+            "This system is not supported. Check the help page for supported systems.",
+        )
+    } else if lower.contains("payout address") {
+        (
+            UiErrorCategory::InvalidSetting,
+            "Enter a valid payout address with a 0x prefix and 40 hexadecimal characters.",
+        )
+    } else if lower.contains("ollama_model")
+        || lower.contains("invalid model")
+        || lower.contains("performance must")
+        || lower.contains("invalid resource_settings")
+        || lower.contains("invalid active resource settings")
+    {
+        (
+            UiErrorCategory::InvalidSetting,
+            "A saved setting is invalid. Review your settings and try again.",
+        )
+    } else if lower.contains("coordinator")
+        || lower.contains("connect")
+        || lower.contains("network")
+        || lower.contains("http")
+        || lower.contains("offline")
+        || lower.contains("registry")
+    {
+        (
+            UiErrorCategory::Connection,
+            "DeLore could not connect. Check your internet connection, then try again.",
+        )
+    } else if lower.contains("interrupted")
+        || lower.contains("unexpected byte range")
+        || lower.contains("download ended before")
+        || lower.contains("download returned an http error")
+    {
+        (
+            UiErrorCategory::TransferInterrupted,
+            "Setup was interrupted while receiving files. Check your internet connection, then retry.",
+        )
+    } else {
+        (
+            UiErrorCategory::SetupFailed,
+            "Setup could not finish. Check your internet connection and free disk space, then try again.",
+        )
+    };
+    UiError {
+        category,
+        message: message.to_string(),
+    }
+}
+
+fn map_error_with_logger(technical: &str, mut logger: impl FnMut(&str)) -> UiError {
+    logger(technical);
+    classify_error(technical)
+}
+
+fn map_error(technical: &str) -> UiError {
+    map_error_with_logger(technical, |detail| {
+        log_technical(&format!("Desktop error: {detail}"));
+    })
+}
+
+fn map_invoke_error(technical: &str) -> String {
+    let error = map_error(technical);
+    format!("{}|{}", error.category.as_str(), error.message)
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 enum CurrentJob {
@@ -56,7 +165,9 @@ fn tray_image() -> tauri::image::Image<'static> {
 #[derive(Debug, Clone, Serialize)]
 struct StatusSnapshot {
     provider_running: bool,
+    #[serde(rename = "setup_state")]
     runtime: RuntimeState,
+    #[serde(rename = "hardware_support")]
     runtime_suitability: RuntimeSuitability,
     gpu: GpuInfo,
     connection: provider_core::ConnectionState,
@@ -64,17 +175,20 @@ struct StatusSnapshot {
     current_job: CurrentJob,
     user_paused: bool,
     payout_address: Option<String>,
+    #[serde(rename = "setup_progress_percent")]
     runtime_percent: u8,
+    #[serde(rename = "artifact_progress_percent")]
     model_percent: u8,
+    #[serde(rename = "expected_setup_bytes")]
     expected_total_download_bytes: Option<u64>,
-    error_message: Option<String>,
+    error_message: Option<UiError>,
     policy: PolicyDecision,
     policy_diagnostic: Option<String>,
     performance_percent: u8,
     hardware_confirmed: bool,
     desktop_preferences: DesktopPreferences,
     earnings: EarningsSnapshot,
-    earnings_error: Option<String>,
+    earnings_error: Option<UiError>,
 }
 
 struct ProviderTask {
@@ -105,19 +219,21 @@ impl DesktopState {
             Err(_) => ProviderConfig::defaults(),
         };
         let gpu = detect_gpu();
-        let runtime = match RuntimeManager::new() {
-            Ok(manager) => initial_runtime_state(&manager),
-            Err(error) => RuntimeState::Error {
-                message: error.to_string(),
-            },
+        let (runtime, runtime_error) = match RuntimeManager::new() {
+            Ok(manager) => (initial_runtime_state(&manager), None),
+            Err(error) => {
+                let mapped = map_error(&format!("{error:#}"));
+                (
+                    RuntimeState::Error {
+                        message: mapped.message.clone(),
+                    },
+                    Some(mapped),
+                )
+            }
         };
         let error_message = config_result
             .err()
-            .map(|error| format!("Could not load provider configuration: {error:#}"));
-        let runtime_error = match &runtime {
-            RuntimeState::Error { message } => Some(message.clone()),
-            _ => None,
-        };
+            .map(|error| map_error(&format!("Could not load provider configuration: {error:#}")));
         let resource_settings = config.resource_settings.clone();
         let performance_percent = resource_settings.performance_percent;
         let history_path =
@@ -137,7 +253,7 @@ impl DesktopState {
                         (
                             Some(store),
                             EarningsSnapshot::default(),
-                            Some(error.to_string()),
+                            Some(map_error(&format!("{error:#}"))),
                         )
                     }
                 }
@@ -146,7 +262,11 @@ impl DesktopState {
                 log_technical(&format!(
                     "Could not determine earnings history path: {error:#}"
                 ));
-                (None, EarningsSnapshot::default(), Some(error.to_string()))
+                (
+                    None,
+                    EarningsSnapshot::default(),
+                    Some(map_error(&format!("{error:#}"))),
+                )
             }
         };
         let snapshot = StatusSnapshot {
@@ -191,7 +311,7 @@ fn get_status(state: State<'_, DesktopState>) -> Result<StatusSnapshot, String> 
         .inner
         .snapshot
         .lock()
-        .map_err(|error| format!("Provider status is unavailable: {error}"))?
+        .map_err(|error| map_invoke_error(&format!("Provider status is unavailable: {error}")))?
         .clone())
 }
 
@@ -200,18 +320,16 @@ fn get_earnings(
     app: tauri::AppHandle,
     state: State<'_, DesktopState>,
 ) -> Result<EarningsSnapshot, String> {
-    let history_store = state
-        .inner()
-        .inner
-        .history
-        .lock()
-        .map_err(|error| format!("Earnings history is unavailable: {error}"))?;
+    let history_store =
+        state.inner().inner.history.lock().map_err(|error| {
+            map_invoke_error(&format!("Earnings history is unavailable: {error}"))
+        })?;
     let store = history_store
         .as_ref()
-        .ok_or_else(|| "Earnings history storage is unavailable.".to_string())?;
-    let earnings = store
-        .load()
-        .map_err(|error| format!("Could not load earnings history: {error:#}"))?;
+        .ok_or_else(|| map_invoke_error("Earnings history storage is unavailable."))?;
+    let earnings = store.load().map_err(|error| {
+        map_invoke_error(&format!("Could not load earnings history: {error:#}"))
+    })?;
     if earnings.recovered_corruption {
         log_technical("Recovered a corrupt local earnings history file.");
     }
@@ -223,19 +341,22 @@ fn get_earnings(
 }
 
 #[tauri::command]
-fn confirm_runtime_download(
+fn confirm_hardware_use(
     app: tauri::AppHandle,
     state: State<'_, DesktopState>,
 ) -> Result<(), String> {
     if let RuntimeSuitability::NotRecommended { .. } = runtime_suitability() {
-        let config = confirm_not_recommended_runtime()
-            .map_err(|error| format!("Could not save hardware confirmation: {error:#}"))?;
+        let config = confirm_not_recommended_runtime().map_err(|error| {
+            map_invoke_error(&format!("Could not save hardware confirmation: {error:#}"))
+        })?;
         let mut granted = state
             .inner()
             .inner
             .confirmation_granted
             .lock()
-            .map_err(|error| format!("Could not record runtime confirmation: {error}"))?;
+            .map_err(|error| {
+                map_invoke_error(&format!("Could not record hardware confirmation: {error}"))
+            })?;
         *granted = true;
         update_status(&state.inner().inner, &app, |snapshot| {
             snapshot.hardware_confirmed = config.resource_settings.not_recommended_confirmed;
@@ -250,7 +371,9 @@ async fn start_provider(
     state: State<'_, DesktopState>,
 ) -> Result<(), String> {
     let mut config = load_config()
-        .map_err(|error| format!("Could not load provider configuration: {error:#}"))?
+        .map_err(|error| {
+            map_invoke_error(&format!("Could not load provider configuration: {error:#}"))
+        })?
         .unwrap_or_else(ProviderConfig::defaults);
     let requires_confirmation = requires_provider_confirmation(
         config.resource_settings.not_recommended_confirmed,
@@ -263,9 +386,13 @@ async fn start_provider(
             .inner
             .confirmation_granted
             .lock()
-            .map_err(|error| format!("Could not check runtime confirmation: {error}"))?;
+            .map_err(|error| {
+                map_invoke_error(&format!("Could not check hardware confirmation: {error}"))
+            })?;
         if requires_confirmation && !*granted {
-            return Err("Provider use on this hardware requires explicit confirmation.".into());
+            return Err(map_invoke_error(
+                "Provider use on this hardware requires explicit confirmation.",
+            ));
         }
         std::mem::take(&mut *granted) || config.resource_settings.not_recommended_confirmed
     };
@@ -275,16 +402,13 @@ async fn start_provider(
         .as_ref()
         .is_some_and(|task| !task.join.inner().is_finished())
     {
-        return Err("Provider is already running.".into());
+        return Err(map_invoke_error("Provider is already running."));
     }
 
     {
-        let mut snapshot = state
-            .inner()
-            .inner
-            .snapshot
-            .lock()
-            .map_err(|error| format!("Provider status is unavailable: {error}"))?;
+        let mut snapshot = state.inner().inner.snapshot.lock().map_err(|error| {
+            map_invoke_error(&format!("Provider status is unavailable: {error}"))
+        })?;
         snapshot.provider_running = true;
         snapshot.current_job = CurrentJob::Idle;
         snapshot.user_paused = false;
@@ -302,7 +426,9 @@ async fn start_provider(
     let (control, pause_rx) = provider_control_channel();
     control
         .update_resource_settings(active_resource_settings.clone())
-        .map_err(|error| format!("Invalid active resource settings: {error:#}"))?;
+        .map_err(|error| {
+            map_invoke_error(&format!("Invalid active resource settings: {error:#}"))
+        })?;
     let settings_rx = control.subscribe_resource_settings();
     let runtime_state = state.inner().inner.clone();
     let runtime_app = app.clone();
@@ -323,9 +449,16 @@ async fn start_provider(
                     snapshot.expected_total_download_bytes = Some(*expected_total_download_bytes);
                 }
             }
-            if let RuntimeState::Error { message } = &runtime {
-                snapshot.error_message = Some(message.clone());
-            }
+            let runtime = match runtime {
+                RuntimeState::Error { message } => {
+                    let mapped = map_error(&message);
+                    snapshot.error_message = Some(mapped.clone());
+                    RuntimeState::Error {
+                        message: mapped.message,
+                    }
+                }
+                other => other,
+            };
             snapshot.runtime = runtime;
         });
     });
@@ -340,7 +473,7 @@ async fn start_provider(
                     "Could not update local earnings history: {error:#}"
                 ));
                 update_status(&event_state, &event_app, |snapshot| {
-                    snapshot.earnings_error = Some(error.to_string());
+                    snapshot.earnings_error = Some(map_error(&format!("{error:#}")));
                 });
             }
             if result.error.is_none() {
@@ -367,7 +500,7 @@ async fn start_provider(
                 let connected = matches!(&state, provider_core::ConnectionState::Connected);
                 snapshot.connection = state;
                 if let Some(message) = message {
-                    snapshot.error_message = Some(message);
+                    snapshot.error_message = Some(map_error(&message));
                 } else if connected {
                     snapshot.error_message = None;
                 }
@@ -387,10 +520,10 @@ async fn start_provider(
                 diagnostic,
             } => {
                 snapshot.policy = decision;
-                snapshot.policy_diagnostic = diagnostic;
+                snapshot.policy_diagnostic = diagnostic.map(|detail| map_error(&detail).message);
             }
             ProviderEvent::ResourceMonitor { .. } => {}
-            ProviderEvent::Error { message } => snapshot.error_message = Some(message),
+            ProviderEvent::Error { message } => snapshot.error_message = Some(map_error(&message)),
         });
     });
 
@@ -420,7 +553,7 @@ async fn start_provider(
                     Ok(manager) if manager.runtime_dir().exists() => RuntimeState::Ready,
                     Ok(_) => RuntimeState::NotInstalled,
                     Err(error) => RuntimeState::Error {
-                        message: error.to_string(),
+                        message: map_error(&format!("{error:#}")).message,
                     },
                 };
                 snapshot.runtime_percent = 0;
@@ -428,7 +561,7 @@ async fn start_provider(
                 snapshot.expected_total_download_bytes = None;
             }
             if let Err(error) = result {
-                snapshot.error_message = Some(format!("{error:#}"));
+                snapshot.error_message = Some(map_error(&format!("{error:#}")));
             }
         });
     });
@@ -472,16 +605,15 @@ async fn set_provider_paused(state: &DesktopState, paused: bool) -> Result<(), S
     let task_slot = state.inner.task.lock().await;
     let task = task_slot
         .as_ref()
-        .ok_or_else(|| "Provider is not running.".to_string())?;
+        .ok_or_else(|| map_invoke_error("Provider is not running."))?;
     task.control
         .set_paused(paused)
-        .map_err(|error| format!("{error:#}"))?;
+        .map_err(|error| map_invoke_error(&format!("{error:#}")))?;
     drop(task_slot);
-    let mut snapshot = state
-        .inner
-        .snapshot
-        .lock()
-        .map_err(|error| format!("Provider status is unavailable: {error}"))?;
+    let mut snapshot =
+        state.inner.snapshot.lock().map_err(|error| {
+            map_invoke_error(&format!("Provider status is unavailable: {error}"))
+        })?;
     snapshot.user_paused = paused;
     Ok(())
 }
@@ -492,8 +624,8 @@ async fn set_performance(
     state: State<'_, DesktopState>,
     performance_percent: u8,
 ) -> Result<StatusSnapshot, String> {
-    let config =
-        save_performance_percent(performance_percent).map_err(|error| format!("{error:#}"))?;
+    let config = save_performance_percent(performance_percent)
+        .map_err(|error| map_invoke_error(&format!("{error:#}")))?;
     let active_settings = desktop_resource_settings(&config.resource_settings);
     {
         let task_slot = state.inner().inner.task.lock().await;
@@ -503,7 +635,7 @@ async fn set_performance(
         {
             task.control
                 .update_resource_settings(active_settings.clone())
-                .map_err(|error| format!("{error:#}"))?;
+                .map_err(|error| map_invoke_error(&format!("{error:#}")))?;
         }
     }
     update_status(&state.inner().inner, &app, |snapshot| {
@@ -515,7 +647,7 @@ async fn set_performance(
         .snapshot
         .lock()
         .map(|snapshot| snapshot.clone())
-        .map_err(|error| format!("Provider status is unavailable: {error}"))
+        .map_err(|error| map_invoke_error(&format!("Provider status is unavailable: {error}")))
 }
 
 #[tauri::command]
@@ -525,12 +657,12 @@ fn set_desktop_preferences(
     preferences: DesktopPreferences,
 ) -> Result<StatusSnapshot, String> {
     let previous = load_config()
-        .map_err(|error| format!("Could not load preferences: {error:#}"))?
+        .map_err(|error| map_invoke_error(&format!("Could not load preferences: {error:#}")))?
         .unwrap_or_else(ProviderConfig::defaults)
         .desktop_preferences;
     let autolaunch = app.autolaunch();
-    let config =
-        save_desktop_preferences(preferences.clone()).map_err(|error| format!("{error:#}"))?;
+    let config = save_desktop_preferences(preferences.clone())
+        .map_err(|error| map_invoke_error(&format!("{error:#}")))?;
     if preferences.start_on_login != previous.start_on_login {
         let result = if preferences.start_on_login {
             autolaunch.enable()
@@ -539,11 +671,13 @@ fn set_desktop_preferences(
         };
         if let Err(error) = result {
             if let Err(rollback_error) = save_desktop_preferences(previous) {
-                return Err(format!(
+                return Err(map_invoke_error(&format!(
                     "Could not update start-on-login: {error}; preference rollback failed: {rollback_error:#}"
-                ));
+                )));
             }
-            return Err(format!("Could not update start-on-login: {error}"));
+            return Err(map_invoke_error(&format!(
+                "Could not update start-on-login: {error}"
+            )));
         }
     }
     update_status(&state.inner().inner, &app, |snapshot| {
@@ -555,12 +689,12 @@ fn set_desktop_preferences(
         .snapshot
         .lock()
         .map(|snapshot| snapshot.clone())
-        .map_err(|error| format!("Provider status is unavailable: {error}"))
+        .map_err(|error| map_invoke_error(&format!("Provider status is unavailable: {error}")))
 }
 
 #[tauri::command]
 fn open_logs() -> Result<(), String> {
-    open_logs_directory()
+    open_logs_directory().map_err(|error| map_invoke_error(&error))
 }
 
 #[tauri::command]
@@ -569,7 +703,8 @@ fn set_payout_address(
     state: State<'_, DesktopState>,
     address: String,
 ) -> Result<StatusSnapshot, String> {
-    let config = save_payout_address(&address).map_err(|error| format!("{error:#}"))?;
+    let config =
+        save_payout_address(&address).map_err(|error| map_invoke_error(&format!("{error:#}")))?;
     update_status(&state.inner().inner, &app, |snapshot| {
         snapshot.payout_address = config.payout_address;
         snapshot.error_message = None;
@@ -580,7 +715,7 @@ fn set_payout_address(
         .snapshot
         .lock()
         .map(|snapshot| snapshot.clone())
-        .map_err(|error| format!("Provider status is unavailable: {error}"))
+        .map_err(|error| map_invoke_error(&format!("Provider status is unavailable: {error}")))
 }
 
 async fn stop_provider_task(app: &tauri::AppHandle, state: &DesktopState) -> Result<(), String> {
@@ -608,7 +743,9 @@ async fn stop_provider_task_and_join(state: &StateInner) -> Result<(), String> {
     *task_slot = None;
     drop(task_slot);
     if let Some(Err(error)) = result {
-        return Err(format!("Provider shutdown task failed: {error}"));
+        return Err(map_invoke_error(&format!(
+            "Provider shutdown task failed: {error}"
+        )));
     }
     Ok(())
 }
@@ -740,7 +877,7 @@ fn initial_runtime_state(manager: &RuntimeManager) -> RuntimeState {
     match manager.executable_path() {
         Ok(_) => RuntimeState::Ready,
         Err(error) => RuntimeState::Error {
-            message: error.to_string(),
+            message: map_error(&format!("{error:#}")).message,
         },
     }
 }
@@ -755,10 +892,10 @@ fn update_status(
             update(&mut snapshot);
             let snapshot = snapshot.clone();
             if let Err(error) = app.emit("provider-status", snapshot) {
-                eprintln!("Could not emit provider status: {error}");
+                log_technical(&format!("Could not emit provider status: {error}"));
             }
         }
-        Err(error) => eprintln!("Provider status lock is unavailable: {error}"),
+        Err(error) => log_technical(&format!("Provider status lock is unavailable: {error}")),
     }
 }
 
@@ -767,10 +904,10 @@ fn emit_status(app: &tauri::AppHandle, state: &DesktopState) {
         Ok(snapshot) => {
             let snapshot = snapshot.clone();
             if let Err(error) = app.emit("provider-status", snapshot) {
-                eprintln!("Could not emit provider status: {error}");
+                log_technical(&format!("Could not emit provider status: {error}"));
             }
         }
-        Err(error) => eprintln!("{error}"),
+        Err(error) => log_technical(&format!("Provider status lock is unavailable: {error}")),
     }
 }
 
@@ -856,7 +993,7 @@ fn main() {
             set_performance,
             set_desktop_preferences,
             open_logs,
-            confirm_runtime_download,
+            confirm_hardware_use,
             set_payout_address
         ])
         .on_window_event(|window, event| {
@@ -879,14 +1016,16 @@ fn main() {
                         let closing_window = window.clone();
                         tauri::async_runtime::spawn(async move {
                             if let Err(error) = stop_provider_task(&app, &state).await {
-                                eprintln!("Provider shutdown on window close failed: {error}");
+                                log_technical(&format!(
+                                    "Provider shutdown on window close failed: {error}"
+                                ));
                             }
                             state
                                 .inner
                                 .allow_window_close
                                 .store(true, Ordering::Release);
                             if let Err(error) = closing_window.close() {
-                                eprintln!("Could not close the app window: {error}");
+                                log_technical(&format!("Could not close the app window: {error}"));
                             }
                         });
                     }
@@ -900,9 +1039,9 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        desktop_resource_settings, initial_runtime_state, provider_control_channel,
-        requires_provider_confirmation, set_provider_paused, stop_provider_task_and_join,
-        DesktopState, ProviderTask,
+        classify_error, desktop_resource_settings, initial_runtime_state, map_error_with_logger,
+        provider_control_channel, requires_provider_confirmation, set_provider_paused,
+        stop_provider_task_and_join, DesktopState, ProviderTask,
     };
     use provider_core::{
         ResourceMode, ResourceSettings, RuntimeManager, RuntimeProgressCallback, RuntimeState,
@@ -913,6 +1052,88 @@ mod tests {
         Arc,
     };
     use tokio::sync::{mpsc, watch};
+
+    #[test]
+    fn technical_provider_errors_are_mapped_to_safe_messages() {
+        let errors = [
+            "OLLAMA_MODEL contains invalid non-Unicode data.",
+            "managed Ollama process exited during startup",
+            "managed Ollama runtime did not become ready within 30 seconds",
+            "model download ended before Ollama reported completion",
+            "Ollama model download failed",
+            "runtime download requires explicit confirmation",
+            "resumed runtime download returned an unexpected byte range",
+            "runtime download exceeded the pinned archive size",
+            "runtime archive extraction is unsupported on this platform",
+        ];
+        let forbidden = ["ollama", "runtime", "sidecar", "model", "pull", "download"];
+        for technical in errors {
+            let mut logged = Vec::new();
+            let mapped = map_error_with_logger(technical, |detail| logged.push(detail.to_string()));
+            let message = mapped.message.to_ascii_lowercase();
+            assert!(
+                forbidden.iter().all(|word| !message.contains(word)),
+                "unsafe mapped message for {technical:?}: {}",
+                mapped.message
+            );
+            assert_eq!(logged, [technical]);
+        }
+    }
+
+    #[test]
+    fn unknown_error_is_generic_and_technical_detail_is_logged() {
+        let technical = "unexpected private engine failure detail";
+        let mut logged = Vec::new();
+        let mapped = map_error_with_logger(technical, |detail| logged.push(detail.to_string()));
+
+        assert_eq!(mapped.category, super::UiErrorCategory::SetupFailed);
+        assert_eq!(
+            mapped.message,
+            "Setup could not finish. Check your internet connection and free disk space, then try again."
+        );
+        assert_eq!(logged, [technical]);
+        let message = mapped.message.to_ascii_lowercase();
+        assert!(
+            ["ollama", "runtime", "sidecar", "model", "pull", "download"]
+                .iter()
+                .all(|word| !message.contains(word))
+        );
+    }
+
+    #[test]
+    fn error_categories_cover_connection_disk_and_invalid_settings() {
+        assert_eq!(
+            classify_error("coordinator connection refused").category,
+            super::UiErrorCategory::Connection
+        );
+        assert_eq!(
+            classify_error("insufficient free disk space").category,
+            super::UiErrorCategory::NotEnoughDiskSpace
+        );
+        assert_eq!(
+            classify_error("Payout address must be 0x followed by 40 hex characters").category,
+            super::UiErrorCategory::InvalidSetting
+        );
+    }
+
+    #[test]
+    fn closed_local_port_maps_to_a_safe_connection_message() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let technical = std::net::TcpStream::connect(address)
+            .unwrap_err()
+            .to_string();
+        let mut logged = String::new();
+        let mapped = map_error_with_logger(&technical, |detail| logged = detail.to_string());
+
+        assert_eq!(mapped.category, super::UiErrorCategory::Connection);
+        assert_eq!(
+            mapped.message,
+            "DeLore could not connect. Check your internet connection, then try again."
+        );
+        assert_eq!(logged, technical);
+    }
 
     #[test]
     fn pause_and_resume_commands_update_provider_control() {
