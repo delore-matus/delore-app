@@ -1,4 +1,8 @@
-use std::path::{Path, PathBuf};
+use std::{
+    io::Write,
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -13,6 +17,48 @@ pub struct ProviderConfig {
     pub ollama_model: String,
     #[serde(default)]
     pub resource_settings: ResourceSettings,
+    #[serde(default)]
+    pub desktop_preferences: DesktopPreferences,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Theme {
+    Dark,
+    Light,
+    #[default]
+    System,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AppLanguage {
+    #[default]
+    English,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DesktopPreferences {
+    pub theme: Theme,
+    pub language: AppLanguage,
+    pub start_on_login: bool,
+    pub start_minimized_to_tray: bool,
+    pub keep_running_in_tray: bool,
+    pub notifications_enabled: bool,
+}
+
+impl Default for DesktopPreferences {
+    fn default() -> Self {
+        Self {
+            theme: Theme::Dark,
+            language: AppLanguage::English,
+            start_on_login: false,
+            start_minimized_to_tray: false,
+            keep_running_in_tray: false,
+            notifications_enabled: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +76,7 @@ impl ProviderConfig {
             coordinator_ws: "ws://127.0.0.1:8081/ws".to_string(),
             ollama_model: "llama3.2:3b".to_string(),
             resource_settings: ResourceSettings::default(),
+            desktop_preferences: DesktopPreferences::default(),
         }
     }
 }
@@ -108,6 +155,14 @@ pub fn set_resource_settings(settings: ResourceSettings) -> Result<ProviderConfi
     set_resource_settings_at(settings, &config_path()?)
 }
 
+pub fn set_performance_percent(performance_percent: u8) -> Result<ProviderConfig> {
+    set_performance_percent_at(performance_percent, &config_path()?)
+}
+
+pub fn set_desktop_preferences(preferences: DesktopPreferences) -> Result<ProviderConfig> {
+    set_desktop_preferences_at(preferences, &config_path()?)
+}
+
 pub fn confirm_not_recommended_runtime() -> Result<ProviderConfig> {
     let mut config = load_config()?.unwrap_or_else(ProviderConfig::defaults);
     config.resource_settings.not_recommended_confirmed = true;
@@ -121,6 +176,27 @@ fn set_resource_settings_at(settings: ResourceSettings, path: &Path) -> Result<P
     let confirmed_before = config.resource_settings.not_recommended_confirmed;
     config.resource_settings = settings;
     config.resource_settings.not_recommended_confirmed |= confirmed_before;
+    save_config_to(&config, path)?;
+    Ok(config)
+}
+
+fn set_desktop_preferences_at(
+    preferences: DesktopPreferences,
+    path: &Path,
+) -> Result<ProviderConfig> {
+    let mut config = load_config_from(path)?.unwrap_or_else(ProviderConfig::defaults);
+    config.desktop_preferences = preferences;
+    save_config_to(&config, path)?;
+    Ok(config)
+}
+
+fn set_performance_percent_at(performance_percent: u8, path: &Path) -> Result<ProviderConfig> {
+    if !(10..=100).contains(&performance_percent) {
+        anyhow::bail!("Performance must be between 10 and 100.");
+    }
+    let mut config = load_config_from(path)?.unwrap_or_else(ProviderConfig::defaults);
+    config.resource_settings.performance_percent = performance_percent;
+    config.resource_settings.validate()?;
     save_config_to(&config, path)?;
     Ok(config)
 }
@@ -152,6 +228,24 @@ pub fn config_path() -> Result<PathBuf> {
     Ok(config_dir()?.join("config.json"))
 }
 
+pub fn append_technical_log(message: &str) -> Result<()> {
+    let logs_dir = config_dir()?.join("logs");
+    std::fs::create_dir_all(&logs_dir)
+        .with_context(|| format!("failed to create log directory: {}", logs_dir.display()))?;
+    let path = logs_dir.join("delore.log");
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("failed to open log file: {}", path.display()))?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    writeln!(file, "{timestamp} {message}")
+        .with_context(|| format!("failed to write log file: {}", path.display()))
+}
+
 pub fn load_config() -> Result<Option<ProviderConfig>> {
     load_config_from(&config_path()?)
 }
@@ -166,7 +260,7 @@ fn load_config_from(path: &Path) -> Result<Option<ProviderConfig>> {
         .with_context(|| format!("failed to parse config: {}", path.display()))?;
     if let Some(address) = config.payout_address.as_deref() {
         if let Err(error) = validate_payout_address(address) {
-            eprintln!(
+            crate::technical_log!(
                 "WARNING: stored payout_address in {} is invalid and will be ignored: {}",
                 path.display(),
                 error
@@ -174,7 +268,7 @@ fn load_config_from(path: &Path) -> Result<Option<ProviderConfig>> {
         }
     }
     if let Err(error) = validate_ollama_model(&config.ollama_model) {
-        eprintln!(
+        crate::technical_log!(
             "WARNING: stored ollama_model in {} is invalid: {}",
             path.display(),
             error
@@ -216,9 +310,10 @@ mod tests {
     };
 
     use super::{
-        load_config_from, save_config_to, select_ollama_model, set_ollama_model_at,
-        set_payout_address_at, set_resource_settings_at, validate_ollama_model,
-        validate_payout_address, ProviderConfig,
+        load_config_from, save_config_to, select_ollama_model, set_desktop_preferences_at,
+        set_ollama_model_at, set_payout_address_at, set_performance_percent_at,
+        set_resource_settings_at, validate_ollama_model, validate_payout_address, AppLanguage,
+        DesktopPreferences, ProviderConfig, Theme,
     };
     use crate::resource::{ResourceMode, ResourceSchedule, ResourceSettings};
 
@@ -347,7 +442,70 @@ mod tests {
 
         let config = load_config_from(&path).unwrap().unwrap();
         assert_eq!(config.resource_settings, ResourceSettings::default());
+        assert_eq!(config.desktop_preferences, DesktopPreferences::default());
         assert_eq!(fs::read_to_string(&path).unwrap(), old_json);
+        remove_test_config(&path);
+    }
+
+    #[test]
+    fn desktop_preferences_round_trip_and_default_normally() {
+        let path = test_config_path();
+        let preferences = DesktopPreferences {
+            theme: Theme::Light,
+            language: AppLanguage::English,
+            start_on_login: true,
+            start_minimized_to_tray: true,
+            keep_running_in_tray: true,
+            notifications_enabled: true,
+        };
+        let updated = set_desktop_preferences_at(preferences.clone(), &path).unwrap();
+        assert_eq!(updated.desktop_preferences, preferences);
+        assert_eq!(
+            load_config_from(&path)
+                .unwrap()
+                .unwrap()
+                .desktop_preferences,
+            preferences
+        );
+        remove_test_config(&path);
+    }
+
+    #[test]
+    fn invalid_theme_is_rejected_without_rewriting_config() {
+        let path = test_config_path();
+        save_config_to(&ProviderConfig::defaults(), &path).unwrap();
+        let original = fs::read(&path).unwrap();
+        let invalid = serde_json::json!({
+            "theme": "ultraviolet",
+            "language": "english",
+            "start_on_login": false,
+            "start_minimized_to_tray": false,
+            "keep_running_in_tray": false,
+            "notifications_enabled": false
+        });
+        assert!(serde_json::from_value::<DesktopPreferences>(invalid).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        remove_test_config(&path);
+    }
+
+    #[test]
+    fn performance_update_preserves_existing_resource_policy_and_rejects_bad_values() {
+        let path = test_config_path();
+        let mut config = ProviderConfig::defaults();
+        config.resource_settings.mode = ResourceMode::ScheduledHours;
+        config.resource_settings.schedule = Some(ResourceSchedule {
+            weekdays: vec![1],
+            start: "09:00".into(),
+            end: "17:00".into(),
+        });
+        save_config_to(&config, &path).unwrap();
+        let original = fs::read(&path).unwrap();
+
+        assert!(set_performance_percent_at(9, &path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        let updated = set_performance_percent_at(75, &path).unwrap();
+        assert_eq!(updated.resource_settings.performance_percent, 75);
+        assert_eq!(updated.resource_settings.mode, ResourceMode::ScheduledHours);
         remove_test_config(&path);
     }
 

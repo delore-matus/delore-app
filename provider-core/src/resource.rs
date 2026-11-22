@@ -54,6 +54,8 @@ pub struct ResourceSettings {
     pub preset: ResourcePreset,
     pub do_not_run_on_battery: bool,
     pub not_recommended_confirmed: bool,
+    pub performance_percent: u8,
+    pub below_normal_priority: bool,
 }
 
 impl Default for ResourceSettings {
@@ -65,6 +67,8 @@ impl Default for ResourceSettings {
             preset: ResourcePreset::Balanced,
             do_not_run_on_battery: true,
             not_recommended_confirmed: false,
+            performance_percent: 50,
+            below_normal_priority: true,
         }
     }
 }
@@ -73,6 +77,9 @@ impl ResourceSettings {
     pub fn validate(&self) -> Result<()> {
         if !(1..=60).contains(&self.idle_threshold_minutes) {
             bail!("idle_threshold_minutes must be between 1 and 60");
+        }
+        if !(10..=100).contains(&self.performance_percent) {
+            bail!("performance_percent must be between 10 and 100");
         }
         if let Some(schedule) = &self.schedule {
             validate_schedule(schedule)?;
@@ -84,15 +91,27 @@ impl ResourceSettings {
     }
 
     pub fn requires_restart(&self, next: &Self) -> bool {
-        let current_priority = self
-            .preset
-            .mapping(8, self.mode == ResourceMode::AlwaysOnLowPriority);
-        let next_priority = next
-            .preset
-            .mapping(8, next.mode == ResourceMode::AlwaysOnLowPriority);
+        let current_priority = self.preset.mapping(
+            8,
+            self.mode == ResourceMode::AlwaysOnLowPriority || self.below_normal_priority,
+        );
+        let next_priority = next.preset.mapping(
+            8,
+            next.mode == ResourceMode::AlwaysOnLowPriority || next.below_normal_priority,
+        );
         self.preset != next.preset
+            || self.below_normal_priority != next.below_normal_priority
             || current_priority.process_priority != next_priority.process_priority
     }
+}
+
+pub fn duty_cycle_pause_ms(job_duration_ms: u128, performance_percent: u8) -> Result<u64> {
+    if !(10..=100).contains(&performance_percent) {
+        bail!("performance_percent must be between 10 and 100");
+    }
+    let pause_ms = job_duration_ms.saturating_mul(u128::from(100 - performance_percent))
+        / u128::from(performance_percent);
+    u64::try_from(pause_ms).map_err(|_| anyhow::anyhow!("performance pause duration overflowed"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -312,8 +331,8 @@ mod tests {
     use chrono_tz::America::New_York;
 
     use super::{
-        decide_policy, is_within_schedule, IdleState, PolicyDecision, PolicyInput, PowerState,
-        ResourceMode, ResourcePreset, ResourceSchedule, ResourceSettings,
+        decide_policy, duty_cycle_pause_ms, is_within_schedule, IdleState, PolicyDecision,
+        PolicyInput, PowerState, ResourceMode, ResourcePreset, ResourceSchedule, ResourceSettings,
     };
 
     fn input(mode: ResourceMode) -> PolicyInput {
@@ -336,7 +355,38 @@ mod tests {
         assert_eq!(settings.preset, ResourcePreset::Balanced);
         assert!(settings.do_not_run_on_battery);
         assert!(!settings.not_recommended_confirmed);
+        assert_eq!(settings.performance_percent, 50);
+        assert!(settings.below_normal_priority);
         assert!(settings.schedule.is_none());
+    }
+
+    #[test]
+    fn validates_performance_slider_bounds() {
+        for value in [10, 50, 100] {
+            assert!(ResourceSettings {
+                performance_percent: value,
+                ..ResourceSettings::default()
+            }
+            .validate()
+            .is_ok());
+        }
+        for value in [0, 9, 101, u8::MAX] {
+            assert!(ResourceSettings {
+                performance_percent: value,
+                ..ResourceSettings::default()
+            }
+            .validate()
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn duty_cycle_scales_the_post_job_pause() {
+        assert_eq!(duty_cycle_pause_ms(10_000, 50).unwrap(), 10_000);
+        assert_eq!(duty_cycle_pause_ms(10_000, 100).unwrap(), 0);
+        assert_eq!(duty_cycle_pause_ms(10_000, 10).unwrap(), 90_000);
+        assert!(duty_cycle_pause_ms(10_000, 9).is_err());
+        assert!(duty_cycle_pause_ms(10_000, 101).is_err());
     }
 
     #[test]

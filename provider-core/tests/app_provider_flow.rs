@@ -48,6 +48,7 @@ async fn app_managed_provider_runs_a_job_and_stops() {
             mode: ResourceMode::AlwaysOnLowPriority,
             ..ResourceSettings::default()
         },
+        desktop_preferences: provider_core::DesktopPreferences::default(),
     };
 
     let (stop, stop_rx) = watch::channel(false);

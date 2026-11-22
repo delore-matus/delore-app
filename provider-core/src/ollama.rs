@@ -3,6 +3,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use common::JobResult;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::resource::ResourceSettings;
 
@@ -18,6 +19,8 @@ struct OllamaGenerateRequest {
 #[derive(Serialize)]
 struct OllamaModelOptions {
     num_thread: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    num_gpu: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -32,10 +35,12 @@ fn ollama_request(
     prompt: &str,
     settings: &ResourceSettings,
     logical_cpu_count: usize,
+    num_gpu: Option<usize>,
 ) -> OllamaGenerateRequest {
     let mapping = settings.preset.mapping(
         logical_cpu_count,
-        settings.mode == crate::resource::ResourceMode::AlwaysOnLowPriority,
+        settings.mode == crate::resource::ResourceMode::AlwaysOnLowPriority
+            || settings.below_normal_priority,
     );
     OllamaGenerateRequest {
         model: model.to_string(),
@@ -44,8 +49,54 @@ fn ollama_request(
         keep_alive: mapping.keep_alive.to_string(),
         options: OllamaModelOptions {
             num_thread: mapping.num_thread,
+            num_gpu,
         },
     }
+}
+
+fn gpu_layers_for_performance(total_layers: usize, performance_percent: u8) -> Option<usize> {
+    if total_layers == 0 || !(10..=100).contains(&performance_percent) {
+        return None;
+    }
+    let requested = total_layers
+        .saturating_mul(usize::from(performance_percent))
+        .saturating_add(99)
+        / 100;
+    Some(requested.clamp(1, total_layers))
+}
+
+async fn model_layer_count(
+    http: &reqwest::Client,
+    api_url: &str,
+    model: &str,
+) -> Result<Option<usize>> {
+    let response = http
+        .post(format!("{}/api/show", api_url.trim_end_matches('/')))
+        .json(&serde_json::json!({ "model": model }))
+        .send()
+        .await
+        .context("failed to query model layer metadata")?
+        .error_for_status()
+        .context("model layer metadata request was rejected")?;
+    let details: Value = response
+        .json()
+        .await
+        .context("failed to parse model layer metadata")?;
+    let Some(model_info) = details.get("model_info").and_then(Value::as_object) else {
+        return Ok(None);
+    };
+    let Some(architecture) = model_info
+        .get("general.architecture")
+        .and_then(Value::as_str)
+    else {
+        return Ok(None);
+    };
+    let block_count_key = format!("{architecture}.block_count");
+    let block_count = model_info
+        .get(&block_count_key)
+        .and_then(Value::as_u64)
+        .and_then(|count| usize::try_from(count).ok());
+    Ok(block_count)
 }
 
 pub async fn run_ollama(
@@ -72,7 +123,32 @@ pub async fn run_ollama_with_settings(
     let logical_cpu_count = std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(1);
-    let request = ollama_request(model, prompt, settings, logical_cpu_count);
+    let gpu_support = crate::detect_gpu().support;
+    let num_gpu = if matches!(
+        gpu_support.as_str(),
+        "nvidia-supported" | "apple-silicon-best-effort"
+    ) {
+        match model_layer_count(&http, api_url, model).await {
+            Ok(Some(total_layers)) => {
+                gpu_layers_for_performance(total_layers, settings.performance_percent)
+            }
+            Ok(None) => {
+                crate::technical_log!(
+                    "No layer count was reported for model {model}; leaving GPU layer selection automatic."
+                );
+                None
+            }
+            Err(error) => {
+                crate::technical_log!(
+                    "Could not read layer count for model {model}; leaving GPU layer selection automatic: {error:#}"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let request = ollama_request(model, prompt, settings, logical_cpu_count, num_gpu);
 
     let response = http
         .post(format!("{}/api/generate", api_url.trim_end_matches('/')))
@@ -137,7 +213,7 @@ pub async fn run_ollama_with_settings(
 
 #[cfg(test)]
 mod tests {
-    use super::ollama_request;
+    use super::{gpu_layers_for_performance, ollama_request};
     use crate::resource::{ResourcePreset, ResourceSettings};
 
     #[test]
@@ -147,14 +223,26 @@ mod tests {
             ..ResourceSettings::default()
         };
         let request =
-            serde_json::to_value(ollama_request("model", "prompt", &settings, 8)).unwrap();
+            serde_json::to_value(ollama_request("model", "prompt", &settings, 8, None)).unwrap();
         assert_eq!(request["options"]["num_thread"], 1);
+        assert!(request["options"].get("num_gpu").is_none());
         assert_eq!(request["keep_alive"], "0");
 
         let balanced = ResourceSettings::default();
         let request =
-            serde_json::to_value(ollama_request("model", "prompt", &balanced, 8)).unwrap();
+            serde_json::to_value(ollama_request("model", "prompt", &balanced, 8, Some(10)))
+                .unwrap();
         assert_eq!(request["options"]["num_thread"], 4);
+        assert_eq!(request["options"]["num_gpu"], 10);
         assert_eq!(request["keep_alive"], "5m");
+    }
+
+    #[test]
+    fn gpu_layer_fraction_rounds_up_within_model_bounds() {
+        assert_eq!(gpu_layers_for_performance(40, 50), Some(20));
+        assert_eq!(gpu_layers_for_performance(13, 10), Some(2));
+        assert_eq!(gpu_layers_for_performance(13, 100), Some(13));
+        assert_eq!(gpu_layers_for_performance(0, 50), None);
+        assert_eq!(gpu_layers_for_performance(13, 101), None);
     }
 }

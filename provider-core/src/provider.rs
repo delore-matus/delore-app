@@ -8,10 +8,11 @@ use tokio::sync::watch;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::{
-    decide_current_policy, detect_gpu, effective_ollama_model, ensure_provider_confirmation,
-    run_ollama_with_settings, runtime_suitability, save_config, NativeSystemProbe, PolicyDecision,
-    ProviderConfig, ResourceMetrics, ResourceMonitor, ResourceSettings, RunningRuntime,
-    RuntimeManager, RuntimeProgressCallback, RuntimeState, RuntimeSuitability, SystemProbe,
+    confirm_not_recommended_runtime, decide_current_policy, detect_gpu, duty_cycle_pause_ms,
+    effective_ollama_model, ensure_provider_confirmation, run_ollama_with_settings,
+    runtime_suitability, NativeSystemProbe, PolicyDecision, ProviderConfig, ResourceMetrics,
+    ResourceMonitor, ResourceSettings, RunningRuntime, RuntimeManager, RuntimeProgressCallback,
+    RuntimeState, RuntimeSuitability, SystemProbe,
 };
 
 #[derive(Debug, Clone)]
@@ -285,7 +286,7 @@ async fn run_provider_inner(
         && matches!(suitability, RuntimeSuitability::NotRecommended { .. })
     {
         config.resource_settings.not_recommended_confirmed = true;
-        save_config(&config)?;
+        confirm_not_recommended_runtime()?;
     }
     let runtime_install = tokio::select! {
         biased;
@@ -323,7 +324,7 @@ async fn run_provider_inner(
         ) => result?,
     };
     let resource_settings = settings_rx.borrow_and_update().clone();
-    println!(
+    crate::technical_log!(
         "Managed Ollama runtime listening on 127.0.0.1:{}",
         runtime.port()
     );
@@ -423,7 +424,7 @@ async fn run_provider_connection(
         Some(address) => match crate::validate_payout_address(address) {
             Ok(()) => address.to_string(),
             Err(error) => {
-                eprintln!(
+                crate::technical_log!(
                     "WARNING: stored payout_address is invalid and will be sent as not-set: {}",
                     error
                 );
@@ -485,7 +486,7 @@ async fn run_provider_connection(
                     break;
                 }
                 _ = tokio::signal::ctrl_c(), if options.handle_ctrl_c => {
-                    println!("Stopping GPU Swarm provider.");
+                    crate::technical_log!("Stopping GPU Swarm provider.");
                     break;
                 }
                 _ = policy_refresh.tick() => {
@@ -562,14 +563,14 @@ async fn run_provider_connection(
                         )
                         .await?;
                         if !matches!(&policy_decision, PolicyDecision::Run) {
-                            println!(
+                            crate::technical_log!(
                                 "Coordinator sent job {} while provider is paused; holding it until resume",
                                 job.id
                             );
                             deferred_job = Some(job);
                             continue;
                         }
-                        println!("Received job");
+                        crate::technical_log!("Received job {}", job.id);
                         event_callback(ProviderEvent::JobStarted {
                             job_id: job.id.clone(),
                         });
@@ -644,51 +645,113 @@ async fn run_provider_connection(
                             event_callback,
                         )
                         .await?;
+                        let cooldown_ms = if options.stop_after_job {
+                            0
+                        } else {
+                            duty_cycle_pause_ms(
+                                result.duration_ms,
+                                resource_settings.performance_percent,
+                            )?
+                        };
+                        if cooldown_ms > 0 && matches!(&policy_decision, PolicyDecision::Run) {
+                            let decision = PolicyDecision::Paused(
+                                "Taking a short break to limit GPU workload".to_string(),
+                            );
+                            sender
+                                .send(Message::Text(
+                                    serde_json::to_string(&WsMessage::Availability {
+                                        accepting_jobs: false,
+                                    })
+                                    .context("failed to serialize provider availability")?,
+                                ))
+                                .await
+                                .context("failed to pause job assignment during cooldown")?;
+                            event_callback(ProviderEvent::Policy {
+                                decision: decision.clone(),
+                                diagnostic: None,
+                            });
+                            policy_decision = decision;
+                        }
                         let result_json = serde_json::to_string(&WsMessage::Result(result.clone()))
                             .context("failed to serialize job result")?;
                         sender
                             .send(Message::Text(result_json))
                             .await
                             .context("failed to send job result")?;
-                        event_callback(ProviderEvent::JobFinished { result });
+                        event_callback(ProviderEvent::JobFinished {
+                            result: result.clone(),
+                        });
 
                         if let Some(fees) = &fee_config {
-                            println!(
+                            crate::technical_log!(
                                 "Job {} complete. You earned {} units (fee: {} units)",
                                 job.id,
                                 fees.provider_payout_units,
                                 fees.job_price_units - fees.provider_payout_units
                             );
                         }
-                        println!("Sent inference result for job {}", job.id);
+                        crate::technical_log!("Sent inference result for job {}", job.id);
+                        if cooldown_ms > 0 {
+                            crate::technical_log!(
+                                "Performance cooldown start: job_id={} duration_ms={} pause_ms={}",
+                                job.id,
+                                result.duration_ms,
+                                cooldown_ms
+                            );
+                            tokio::select! {
+                                biased;
+                                _ = wait_for_stop(stop_rx) => {
+                                    let _ = sender.send(Message::Close(None)).await;
+                                    break 'connection;
+                                }
+                                _ = tokio::time::sleep(Duration::from_millis(cooldown_ms)) => {}
+                            }
+                            crate::technical_log!("Performance cooldown end: job_id={}", job.id);
+                            refresh_policy(
+                                &resource_settings,
+                                pause_rx,
+                                system_probe,
+                                &mut policy_decision,
+                                &mut sender,
+                                event_callback,
+                            )
+                            .await?;
+                        }
                         if options.stop_after_job {
-                            println!("One-job mode complete; stopping provider.");
+                            crate::technical_log!("One-job mode complete; stopping provider.");
                             break;
                         }
                     }
                     WsMessage::Result(result) => {
-                        println!("Ignoring unexpected result message: {result:?}");
+                        crate::technical_log!("Ignoring unexpected result message: {result:?}");
                     }
                     WsMessage::Register(registration) => {
-                        println!("Ignoring unexpected provider registration: {registration:?}");
+                        crate::technical_log!(
+                            "Ignoring unexpected provider registration: {registration:?}"
+                        );
                     }
                     WsMessage::FeeConfig(fees) => {
-                        println!(
+                        crate::technical_log!(
                             "Platform fee: {} bps — you receive {} units per job.",
-                            fees.fee_bps, fees.provider_payout_units
+                            fees.fee_bps,
+                            fees.provider_payout_units
                         );
-                        println!("Platform fee recipient: {}", fees.fee_address);
+                        crate::technical_log!("Platform fee recipient: {}", fees.fee_address);
                         event_callback(ProviderEvent::FeeConfig {
                             config: fees.clone(),
                         });
                         fee_config = Some(fees);
                     }
                     WsMessage::Availability { .. } => {
-                        println!("Ignoring unexpected coordinator availability message");
+                        crate::technical_log!(
+                            "Ignoring unexpected coordinator availability message"
+                        );
                     }
                 }
             }
-            Message::Binary(_) => println!("Ignoring unexpected binary message"),
+            Message::Binary(_) => {
+                crate::technical_log!("Ignoring unexpected binary message")
+            }
             Message::Ping(payload) => {
                 sender
                     .send(Message::Pong(payload))
@@ -702,7 +765,7 @@ async fn run_provider_connection(
                         "Coordinator disconnected: code={} reason={}",
                         frame.code, frame.reason
                     );
-                    println!("{message}");
+                    crate::technical_log!("{message}");
                     emit_connection(event_callback, ConnectionState::Disconnected, Some(message));
                 }
                 break;
@@ -742,8 +805,10 @@ async fn refresh_policy(
         .await
         .context("failed to send provider availability")?;
     match &next {
-        PolicyDecision::Run => println!("Provider policy: Run; accepting jobs"),
-        PolicyDecision::Paused(reason) => println!("Provider policy: Paused — {reason}"),
+        PolicyDecision::Run => crate::technical_log!("Provider policy: Run; accepting jobs"),
+        PolicyDecision::Paused(reason) => {
+            crate::technical_log!("Provider policy: Paused — {reason}")
+        }
     }
     event_callback(ProviderEvent::Policy {
         decision: next.clone(),
@@ -761,7 +826,7 @@ async fn connect_with_retry(
 ) -> Result<Option<CoordinatorSocket>> {
     loop {
         emit_connection(event_callback, ConnectionState::Connecting, None);
-        println!("Connecting provider to {coordinator_url}");
+        crate::technical_log!("Connecting provider to {coordinator_url}");
         let result = tokio::select! {
             biased;
             _ = wait_for_stop(stop_rx) => {
@@ -772,7 +837,7 @@ async fn connect_with_retry(
         };
         match result {
             Ok((websocket, _response)) => {
-                println!("Provider connected");
+                crate::technical_log!("Provider connected");
                 emit_connection(event_callback, ConnectionState::Connected, None);
                 return Ok(Some(websocket));
             }
@@ -784,7 +849,7 @@ async fn connect_with_retry(
                     return Err(error);
                 }
                 let message = format!("{error:#}");
-                eprintln!("{message}");
+                crate::technical_log!("{message}");
                 emit_connection(event_callback, ConnectionState::Disconnected, Some(message));
                 tokio::select! {
                     biased;

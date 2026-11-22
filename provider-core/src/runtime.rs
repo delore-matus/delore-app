@@ -1,5 +1,6 @@
 use std::{
     fs::File,
+    fs::OpenOptions,
     io::Read,
     net::TcpListener,
     path::{Path, PathBuf},
@@ -418,8 +419,22 @@ impl RuntimeManager {
             .unwrap_or(1);
         let mapping = settings.preset.mapping(
             logical_cpu_count,
-            settings.mode == crate::resource::ResourceMode::AlwaysOnLowPriority,
+            settings.mode == crate::resource::ResourceMode::AlwaysOnLowPriority
+                || settings.below_normal_priority,
         );
+        let logs_dir = crate::config_dir()?.join("logs");
+        tokio::fs::create_dir_all(&logs_dir)
+            .await
+            .context("failed to create technical log directory")?;
+        let engine_log_path = logs_dir.join("engine.log");
+        let engine_stdout = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&engine_log_path)
+            .with_context(|| format!("failed to open engine log: {}", engine_log_path.display()))?;
+        let engine_stderr = engine_stdout
+            .try_clone()
+            .context("failed to duplicate engine log handle")?;
         let mut child = Command::new(&executable)
             .arg("serve")
             .env("OLLAMA_HOST", format!("127.0.0.1:{port}"))
@@ -434,8 +449,8 @@ impl RuntimeManager {
                 mapping.max_loaded_models.to_string(),
             )
             .current_dir(self.runtime_dir())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
+            .stdout(Stdio::from(engine_stdout))
+            .stderr(Stdio::from(engine_stderr))
             .kill_on_drop(true)
             .spawn()
             .with_context(|| {
