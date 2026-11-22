@@ -1,26 +1,26 @@
 # GPU Swarm MVP
 
-This local Rust prototype coordinates provider daemons and an app-managed Ollama
-runtime. It is for testing on a local machine or testnet only; it does not use
-real money or private keys.
+This Rust workspace coordinates test providers and a managed local inference
+process. It is for local/testnet use only: it does not use real money or private
+keys.
 
-## Desktop app shell
+## Desktop app
 
-The initial Tauri v2 status app lives in `desktop/` and shares provider logic
-through `provider-core`; it does not launch the CLI. Install Node.js and the
-Tauri prerequisites for your OS, then run `npm install` in `desktop/` and
-`cargo tauri dev` from that directory. `npm run build` checks TypeScript and
-builds the Vite frontend.
+The Tauri v2 app lives in `desktop/`. It provides Status, Earnings, and Settings
+screens, a system tray, optional start-on-login, and a local TESTNET earnings
+history.
 
-This shell currently covers provider status, runtime/model progress, coordinator
-fees and connection state, job state, and validated payout-address editing. Its
-resource settings include idle, scheduled, and low-priority modes; workload
-presets, battery protection, Pause/Resume, and managed-runtime monitoring.
-Metrics unavailable on the current GPU or OS are shown as unavailable. System
-tray, autostart, installers/bundles, and CI are intentionally not part of this
-step.
-The minimal Windows development icon is only a build resource; final platform
-icons remain part of the later bundling step.
+Install Node.js and the Tauri prerequisites for the target OS, then run:
+
+```powershell
+cd desktop
+npm install
+cargo tauri dev
+```
+
+The desktop UI does not shell out to `gpuswarm`. Both the app and CLI use
+`provider-core` for provider control, configuration, the managed process, and
+job execution.
 
 ## Configuration
 
@@ -138,8 +138,8 @@ cargo run -p coordinator
 
 The address must be `0x` followed by exactly 40 hexadecimal characters. For
 local testnet use only, `GPUSWARM_ALLOW_NO_FEE_ADDRESS=1` permits a missing
-address and emits a loud warning. Providers never configure or receive this
-address; it is coordinator/operator data only.
+address and emits a loud warning. The provider receives the configured fee
+address from the coordinator as read-only fee configuration.
 
 ## Job reliability and disconnects
 
@@ -155,3 +155,25 @@ Jobs that are still queued because no provider is idle remain queued until a
 provider becomes available. If no provider connects, a queued job stays queued
 and does not earn anything. A running job that times out (default 120 seconds)
 is also marked failed and is not retried.
+
+## Local smoke tests
+
+The coordinator must use ports 8080 for HTTP and 8081 for WebSocket traffic.
+Both smoke-test scripts set a fake fee recipient when it is not already
+configured and use the small `llama3.2:1b` development model.
+
+Windows:
+
+```powershell
+.\test.ps1
+```
+
+The script starts the coordinator and provider, waits for provider registration,
+tests a missing payment header, submits a job, and polls `GET /jobs/{id}` until
+completion or failure.
+
+Bash:
+
+```bash
+./test.sh
+```
