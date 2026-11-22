@@ -4,6 +4,38 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
+ISOLATED_TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/gpu-swarm-test.XXXXXX")"
+export GPUSWARM_CONFIG_DIR="$ISOLATED_TEST_DIR/config"
+mkdir -p "$GPUSWARM_CONFIG_DIR"
+trap 'rm -rf "$ISOLATED_TEST_DIR"' EXIT
+echo "Using isolated provider config: $GPUSWARM_CONFIG_DIR"
+
+cat >"$GPUSWARM_CONFIG_DIR/config.json" <<'JSON'
+{
+  "payout_address": null,
+  "provider_id": "test-provider",
+  "coordinator_ws": "ws://127.0.0.1:8081/ws",
+  "ollama_model": "llama3.2:1b",
+  "resource_settings": {
+    "mode": "only_when_idle",
+    "idle_threshold_minutes": 5,
+    "schedule": null,
+    "preset": "balanced",
+    "do_not_run_on_battery": true,
+    "not_recommended_confirmed": true,
+    "performance_percent": 50
+  },
+  "desktop_preferences": {
+    "theme": "dark",
+    "language": "english",
+    "start_on_login": false,
+    "start_minimized_to_tray": false,
+    "keep_running_in_tray": false,
+    "notifications_enabled": false
+  }
+}
+JSON
+
 export GPUSWARM_FEE_ADDRESS="${GPUSWARM_FEE_ADDRESS:-0x20759eE366409B7dFE73a5325bfe0Dd57B6d7850}"
 export OLLAMA_MODEL="${OLLAMA_MODEL:-llama3.2:1b}"
 
@@ -14,7 +46,7 @@ PROVIDER_LOG="$ROOT/provider-test.log"
 
 cargo run -p coordinator >"$COORDINATOR_LOG" 2>&1 &
 COORDINATOR_PID=$!
-trap 'kill "$COORDINATOR_PID" "$PROVIDER_PID" 2>/dev/null || true' EXIT
+trap 'kill "${PROVIDER_PID:-}" "${COORDINATOR_PID:-}" 2>/dev/null || true; rm -rf "$ISOLATED_TEST_DIR"' EXIT
 
 for _ in $(seq 1 50); do
   if curl -fsS http://127.0.0.1:8080/fees >/dev/null 2>&1; then

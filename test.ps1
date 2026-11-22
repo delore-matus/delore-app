@@ -1,6 +1,17 @@
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
+$isolatedTestRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("gpu-swarm-test-" + [guid]::NewGuid().ToString("N"))
+$isolatedAppData = Join-Path $isolatedTestRoot "AppData"
+$isolatedConfigDir = Join-Path $isolatedTestRoot "config"
+$originalAppData = $env:APPDATA
+$originalConfigDir = $env:GPUSWARM_CONFIG_DIR
+New-Item -ItemType Directory -Path $isolatedAppData -Force | Out-Null
+New-Item -ItemType Directory -Path $isolatedConfigDir -Force | Out-Null
+$env:APPDATA = $isolatedAppData
+$env:GPUSWARM_CONFIG_DIR = $isolatedConfigDir
+Write-Output "Using isolated provider config: $isolatedConfigDir"
+
 if (-not $env:GPUSWARM_FEE_ADDRESS) {
     $env:GPUSWARM_FEE_ADDRESS = "0x20759eE366409B7dFE73a5325bfe0Dd57B6d7850"
 }
@@ -40,7 +51,7 @@ try {
     }
     $fees | ConvertTo-Json -Compress
 
-    $configDirectory = Join-Path $env:APPDATA "GpuSwarm"
+    $configDirectory = $env:GPUSWARM_CONFIG_DIR
     $configPath = Join-Path $configDirectory "config.json"
     New-Item -ItemType Directory -Path $configDirectory -Force | Out-Null
     if (Test-Path $configPath) {
@@ -139,5 +150,18 @@ try {
     }
     if ($coordinator -and -not $coordinator.HasExited) {
         Stop-Process -Id $coordinator.Id -Force
+    }
+    $managedRoot = Join-Path $env:LOCALAPPDATA "GpuSwarm\runtime"
+    Get-Process -Name ollama -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -and $_.Path.StartsWith($managedRoot, [System.StringComparison]::OrdinalIgnoreCase) } |
+        ForEach-Object { Stop-Process -Id $_.Id -Force }
+    $env:APPDATA = $originalAppData
+    if ($null -eq $originalConfigDir) {
+        Remove-Item Env:GPUSWARM_CONFIG_DIR -ErrorAction SilentlyContinue
+    } else {
+        $env:GPUSWARM_CONFIG_DIR = $originalConfigDir
+    }
+    if (Test-Path $isolatedTestRoot) {
+        Remove-Item -Recurse -Force $isolatedTestRoot -ErrorAction SilentlyContinue
     }
 }
