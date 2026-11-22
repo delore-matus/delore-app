@@ -40,6 +40,33 @@ try {
     }
     $fees | ConvertTo-Json -Compress
 
+    $configDirectory = Join-Path $env:APPDATA "GpuSwarm"
+    $configPath = Join-Path $configDirectory "config.json"
+    New-Item -ItemType Directory -Path $configDirectory -Force | Out-Null
+    if (Test-Path $configPath) {
+        $config = Get-Content $configPath -Raw | ConvertFrom-Json
+    } else {
+        $config = [ordered]@{
+            payout_address = $null
+            provider_id = "test-provider"
+            coordinator_ws = "ws://127.0.0.1:8081/ws"
+            ollama_model = "llama3.2:1b"
+            resource_settings = [ordered]@{}
+            desktop_preferences = [ordered]@{}
+        }
+        $config = $config | ConvertTo-Json -Depth 8 | ConvertFrom-Json
+    }
+    $config.ollama_model = "llama3.2:1b"
+    if ($null -eq $config.resource_settings) {
+        $config | Add-Member -NotePropertyName resource_settings -NotePropertyValue ([ordered]@{})
+    }
+    if ($null -eq $config.resource_settings.not_recommended_confirmed) {
+        $config.resource_settings | Add-Member -NotePropertyName not_recommended_confirmed -NotePropertyValue $true
+    } else {
+        $config.resource_settings.not_recommended_confirmed = $true
+    }
+    $config | ConvertTo-Json -Depth 8 | Set-Content -Path $configPath -Encoding UTF8
+
     $provider = Start-Process -FilePath "cargo" `
         -ArgumentList "run", "-p", "provider-daemon" `
         -WorkingDirectory $PSScriptRoot `
@@ -49,7 +76,7 @@ try {
 
     Write-Output "Waiting for provider registration..."
     $registered = $false
-    for ($attempt = 0; $attempt -lt 300; $attempt++) {
+    for ($attempt = 0; $attempt -lt 600; $attempt++) {
         try {
             $providers = Invoke-RestMethod -Uri "http://127.0.0.1:8080/providers" -TimeoutSec 1
             if ($providers.Count -gt 0) {
