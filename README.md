@@ -161,6 +161,14 @@ local testnet use only, `GPUSWARM_ALLOW_NO_FEE_ADDRESS=1` permits a missing
 address and emits a loud warning. The provider receives the configured fee
 address from the coordinator as read-only fee configuration.
 
+## Coordinator job storage
+
+The coordinator stores job state in SQLite at `coordinator.sqlite3` in its
+working directory. Set `GPUSWARM_DB_PATH` to choose another file. Queued and
+terminal jobs survive coordinator restarts; any job that was running at restart
+is marked failed because its provider connection no longer exists. Provider
+connections themselves are temporary and must register again after a restart.
+
 ## Job reliability and disconnects
 
 A new job is queued and assigned once an idle provider is available. If a

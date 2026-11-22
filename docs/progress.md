@@ -5,7 +5,7 @@
 | 1. Zero-percent slider regression | PASS | Real Tauri window/CDP and expanded ignored integration flow verified against owned coordinators; details below. |
 | 2. Connection resilience and single instance | PASS | Reconnect backoff, in-flight result discard, explicit connection state, and focus/restore on second launch verified. |
 | 3. First-run onboarding and data management | PASS | Adaptive startup readiness, first-run welcome, and local data-folder access verified. |
-| 4. Coordinator hardening (SQLite) | TODO | |
+| 4. Coordinator hardening (SQLite) | PASS | Durable job lifecycle and restart recovery verified with a real coordinator restart. |
 | 5. Coordinator URL and TLS | TODO | |
 | 6. Network-selected model | TODO | |
 | 7. Branding and installers | TODO | |
@@ -37,4 +37,11 @@ Phase 3 evidence (all timestamps UTC):
 - `cargo test --workspace`: 90 passed, 0 failed, 4 ignored. `cargo clippy --workspace --all-targets`: passed with the existing coordinator `while_let_loop` warning. `cargo fmt --all` and frontend tests (5 passed) and build passed.
 - All four ignored tests were explicitly run and passed: `close_shutdown_helper_stops_the_managed_runtime`, `managed_provider_runs_a_job_and_stops`, `disconnect_during_job_discards_result_and_reconnects`, and `performance_slider_controls_registration_and_job_flow`. A stale assertion in the provider-core flow test expected the CLI path to write desktop history; that test-only mismatch was corrected in separate commit `2dd15c1`.
 
-Next: Phase 4 — coordinator hardening (SQLite).
+Phase 4 evidence (all timestamps UTC):
+- Added SQLite job persistence at `coordinator.sqlite3` by default, configurable with `GPUSWARM_DB_PATH`. Queued jobs are restored after restart; terminal results remain queryable; jobs that were running during restart are marked failed. SQLite uses WAL, `synchronous=FULL`, a busy timeout, schema versioning, and an integrity check.
+- Full workspace tests: 92 passed, 0 failed, 4 ignored. Coordinator tests passed after the final storage change: 17 passed. Workspace clippy passed; the follow-up coordinator clippy check after the final storage change also passed, with only the existing `while_let_loop` warning in `coordinator/src/main.rs`.
+- Explicitly ran all three ignored integration tests: `managed_provider_runs_a_job_and_stops`, `disconnect_during_job_discards_result_and_reconnects`, and `performance_slider_controls_registration_and_job_flow`; all passed. Their coordinator used a temporary SQLite database, and the provider config/log path was isolated with `GPUSWARM_CONFIG_DIR`.
+- Real restart check: submitted job `phase4-restart-73b1132341c8456ca2d3e24fa7f57b57`; it was queued at `2026-11-22T23:40:30.831Z`. Stopped coordinator PID `14916` at `23:40:38.565Z`; restarted as PID `2844` at `23:40:47.843Z`. Startup reported `1 jobs loaded; 1 queued`, and `GET /jobs/{id}` returned `status=queued`. Both runs used a temporary database and the configured test fee address.
+- Disk space before the first Phase 4 rebuild was C: 25.06 GB free and Q: 3.99 GB free. The first default-debug ignored-test build exhausted Q:. Only the dedicated build target `Q:\\gpu-swarm-phase4-88e391cb1c1c460d98e7` was removed; builds were then retried with reduced debug output and two jobs. No files under the repository other than project build output were deleted.
+
+Next: Phase 5 — coordinator URL and TLS.

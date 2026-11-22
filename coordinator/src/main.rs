@@ -8,6 +8,7 @@ use std::{
     fs::OpenOptions,
     io::Write,
     net::SocketAddr,
+    path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -26,8 +27,11 @@ use axum::{
 };
 use common::{FeeConfig as SharedFeeConfig, JobPayload, JobResult, WsMessage};
 use futures_util::{SinkExt, StreamExt};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch, Mutex};
+
+mod storage;
+use storage::JobStore;
 
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 type ProviderSenderMap = HashMap<String, (u64, mpsc::UnboundedSender<JobPayload>)>;
@@ -42,6 +46,8 @@ struct AppState {
     pending_jobs: Arc<Mutex<VecDeque<String>>>,
     /// Every job in one in-memory lifecycle map.
     jobs: Arc<Mutex<HashMap<String, JobRecord>>>,
+    /// Durable job state recovered from SQLite on coordinator startup.
+    job_store: JobStore,
     /// Per-provider inboxes used to assign jobs directly.
     provider_senders: Arc<Mutex<ProviderSenderMap>>,
     /// Connected provider details and mock earning counters.
@@ -141,6 +147,14 @@ fn parse_configured_port(name: &str, value: Option<&str>, default: u16) -> Resul
     }
 }
 
+fn configured_database_path(value: Option<PathBuf>) -> Result<PathBuf> {
+    let path = value.unwrap_or_else(|| PathBuf::from("coordinator.sqlite3"));
+    if path.as_os_str().is_empty() {
+        anyhow::bail!("GPUSWARM_DB_PATH cannot be empty");
+    }
+    Ok(path)
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct ProviderInfo {
     provider_id: String,
@@ -154,14 +168,14 @@ struct ProviderInfo {
     total_earned_units: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct FeeBreakdown {
     gross_price: u64,
     platform_fee: u64,
     provider_payout: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct JobRecord {
     id: String,
     prompt: String,
@@ -204,7 +218,8 @@ fn fail_running_jobs_for_provider(
     jobs: &mut HashMap<String, JobRecord>,
     provider_id: &str,
     error: &str,
-) {
+) -> Vec<JobRecord> {
+    let mut failed_jobs = Vec::new();
     for record in jobs.values_mut() {
         if record.status == "running" && record.provider_id.as_deref() == Some(provider_id) {
             record.status = "failed".to_string();
@@ -219,6 +234,16 @@ fn fail_running_jobs_for_provider(
                     error
                 ),
             );
+            failed_jobs.push(record.clone());
+        }
+    }
+    failed_jobs
+}
+
+async fn persist_job_records(state: &AppState, records: Vec<JobRecord>) {
+    for record in records {
+        if let Err(error) = state.job_store.save_job(record.clone()).await {
+            eprintln!("Failed to persist job {}: {error:#}", record.id);
         }
     }
 }
@@ -249,18 +274,26 @@ async fn request_job(
         return (StatusCode::PAYMENT_REQUIRED, Json(body)).into_response();
     }
 
-    state.jobs.lock().await.insert(
-        job.id.clone(),
-        JobRecord {
-            id: job.id.clone(),
-            prompt: job.prompt.clone(),
-            status: "queued".to_string(),
-            provider_id: None,
-            result: None,
-            fee_breakdown: None,
-            error: None,
-        },
-    );
+    let record = JobRecord {
+        id: job.id.clone(),
+        prompt: job.prompt.clone(),
+        status: "queued".to_string(),
+        provider_id: None,
+        result: None,
+        fee_breakdown: None,
+        error: None,
+    };
+    if let Err(error) = state.job_store.save_job(record.clone()).await {
+        eprintln!("Failed to persist queued job {}: {error:#}", job.id);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "Coordinator could not store the job".to_string(),
+            }),
+        )
+            .into_response();
+    }
+    state.jobs.lock().await.insert(job.id.clone(), record);
     state.pending_jobs.lock().await.push_back(job.id.clone());
     assign_pending_job(state.clone()).await;
 
@@ -302,20 +335,31 @@ async fn assign_pending_job(state: AppState) {
             break;
         };
 
-        let job = {
+        let record = {
             let jobs = state.jobs.lock().await;
-            jobs.get(&job_id).map(|record| JobPayload {
-                id: record.id.clone(),
-                prompt: record.prompt.clone(),
-            })
+            jobs.get(&job_id).cloned()
         };
-        let Some(job) = job else {
+        let Some(record) = record else {
             state.pending_jobs.lock().await.pop_front();
             continue;
         };
 
+        let job = JobPayload {
+            id: record.id.clone(),
+            prompt: record.prompt.clone(),
+        };
+        let mut running_record = record.clone();
+        running_record.status = "running".to_string();
+        running_record.provider_id = Some(provider_id.clone());
+        if let Err(error) = state.job_store.save_job(running_record.clone()).await {
+            eprintln!("Failed to persist running job {job_id}: {error:#}");
+            break;
+        }
         if sender.send(job).is_err() {
             state.pending_jobs.lock().await.pop_front();
+            if let Err(error) = state.job_store.save_job(record).await {
+                eprintln!("Failed to restore queued job {job_id}: {error:#}");
+            }
             continue;
         }
         state.pending_jobs.lock().await.pop_front();
@@ -323,10 +367,11 @@ async fn assign_pending_job(state: AppState) {
         if let Some(provider) = state.providers.lock().await.get_mut(&provider_id) {
             provider.status = "busy".to_string();
         }
-        if let Some(record) = state.jobs.lock().await.get_mut(&job_id) {
-            record.status = "running".to_string();
-            record.provider_id = Some(provider_id.clone());
-        }
+        state
+            .jobs
+            .lock()
+            .await
+            .insert(job_id.clone(), running_record);
 
         let timeout_state = state.clone();
         let timeout_job_id = job_id.clone();
@@ -335,6 +380,7 @@ async fn assign_pending_job(state: AppState) {
             let timeout_secs = timeout_state.job_timeout_secs;
             tokio::time::sleep(Duration::from_secs(timeout_secs)).await;
             let mut jobs = timeout_state.jobs.lock().await;
+            let mut failed_job = None;
             if let Some(record) = jobs.get_mut(&timeout_job_id) {
                 if record.status == "running"
                     && record.provider_id.as_deref() == Some(&timeout_provider_id)
@@ -351,9 +397,15 @@ async fn assign_pending_job(state: AppState) {
                             timeout_secs
                         ),
                     );
+                    failed_job = Some(record.clone());
                 }
             }
             drop(jobs);
+            if let Some(job) = failed_job {
+                if let Err(error) = timeout_state.job_store.save_job(job).await {
+                    eprintln!("Failed to persist timed-out job {timeout_job_id}: {error:#}");
+                }
+            }
             if let Some(provider) = timeout_state
                 .providers
                 .lock()
@@ -528,11 +580,19 @@ async fn handle_websocket(socket: WebSocket, state: AppState) {
                         if result.error.is_none() {
                             let (platform_fee, provider_payout) =
                                 calculate_fee(receive_fees.job_price_units, receive_fees.fee_bps);
-                            apply_completed_job_result(
-                                &mut *receive_state.jobs.lock().await,
-                                &result,
-                                &receive_fees,
-                            );
+                            let completed_job = {
+                                let mut jobs = receive_state.jobs.lock().await;
+                                apply_completed_job_result(&mut jobs, &result, &receive_fees);
+                                jobs.get(&result.job_id).cloned()
+                            };
+                            if let Some(job) = completed_job {
+                                if let Err(error) = receive_state.job_store.save_job(job).await {
+                                    eprintln!(
+                                        "Failed to persist completed job {}: {error:#}",
+                                        result.job_id
+                                    );
+                                }
+                            }
                             append_line(
                                 "completed_jobs.log",
                                 &format!(
@@ -577,12 +637,24 @@ async fn handle_websocket(socket: WebSocket, state: AppState) {
                                 ),
                             );
                         } else {
-                            if let Some(record) =
-                                receive_state.jobs.lock().await.get_mut(&result.job_id)
-                            {
-                                record.status = "failed".to_string();
-                                record.result = Some(result.clone());
-                                record.error = result.error.clone();
+                            let failed_job = {
+                                let mut jobs = receive_state.jobs.lock().await;
+                                if let Some(record) = jobs.get_mut(&result.job_id) {
+                                    record.status = "failed".to_string();
+                                    record.result = Some(result.clone());
+                                    record.error = result.error.clone();
+                                    Some(record.clone())
+                                } else {
+                                    None
+                                }
+                            };
+                            if let Some(job) = failed_job {
+                                if let Err(error) = receive_state.job_store.save_job(job).await {
+                                    eprintln!(
+                                        "Failed to persist failed job {}: {error:#}",
+                                        result.job_id
+                                    );
+                                }
                             }
                             if let Some(provider) =
                                 receive_providers.lock().await.get_mut(&result.provider_id)
@@ -621,16 +693,18 @@ async fn handle_websocket(socket: WebSocket, state: AppState) {
                                 "WARNING: provider_id '{}' reconnected with a duplicate ID; replacing the old connection",
                                 provider_id
                             );
-                            {
+                            let failed_jobs = {
+                                let mut jobs = receive_state.jobs.lock().await;
                                 fail_running_jobs_for_provider(
-                                    &mut *receive_state.jobs.lock().await,
+                                    &mut jobs,
                                     &provider_id,
                                     &format!(
                                         "Provider '{}' reconnected with the same provider_id",
                                         provider_id
                                     ),
-                                );
-                            }
+                                )
+                            };
+                            persist_job_records(&receive_state, failed_jobs).await;
                         }
                         let mut providers = receive_providers.lock().await;
                         let (jobs_completed, total_earned_units) = providers
@@ -722,13 +796,15 @@ async fn handle_websocket(socket: WebSocket, state: AppState) {
                                 .lock()
                                 .await
                                 .remove(&provider_id);
-                            {
+                            let failed_jobs = {
+                                let mut jobs = receive_state.jobs.lock().await;
                                 fail_running_jobs_for_provider(
-                                    &mut *receive_state.jobs.lock().await,
+                                    &mut jobs,
                                     &provider_id,
                                     "Provider disconnected while job was running",
-                                );
-                            }
+                                )
+                            };
+                            persist_job_records(&receive_state, failed_jobs).await;
                             assign_pending_job(receive_state.clone()).await;
                         }
                     }
@@ -760,13 +836,15 @@ async fn handle_websocket(socket: WebSocket, state: AppState) {
                                 .lock()
                                 .await
                                 .remove(&provider_id);
-                            {
+                            let failed_jobs = {
+                                let mut jobs = receive_state.jobs.lock().await;
                                 fail_running_jobs_for_provider(
-                                    &mut *receive_state.jobs.lock().await,
+                                    &mut jobs,
                                     &provider_id,
                                     "Provider disconnected while job was running",
-                                );
-                            }
+                                )
+                            };
+                            persist_job_records(&receive_state, failed_jobs).await;
                             assign_pending_job(receive_state.clone()).await;
                         }
                     }
@@ -784,6 +862,25 @@ async fn handle_websocket(socket: WebSocket, state: AppState) {
 #[tokio::main]
 async fn main() -> Result<()> {
     let fees = parse_fee_settings()?;
+    let database_path =
+        configured_database_path(std::env::var_os("GPUSWARM_DB_PATH").map(PathBuf::from))?;
+    let job_store = JobStore::open(&database_path)?;
+    let recovered_jobs = job_store.load_and_recover()?;
+    let pending_jobs = recovered_jobs
+        .iter()
+        .filter(|job| job.status == "queued")
+        .map(|job| job.id.clone())
+        .collect::<VecDeque<_>>();
+    let jobs = recovered_jobs
+        .into_iter()
+        .map(|job| (job.id.clone(), job))
+        .collect::<HashMap<_, _>>();
+    println!(
+        "Coordinator database: {} ({} jobs loaded; {} queued)",
+        database_path.display(),
+        jobs.len(),
+        pending_jobs.len()
+    );
     let job_timeout_secs = std::env::var("JOB_TIMEOUT_SECS")
         .unwrap_or_else(|_| "120".to_string())
         .parse::<u64>()
@@ -800,8 +897,9 @@ async fn main() -> Result<()> {
     );
     let state = AppState {
         assignment_lock: Arc::new(Mutex::new(())),
-        pending_jobs: Arc::new(Mutex::new(VecDeque::new())),
-        jobs: Arc::new(Mutex::new(HashMap::new())),
+        pending_jobs: Arc::new(Mutex::new(pending_jobs)),
+        jobs: Arc::new(Mutex::new(jobs)),
+        job_store,
         provider_senders: Arc::new(Mutex::new(HashMap::new())),
         providers: Arc::new(Mutex::new(HashMap::new())),
         fees,
@@ -874,17 +972,32 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::storage::JobStore;
     use super::{
-        apply_completed_job_result, assign_pending_job, calculate_fee,
+        apply_completed_job_result, assign_pending_job, calculate_fee, configured_database_path,
         fail_running_jobs_for_provider, parse_configured_port, validate_fee_address, AppState,
         FeeSettings, JobPayload, JobRecord, JobResult, ProviderInfo,
     };
     use std::{
         collections::{HashMap, VecDeque},
+        path::PathBuf,
         sync::Arc,
         time::Duration,
     };
     use tokio::sync::{mpsc, Mutex};
+
+    #[test]
+    fn coordinator_database_path_has_a_safe_default_and_rejects_empty_values() {
+        assert_eq!(
+            configured_database_path(None).unwrap(),
+            PathBuf::from("coordinator.sqlite3")
+        );
+        assert_eq!(
+            configured_database_path(Some(PathBuf::from("custom.sqlite3"))).unwrap(),
+            PathBuf::from("custom.sqlite3")
+        );
+        assert!(configured_database_path(Some(PathBuf::new())).is_err());
+    }
 
     #[test]
     fn configured_ports_support_defaults_and_ephemeral_ports() {
@@ -1053,6 +1166,7 @@ mod tests {
                     error: None,
                 },
             )]))),
+            job_store: JobStore::in_memory().unwrap(),
             provider_senders: Arc::new(Mutex::new(HashMap::from([(
                 "test-provider-A".to_string(),
                 (1_u64, sender),
