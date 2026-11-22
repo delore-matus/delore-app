@@ -55,7 +55,7 @@ fn ollama_request(
 }
 
 fn gpu_layers_for_performance(total_layers: usize, performance_percent: u8) -> Option<usize> {
-    if total_layers == 0 || !(10..=100).contains(&performance_percent) {
+    if total_layers == 0 || performance_percent == 0 || performance_percent > 100 {
         return None;
     }
     let requested = total_layers
@@ -124,10 +124,11 @@ pub async fn run_ollama_with_settings(
         .map(usize::from)
         .unwrap_or(1);
     let gpu_support = crate::detect_gpu().support;
-    let num_gpu = if matches!(
-        gpu_support.as_str(),
-        "nvidia-supported" | "apple-silicon-best-effort"
-    ) {
+    let num_gpu = if settings.performance_percent > 0
+        && matches!(
+            gpu_support.as_str(),
+            "nvidia-supported" | "apple-silicon-best-effort"
+        ) {
         match model_layer_count(&http, api_url, model).await {
             Ok(Some(total_layers)) => {
                 gpu_layers_for_performance(total_layers, settings.performance_percent)
@@ -240,9 +241,12 @@ mod tests {
     #[test]
     fn gpu_layer_fraction_rounds_up_within_model_bounds() {
         assert_eq!(gpu_layers_for_performance(40, 50), Some(20));
+        assert_eq!(gpu_layers_for_performance(13, 1), Some(1));
         assert_eq!(gpu_layers_for_performance(13, 10), Some(2));
+        assert_eq!(gpu_layers_for_performance(13, 99), Some(13));
         assert_eq!(gpu_layers_for_performance(13, 100), Some(13));
         assert_eq!(gpu_layers_for_performance(0, 50), None);
+        assert_eq!(gpu_layers_for_performance(13, 0), None);
         assert_eq!(gpu_layers_for_performance(13, 101), None);
     }
 }

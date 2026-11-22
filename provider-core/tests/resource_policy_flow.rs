@@ -4,37 +4,16 @@ use std::{
 };
 
 use provider_core::{
-    run_provider_managed_with_probe, IdleState, NativeSystemProbe, PolicyDecision, PowerState,
-    ProviderConfig, ProviderEvent, ProviderEventCallback, ResourceMode, ResourcePreset,
-    ResourceSettings, RuntimeManager, RuntimeProgressCallback, SystemProbe, SystemSample,
+    provider_control_channel, run_provider_managed_with_control, PolicyDecision, ProviderConfig,
+    ProviderEvent, ProviderEventCallback, ResourceMode, ResourcePreset, RuntimeManager,
+    RuntimeProgressCallback,
 };
 use serde_json::Value;
 use tokio::sync::{mpsc, watch};
 
-struct TimedIdleProbe {
-    started: Instant,
-    power: PowerState,
-}
-
-impl SystemProbe for TimedIdleProbe {
-    fn sample(&self) -> SystemSample {
-        let elapsed = self.started.elapsed();
-        let idle = if elapsed >= Duration::from_secs(60) {
-            IdleState::IdleFor(elapsed)
-        } else {
-            IdleState::Active
-        };
-        SystemSample {
-            idle,
-            power: self.power,
-            diagnostic: None,
-        }
-    }
-}
-
 #[tokio::test]
-#[ignore = "requires a running coordinator, installed runtime, cached model, and one-minute policy wait"]
-async fn paused_provider_leaves_job_queued_until_idle_threshold_then_runs_it() {
+#[ignore = "requires a running coordinator, installed runtime, and cached model"]
+async fn zero_performance_keeps_job_queued_until_slider_increases() {
     let runtime = RuntimeManager::new().unwrap();
     assert!(
         runtime.runtime_dir().exists(),
@@ -48,55 +27,42 @@ async fn paused_provider_leaves_job_queued_until_idle_threshold_then_runs_it() {
         "cached llama3.2:1b model is required"
     );
 
-    let system = NativeSystemProbe.sample();
-    println!(
-        "native Windows probe: idle={:?}, power={:?}, diagnostic={:?}",
-        system.idle, system.power, system.diagnostic
-    );
-    if system.power == PowerState::OnBattery {
-        panic!("flow requires AC power; do-not-run-on-battery is enabled");
-    }
-
     let coordinator_http =
         std::env::var("GPUSWARM_E2E_HTTP").unwrap_or_else(|_| "http://127.0.0.1:8080".into());
     let coordinator_ws =
         std::env::var("GPUSWARM_E2E_WS").unwrap_or_else(|_| "ws://127.0.0.1:8081/ws".into());
     let expected_fee_address = std::env::var("GPUSWARM_EXPECTED_FEE_ADDRESS").ok();
-    let job_id = format!("resource-policy-{}", uuid::Uuid::new_v4());
+    let job_id = format!("performance-zero-{}", uuid::Uuid::new_v4());
     let mut config = ProviderConfig::defaults();
-    config.provider_id = format!("resource-policy-provider-{}", uuid::Uuid::new_v4());
+    config.provider_id = format!("performance-zero-provider-{}", uuid::Uuid::new_v4());
     config.coordinator_ws = coordinator_ws;
     config.ollama_model = "llama3.2:1b".into();
-    config.resource_settings = ResourceSettings {
-        mode: ResourceMode::OnlyWhenIdle,
-        idle_threshold_minutes: 1,
+    config.resource_settings = provider_core::ResourceSettings {
+        mode: ResourceMode::AlwaysOnLowPriority,
         preset: ResourcePreset::Low,
-        do_not_run_on_battery: true,
+        do_not_run_on_battery: false,
         not_recommended_confirmed: true,
-        ..ResourceSettings::default()
+        performance_percent: 0,
+        ..provider_core::ResourceSettings::default()
     };
 
+    let (control, pause_rx) = provider_control_channel();
+    control
+        .update_resource_settings(config.resource_settings.clone())
+        .unwrap();
+    let settings_rx = control.subscribe_resource_settings();
     let (stop, stop_rx) = watch::channel(false);
-    let (_control, pause_rx) = provider_core::provider_control_channel();
-    let (runtime_tx, mut runtime_rx) = mpsc::unbounded_channel();
-    let runtime_callback: RuntimeProgressCallback = Arc::new(move |state| {
-        let _ = runtime_tx.send(state);
-    });
+    let runtime_callback: RuntimeProgressCallback = Arc::new(|_| {});
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let event_callback: ProviderEventCallback = Arc::new(move |event| {
         let _ = event_tx.send(event);
     });
-    let probe = Arc::new(TimedIdleProbe {
-        started: Instant::now(),
-        power: system.power,
-    });
-    println!("test probe: mode=OnlyWhenIdle threshold=1 minute; reports Active for 60 seconds");
-    let provider = tokio::spawn(run_provider_managed_with_probe(
+    let provider = tokio::spawn(run_provider_managed_with_control(
         config,
         false,
         stop_rx,
         pause_rx,
-        probe,
+        settings_rx,
         runtime_callback,
         event_callback,
     ));
@@ -105,43 +71,41 @@ async fn paused_provider_leaves_job_queued_until_idle_threshold_then_runs_it() {
     let mut saw_initial_paused = false;
     let mut saw_fee_config = false;
     let startup_deadline = Instant::now() + Duration::from_secs(90);
-    while !saw_initial_paused {
+    while !saw_initial_paused || !saw_fee_config {
         assert!(
             Instant::now() < startup_deadline,
-            "provider did not reach Paused"
+            "provider did not register paused and receive fee config"
         );
-        tokio::select! {
-            state = runtime_rx.recv() => {
-                if let Some(state) = state {
-                    println!("runtime={state:?}");
+        if let Some(event) = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .unwrap_or(None)
+        {
+            match event {
+                ProviderEvent::Policy { decision, .. } => {
+                    println!("provider-status policy={decision:?}");
+                    saw_initial_paused = matches!(
+                        decision,
+                        PolicyDecision::Paused(ref reason)
+                            if reason == "Performance is set to 0%, no work is accepted"
+                    );
                 }
-            }
-            event = event_rx.recv() => {
-                match event {
-                    Some(ProviderEvent::Policy { decision, diagnostic }) => {
-                        println!("provider-status policy={decision:?} diagnostic={diagnostic:?}");
-                        saw_initial_paused = matches!(
-                            decision,
-                            PolicyDecision::Paused(ref reason)
-                                if reason == "Waiting for the idle threshold"
-                        );
+                ProviderEvent::FeeConfig { config } => {
+                    let fee_units = config.job_price_units - config.provider_payout_units;
+                    println!(
+                        "fee_config fee_bps={} provider_payout={} fee={} recipient={}",
+                        config.fee_bps, config.provider_payout_units, fee_units, config.fee_address
+                    );
+                    if let Some(expected) = &expected_fee_address {
+                        assert_eq!(&config.fee_address, expected);
                     }
-                    Some(ProviderEvent::FeeConfig { config }) => {
-                        println!(
-                            "provider-status fee_bps={} fee_address={}",
-                            config.fee_bps, config.fee_address
-                        );
-                        if let Some(expected) = &expected_fee_address {
-                            assert_eq!(&config.fee_address, expected);
-                        }
-                        saw_fee_config = true;
-                    }
-                    Some(ProviderEvent::Connection { state, message }) => {
-                        println!("provider-status connection={state:?} message={message:?}");
-                    }
-                    Some(event) => println!("provider-status event={event:?}"),
-                    None => break,
+                    assert_eq!(config.provider_payout_units, 9_000);
+                    assert_eq!(fee_units, 1_000);
+                    saw_fee_config = true;
                 }
+                ProviderEvent::Connection { state, message } => {
+                    println!("provider-status connection={state:?} message={message:?}");
+                }
+                event => println!("provider-status event={event:?}"),
             }
         }
     }
@@ -172,14 +136,28 @@ async fn paused_provider_leaves_job_queued_until_idle_threshold_then_runs_it() {
             .unwrap();
         if job["status"] == "queued" {
             println!(
-                "job while paused: status={} job_id={}",
-                job["status"], job_id
+                "job while performance=0: status={} job_id={} at={:?}",
+                job["status"],
+                job_id,
+                chrono::Local::now()
             );
             queued = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+    assert!(queued, "job must remain queued at 0% performance");
+
+    let mut resumed_settings = provider_core::ResourceSettings {
+        performance_percent: 50,
+        ..provider_core::ResourceSettings::default()
+    };
+    resumed_settings.mode = ResourceMode::AlwaysOnLowPriority;
+    resumed_settings.preset = ResourcePreset::Low;
+    resumed_settings.do_not_run_on_battery = false;
+    resumed_settings.not_recommended_confirmed = true;
+    control.update_resource_settings(resumed_settings).unwrap();
+    println!("slider changed to 50% at {}", chrono::Local::now());
 
     let run_deadline = Instant::now() + Duration::from_secs(180);
     let mut saw_run = false;
@@ -191,43 +169,37 @@ async fn paused_provider_leaves_job_queued_until_idle_threshold_then_runs_it() {
             Instant::now() < run_deadline,
             "provider did not run and finish the queued job"
         );
-        tokio::select! {
-            state = runtime_rx.recv() => {
-                if let Some(state) = state {
-                    println!("runtime={state:?}");
+        if let Some(event) = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .unwrap_or(None)
+        {
+            match event {
+                ProviderEvent::Policy { decision, .. } => {
+                    println!("provider-status policy={decision:?}");
+                    saw_run |= matches!(decision, PolicyDecision::Run);
                 }
-            }
-            event = event_rx.recv() => {
-                match event {
-                    Some(ProviderEvent::Policy { decision, diagnostic }) => {
-                        println!("provider-status policy={decision:?} diagnostic={diagnostic:?}");
-                        saw_run |= matches!(decision, PolicyDecision::Run);
-                    }
-                    Some(ProviderEvent::JobStarted { job_id: started_id }) => {
-                        println!("provider-status job=running id={started_id}");
-                        job_started_before_run |= !saw_run;
-                        saw_started |= started_id == job_id;
-                    }
-                    Some(ProviderEvent::JobFinished { result }) => {
-                        println!("provider-status job=finished id={} error={:?}", result.job_id, result.error);
-                        saw_finished |= result.job_id == job_id;
-                    }
-                    Some(ProviderEvent::Connection { state, message }) => {
-                        println!("provider-status connection={state:?} message={message:?}");
-                    }
-                    Some(ProviderEvent::FeeConfig { config }) => {
-                        println!(
-                            "provider-status fee_bps={} fee_address={}",
-                            config.fee_bps, config.fee_address
-                        );
-                        if let Some(expected) = &expected_fee_address {
-                            assert_eq!(&config.fee_address, expected);
-                        }
-                        saw_fee_config = true;
-                    }
-                    Some(event) => println!("provider-status event={event:?}"),
-                    None => break,
+                ProviderEvent::JobStarted { job_id: started_id } => {
+                    println!(
+                        "provider-status job=running id={started_id} at={}",
+                        chrono::Local::now()
+                    );
+                    job_started_before_run |= !saw_run;
+                    saw_started |= started_id == job_id;
                 }
+                ProviderEvent::JobFinished { result } => {
+                    println!(
+                        "provider-status job=finished id={} error={:?} at={}",
+                        result.job_id,
+                        result.error,
+                        chrono::Local::now()
+                    );
+                    saw_finished |= result.job_id == job_id;
+                }
+                ProviderEvent::Connection { state, message } => {
+                    println!("provider-status connection={state:?} message={message:?}");
+                }
+                ProviderEvent::FeeConfig { .. } => {}
+                event => println!("provider-status event={event:?}"),
             }
         }
     }
@@ -260,15 +232,14 @@ async fn paused_provider_leaves_job_queued_until_idle_threshold_then_runs_it() {
     };
 
     println!(
-        "GET /jobs/{job_id}: status={} result={:?}",
-        job_result["status"], job_result["result"]["result_data"]
+        "GET /jobs/{job_id}: status={} result={:?} at={}",
+        job_result["status"],
+        job_result["result"]["result_data"],
+        chrono::Local::now()
     );
     assert!(saw_initial_paused);
     assert!(saw_fee_config, "coordinator did not send its FeeConfig");
-    assert!(
-        queued,
-        "job must remain queued while the provider is paused"
-    );
+    assert!(queued, "job must remain queued while performance is zero");
     assert!(saw_run);
     assert!(saw_started);
     assert!(!job_started_before_run, "job started before policy Run");

@@ -9,8 +9,8 @@ use std::{
 };
 
 use provider_core::{
-    confirm_not_recommended_runtime, detect_gpu, load_config, provider_control_channel,
-    run_provider_managed_with_control, runtime_suitability,
+    confirm_not_recommended_runtime, detect_gpu, load_config, load_config_with_recovery,
+    provider_control_channel, run_provider_managed_with_control, runtime_suitability,
     set_desktop_preferences as save_desktop_preferences, set_payout_address as save_payout_address,
     set_performance_percent as save_performance_percent, DesktopPreferences, FeeConfig, GpuInfo,
     JobResult, PolicyDecision, ProviderConfig, ProviderControl, ProviderEvent,
@@ -38,6 +38,7 @@ enum UiErrorCategory {
     NotEnoughDiskSpace,
     UnsupportedSystem,
     InvalidSetting,
+    SettingsUnreadable,
     SetupFailed,
 }
 
@@ -49,6 +50,7 @@ impl UiErrorCategory {
             Self::NotEnoughDiskSpace => "not_enough_disk_space",
             Self::UnsupportedSystem => "unsupported_system",
             Self::InvalidSetting => "invalid_setting",
+            Self::SettingsUnreadable => "settings_unreadable",
             Self::SetupFailed => "setup_failed",
         }
     }
@@ -69,6 +71,14 @@ fn classify_error(technical: &str) -> UiError {
         (
             UiErrorCategory::NotEnoughDiskSpace,
             "There is not enough free disk space. Free some space, then try again.",
+        )
+    } else if lower.contains("failed to parse config")
+        || lower.contains("unreadable config")
+        || lower.contains("could not read config")
+    {
+        (
+            UiErrorCategory::SettingsUnreadable,
+            "Your settings file could not be read. DeLore will use default settings.",
         )
     } else if lower.contains("unsupported on this platform") || lower.contains("unsupported system")
     {
@@ -132,6 +142,14 @@ fn map_error(technical: &str) -> UiError {
     map_error_with_logger(technical, |detail| {
         log_technical(&format!("Desktop error: {detail}"));
     })
+}
+
+fn settings_unreadable_error() -> UiError {
+    UiError {
+        category: UiErrorCategory::SettingsUnreadable,
+        message: "Your settings file could not be read. DeLore will use default settings."
+            .to_string(),
+    }
 }
 
 fn map_invoke_error(technical: &str) -> String {
@@ -213,10 +231,20 @@ struct DesktopState {
 
 impl DesktopState {
     fn new() -> Self {
-        let config_result = load_config();
-        let config = match &config_result {
-            Ok(config) => config.clone().unwrap_or_else(ProviderConfig::defaults),
-            Err(_) => ProviderConfig::defaults(),
+        let (config, settings_error) = match load_config_with_recovery() {
+            Ok(loaded) => (
+                loaded.config.unwrap_or_else(ProviderConfig::defaults),
+                loaded.recovered_unreadable.then(settings_unreadable_error),
+            ),
+            Err(error) => {
+                log_technical(&format!(
+                    "Could not back up unreadable provider configuration: {error:#}"
+                ));
+                (
+                    ProviderConfig::defaults(),
+                    Some(settings_unreadable_error()),
+                )
+            }
         };
         let gpu = detect_gpu();
         let (runtime, runtime_error) = match RuntimeManager::new() {
@@ -231,9 +259,6 @@ impl DesktopState {
                 )
             }
         };
-        let error_message = config_result
-            .err()
-            .map(|error| map_error(&format!("Could not load provider configuration: {error:#}")));
         let resource_settings = config.resource_settings.clone();
         let performance_percent = resource_settings.performance_percent;
         let history_path =
@@ -282,7 +307,7 @@ impl DesktopState {
             runtime_percent: 0,
             model_percent: 0,
             expected_total_download_bytes: None,
-            error_message: error_message.or(runtime_error),
+            error_message: settings_error.or(runtime_error),
             policy: PolicyDecision::Paused("Provider is stopped".to_string()),
             policy_diagnostic: None,
             performance_percent,
@@ -346,9 +371,19 @@ fn confirm_hardware_use(
     state: State<'_, DesktopState>,
 ) -> Result<(), String> {
     if let RuntimeSuitability::NotRecommended { .. } = runtime_suitability() {
-        let config = confirm_not_recommended_runtime().map_err(|error| {
-            map_invoke_error(&format!("Could not save hardware confirmation: {error:#}"))
+        let loaded = load_config_with_recovery().map_err(|error| {
+            map_invoke_error(&format!(
+                "Could not back up unreadable provider configuration: {error:#}"
+            ))
         })?;
+        let hardware_confirmed = if loaded.recovered_unreadable {
+            true
+        } else {
+            confirm_not_recommended_runtime()
+                .map_err(|error| map_invoke_error(&format!("{error:#}")))?
+                .resource_settings
+                .not_recommended_confirmed
+        };
         let mut granted = state
             .inner()
             .inner
@@ -359,7 +394,10 @@ fn confirm_hardware_use(
             })?;
         *granted = true;
         update_status(&state.inner().inner, &app, |snapshot| {
-            snapshot.hardware_confirmed = config.resource_settings.not_recommended_confirmed;
+            snapshot.hardware_confirmed = hardware_confirmed;
+            if loaded.recovered_unreadable {
+                snapshot.error_message = Some(settings_unreadable_error());
+            }
         });
     }
     Ok(())
@@ -370,10 +408,14 @@ async fn start_provider(
     app: tauri::AppHandle,
     state: State<'_, DesktopState>,
 ) -> Result<(), String> {
-    let mut config = load_config()
-        .map_err(|error| {
-            map_invoke_error(&format!("Could not load provider configuration: {error:#}"))
-        })?
+    let loaded_config = load_config_with_recovery().map_err(|error| {
+        map_invoke_error(&format!(
+            "Could not back up unreadable provider configuration: {error:#}"
+        ))
+    })?;
+    let settings_were_unreadable = loaded_config.recovered_unreadable;
+    let mut config = loaded_config
+        .config
         .unwrap_or_else(ProviderConfig::defaults);
     let requires_confirmation = requires_provider_confirmation(
         config.resource_settings.not_recommended_confirmed,
@@ -396,6 +438,9 @@ async fn start_provider(
         }
         std::mem::take(&mut *granted) || config.resource_settings.not_recommended_confirmed
     };
+    if settings_were_unreadable && confirmed {
+        config.resource_settings.not_recommended_confirmed = true;
+    }
 
     let mut task_slot = state.inner().inner.task.lock().await;
     if task_slot
@@ -412,7 +457,7 @@ async fn start_provider(
         snapshot.provider_running = true;
         snapshot.current_job = CurrentJob::Idle;
         snapshot.user_paused = false;
-        snapshot.error_message = None;
+        snapshot.error_message = settings_were_unreadable.then(settings_unreadable_error);
         snapshot.runtime_percent = 0;
         snapshot.model_percent = 0;
         snapshot.expected_total_download_bytes = None;
@@ -622,7 +667,7 @@ async fn set_provider_paused(state: &DesktopState, paused: bool) -> Result<(), S
 async fn set_performance(
     app: tauri::AppHandle,
     state: State<'_, DesktopState>,
-    performance_percent: u8,
+    performance_percent: i16,
 ) -> Result<StatusSnapshot, String> {
     let config = save_performance_percent(performance_percent)
         .map_err(|error| map_invoke_error(&format!("{error:#}")))?;
@@ -639,7 +684,7 @@ async fn set_performance(
         }
     }
     update_status(&state.inner().inner, &app, |snapshot| {
-        snapshot.performance_percent = performance_percent;
+        snapshot.performance_percent = config.resource_settings.performance_percent;
     });
     state
         .inner()
@@ -1041,7 +1086,7 @@ mod tests {
     use super::{
         classify_error, desktop_resource_settings, initial_runtime_state, map_error_with_logger,
         provider_control_channel, requires_provider_confirmation, set_provider_paused,
-        stop_provider_task_and_join, DesktopState, ProviderTask,
+        settings_unreadable_error, stop_provider_task_and_join, DesktopState, ProviderTask,
     };
     use provider_core::{
         ResourceMode, ResourceSettings, RuntimeManager, RuntimeProgressCallback, RuntimeState,
@@ -1114,6 +1159,17 @@ mod tests {
             classify_error("Payout address must be 0x followed by 40 hex characters").category,
             super::UiErrorCategory::InvalidSetting
         );
+    }
+
+    #[test]
+    fn unreadable_settings_use_a_dedicated_friendly_category() {
+        let mapped = classify_error("failed to parse config: key must be a string");
+        assert_eq!(mapped.category, super::UiErrorCategory::SettingsUnreadable);
+        assert_eq!(
+            mapped.message,
+            "Your settings file could not be read. DeLore will use default settings."
+        );
+        assert_eq!(settings_unreadable_error().message, mapped.message);
     }
 
     #[test]

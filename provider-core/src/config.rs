@@ -21,6 +21,12 @@ pub struct ProviderConfig {
     pub desktop_preferences: DesktopPreferences,
 }
 
+#[derive(Debug)]
+pub struct ConfigLoadResult {
+    pub config: Option<ProviderConfig>,
+    pub recovered_unreadable: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Theme {
@@ -155,7 +161,7 @@ pub fn set_resource_settings(settings: ResourceSettings) -> Result<ProviderConfi
     set_resource_settings_at(settings, &config_path()?)
 }
 
-pub fn set_performance_percent(performance_percent: u8) -> Result<ProviderConfig> {
+pub fn set_performance_percent(performance_percent: i16) -> Result<ProviderConfig> {
     set_performance_percent_at(performance_percent, &config_path()?)
 }
 
@@ -190,12 +196,12 @@ fn set_desktop_preferences_at(
     Ok(config)
 }
 
-fn set_performance_percent_at(performance_percent: u8, path: &Path) -> Result<ProviderConfig> {
-    if !(10..=100).contains(&performance_percent) {
-        anyhow::bail!("Performance must be between 10 and 100.");
+fn set_performance_percent_at(performance_percent: i16, path: &Path) -> Result<ProviderConfig> {
+    if !(0..=100).contains(&performance_percent) {
+        anyhow::bail!("Performance must be between 0 and 100.");
     }
     let mut config = load_config_from(path)?.unwrap_or_else(ProviderConfig::defaults);
-    config.resource_settings.performance_percent = performance_percent;
+    config.resource_settings.performance_percent = u8::try_from(performance_percent)?;
     config.resource_settings.validate()?;
     save_config_to(&config, path)?;
     Ok(config)
@@ -253,6 +259,43 @@ pub fn append_technical_log(message: &str) -> Result<()> {
 
 pub fn load_config() -> Result<Option<ProviderConfig>> {
     load_config_from(&config_path()?)
+}
+
+pub fn load_config_with_recovery() -> Result<ConfigLoadResult> {
+    load_config_with_recovery_from(&config_path()?, |message| {
+        crate::technical_log!("{message}");
+    })
+}
+
+fn load_config_with_recovery_from(
+    path: &Path,
+    mut logger: impl FnMut(&str),
+) -> Result<ConfigLoadResult> {
+    match load_config_from(path) {
+        Ok(config) => Ok(ConfigLoadResult {
+            config,
+            recovered_unreadable: false,
+        }),
+        Err(error) => {
+            let backup_path = path.with_file_name("config.json.bad");
+            std::fs::copy(path, &backup_path).with_context(|| {
+                format!(
+                    "failed to back up unreadable config from {} to {}",
+                    path.display(),
+                    backup_path.display()
+                )
+            })?;
+            logger(&format!(
+                "Unreadable config at {}; preserving backup at {}: {error:#}",
+                path.display(),
+                backup_path.display()
+            ));
+            Ok(ConfigLoadResult {
+                config: None,
+                recovered_unreadable: true,
+            })
+        }
+    }
 }
 
 fn decode_config_bytes(bytes: &[u8]) -> String {
@@ -339,10 +382,10 @@ mod tests {
     };
 
     use super::{
-        load_config_from, save_config_to, select_ollama_model, set_desktop_preferences_at,
-        set_ollama_model_at, set_payout_address_at, set_performance_percent_at,
-        set_resource_settings_at, validate_ollama_model, validate_payout_address, AppLanguage,
-        DesktopPreferences, ProviderConfig, Theme,
+        load_config_from, load_config_with_recovery_from, save_config_to, select_ollama_model,
+        set_desktop_preferences_at, set_ollama_model_at, set_payout_address_at,
+        set_performance_percent_at, set_resource_settings_at, validate_ollama_model,
+        validate_payout_address, AppLanguage, DesktopPreferences, ProviderConfig, Theme,
     };
     use crate::resource::{ResourceMode, ResourceSchedule, ResourceSettings};
 
@@ -513,6 +556,45 @@ mod tests {
     }
 
     #[test]
+    fn existing_performance_values_load_without_rewriting() {
+        let path = test_config_path();
+        for value in [10, 100] {
+            let mut config = ProviderConfig::defaults();
+            config.resource_settings.performance_percent = value;
+            save_config_to(&config, &path).unwrap();
+            let original = fs::read(&path).unwrap();
+            let loaded = load_config_from(&path).unwrap().unwrap();
+            assert_eq!(loaded.resource_settings.performance_percent, value);
+            assert_eq!(fs::read(&path).unwrap(), original);
+        }
+        remove_test_config(&path);
+    }
+
+    #[test]
+    fn malformed_config_falls_back_and_keeps_a_bad_backup() {
+        let path = test_config_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let malformed = b"{this is not valid json";
+        fs::write(&path, malformed).unwrap();
+        let mut logged = String::new();
+
+        let loaded = load_config_with_recovery_from(&path, |message| {
+            logged = message.to_string();
+        })
+        .unwrap();
+
+        assert!(loaded.config.is_none());
+        assert!(loaded.recovered_unreadable);
+        assert_eq!(fs::read(&path).unwrap(), malformed);
+        assert_eq!(
+            fs::read(path.with_file_name("config.json.bad")).unwrap(),
+            malformed
+        );
+        assert!(logged.contains("failed to parse config"));
+        remove_test_config(&path);
+    }
+
+    #[test]
     fn desktop_preferences_round_trip_and_default_normally() {
         let path = test_config_path();
         let preferences = DesktopPreferences {
@@ -566,11 +648,32 @@ mod tests {
         save_config_to(&config, &path).unwrap();
         let original = fs::read(&path).unwrap();
 
-        assert!(set_performance_percent_at(9, &path).is_err());
-        assert_eq!(fs::read(&path).unwrap(), original);
-        let updated = set_performance_percent_at(75, &path).unwrap();
-        assert_eq!(updated.resource_settings.performance_percent, 75);
+        for invalid in [-1, 101, 255] {
+            assert!(set_performance_percent_at(invalid, &path).is_err());
+            assert_eq!(fs::read(&path).unwrap(), original);
+        }
+        for valid in [0, 1, 100] {
+            let updated = set_performance_percent_at(valid, &path).unwrap();
+            assert_eq!(updated.resource_settings.performance_percent, valid as u8);
+        }
+        let updated = load_config_from(&path).unwrap().unwrap();
+        assert_eq!(updated.resource_settings.performance_percent, 100);
         assert_eq!(updated.resource_settings.mode, ResourceMode::ScheduledHours);
+        remove_test_config(&path);
+    }
+
+    #[test]
+    fn out_of_range_config_performance_is_rejected_without_rewriting() {
+        let path = test_config_path();
+        for value in [-1, 101] {
+            let mut json = serde_json::to_value(ProviderConfig::defaults()).unwrap();
+            json["resource_settings"]["performance_percent"] = serde_json::json!(value);
+            let bytes = serde_json::to_vec(&json).unwrap();
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, &bytes).unwrap();
+            assert!(load_config_from(&path).is_err());
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
         remove_test_config(&path);
     }
 

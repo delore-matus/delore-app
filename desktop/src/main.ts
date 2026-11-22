@@ -11,6 +11,7 @@ type UiErrorCategory =
   | 'not_enough_disk_space'
   | 'unsupported_system'
   | 'invalid_setting'
+  | 'settings_unreadable'
   | 'setup_failed'
 
 interface UiError {
@@ -159,13 +160,14 @@ root.innerHTML = `
               </div>
               <output class="state-chip" id="performance-value">50%</output>
             </div>
-            <label class="slider-label" for="performance-slider">
+            <label class="slider-label" for="performance-slider">Performance</label>
+            <input id="performance-slider" type="range" min="0" max="100" step="1" value="50" />
+            <div class="slider-limits"><span>0%</span><span>100%</span></div>
+            <p class="muted" id="performance-status">
               Approximate limit on how hard DeLore works your GPU.
-            </label>
-            <input id="performance-slider" type="range" min="10" max="100" step="1" value="50" />
-            <div class="slider-limits"><span>10%</span><span>100%</span></div>
+            </p>
             <p class="muted" id="performance-detail">
-              Approximate limit only; not a hard GPU cap. Where supported, this also adjusts GPU layer use.
+              This is an approximate limit, never a hard GPU cap. Pause always overrides the slider.
             </p>
           </section>
 
@@ -361,6 +363,10 @@ function renderStatus(): void {
   $('performance-value').textContent = `${status.performance_percent}%`
   const slider = $<HTMLInputElement>('performance-slider')
   if (document.activeElement !== slider) slider.value = String(status.performance_percent)
+  $('performance-status').textContent =
+    status.performance_percent === 0
+      ? 'DeLore is not taking any work.'
+      : 'Approximate limit on how hard DeLore works your GPU.'
   $('suitability-note').textContent =
     status.hardware_support.status === 'not_recommended'
       ? status.hardware_confirmed
@@ -578,6 +584,7 @@ const uiErrorCategories = new Set<UiErrorCategory>([
   'not_enough_disk_space',
   'unsupported_system',
   'invalid_setting',
+  'settings_unreadable',
   'setup_failed',
 ])
 

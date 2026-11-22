@@ -10,9 +10,9 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use crate::{
     confirm_not_recommended_runtime, decide_current_policy, detect_gpu, duty_cycle_pause_ms,
     effective_ollama_model, ensure_provider_confirmation, run_ollama_with_settings,
-    runtime_suitability, NativeSystemProbe, PolicyDecision, ProviderConfig, ResourceMetrics,
-    ResourceMonitor, ResourceSettings, RunningRuntime, RuntimeManager, RuntimeProgressCallback,
-    RuntimeState, RuntimeSuitability, SystemProbe,
+    runtime_suitability, DutyCyclePause, NativeSystemProbe, PolicyDecision, ProviderConfig,
+    ResourceMetrics, ResourceMonitor, ResourceSettings, RunningRuntime, RuntimeManager,
+    RuntimeProgressCallback, RuntimeState, RuntimeSuitability, SystemProbe,
 };
 
 #[derive(Debug, Clone)]
@@ -574,13 +574,14 @@ async fn run_provider_connection(
                         event_callback(ProviderEvent::JobStarted {
                             job_id: job.id.clone(),
                         });
+                        let inference_settings = resource_settings.clone();
                         let inference = run_ollama_with_settings(
                             runtime.api_url(),
                             &job.id,
                             &provider_id,
                             &model,
                             &job.prompt,
-                            &resource_settings,
+                            &inference_settings,
                         );
                         tokio::pin!(inference);
                         let result = loop {
@@ -622,6 +623,16 @@ async fn run_provider_connection(
                                 }
                             }
                         };
+                        if settings_channel_open {
+                            match settings_rx.has_changed() {
+                                Ok(true) => {
+                                    resource_settings = settings_rx.borrow_and_update().clone();
+                                    resource_settings.validate()?;
+                                }
+                                Ok(false) => {}
+                                Err(_) => settings_channel_open = false,
+                            }
+                        }
 
                         let result: JobResult = match result {
                             Ok(result) => result,
@@ -645,13 +656,17 @@ async fn run_provider_connection(
                             event_callback,
                         )
                         .await?;
-                        let cooldown_ms = if options.stop_after_job {
-                            0
+                        let cooldown = if options.stop_after_job {
+                            DutyCyclePause::PauseMs(0)
                         } else {
                             duty_cycle_pause_ms(
                                 result.duration_ms,
-                                resource_settings.performance_percent,
+                                i16::from(resource_settings.performance_percent),
                             )?
+                        };
+                        let cooldown_ms = match cooldown {
+                            DutyCyclePause::NoWork => 0,
+                            DutyCyclePause::PauseMs(pause_ms) => pause_ms,
                         };
                         if cooldown_ms > 0 && matches!(&policy_decision, PolicyDecision::Run) {
                             let decision = PolicyDecision::Paused(

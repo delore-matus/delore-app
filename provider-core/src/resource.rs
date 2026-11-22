@@ -78,8 +78,8 @@ impl ResourceSettings {
         if !(1..=60).contains(&self.idle_threshold_minutes) {
             bail!("idle_threshold_minutes must be between 1 and 60");
         }
-        if !(10..=100).contains(&self.performance_percent) {
-            bail!("performance_percent must be between 10 and 100");
+        if !(0..=100).contains(&self.performance_percent) {
+            bail!("performance_percent must be between 0 and 100");
         }
         if let Some(schedule) = &self.schedule {
             validate_schedule(schedule)?;
@@ -105,13 +105,27 @@ impl ResourceSettings {
     }
 }
 
-pub fn duty_cycle_pause_ms(job_duration_ms: u128, performance_percent: u8) -> Result<u64> {
-    if !(10..=100).contains(&performance_percent) {
-        bail!("performance_percent must be between 10 and 100");
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DutyCyclePause {
+    NoWork,
+    PauseMs(u64),
+}
+
+pub fn duty_cycle_pause_ms(
+    job_duration_ms: u128,
+    performance_percent: i16,
+) -> Result<DutyCyclePause> {
+    if !(0..=100).contains(&performance_percent) {
+        bail!("performance_percent must be between 0 and 100");
     }
-    let pause_ms = job_duration_ms.saturating_mul(u128::from(100 - performance_percent))
-        / u128::from(performance_percent);
-    u64::try_from(pause_ms).map_err(|_| anyhow::anyhow!("performance pause duration overflowed"))
+    if performance_percent == 0 {
+        return Ok(DutyCyclePause::NoWork);
+    }
+    let percent = u128::try_from(performance_percent)?;
+    let pause_ms = job_duration_ms.saturating_mul(100 - percent) / percent;
+    // Cap the cooldown at 30 minutes so an unusually long job cannot strand the provider.
+    let pause_ms = pause_ms.min(30 * 60 * 1000);
+    Ok(DutyCyclePause::PauseMs(u64::try_from(pause_ms)?))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -179,6 +193,7 @@ pub struct PolicyInput {
     pub mode: ResourceMode,
     pub idle_threshold: Duration,
     pub do_not_run_on_battery: bool,
+    pub performance_percent: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -191,6 +206,9 @@ pub enum PolicyDecision {
 pub fn decide_policy(input: PolicyInput) -> PolicyDecision {
     if input.user_paused {
         return PolicyDecision::Paused("Paused by user".to_string());
+    }
+    if input.performance_percent == 0 {
+        return PolicyDecision::Paused("Performance is set to 0%, no work is accepted".to_string());
     }
     if input.do_not_run_on_battery {
         match input.power {
@@ -253,6 +271,7 @@ pub fn decide_current_policy(
         mode: settings.mode,
         idle_threshold: Duration::from_secs(u64::from(settings.idle_threshold_minutes) * 60),
         do_not_run_on_battery: settings.do_not_run_on_battery,
+        performance_percent: settings.performance_percent,
     })
 }
 
@@ -331,8 +350,9 @@ mod tests {
     use chrono_tz::America::New_York;
 
     use super::{
-        decide_policy, duty_cycle_pause_ms, is_within_schedule, IdleState, PolicyDecision,
-        PolicyInput, PowerState, ResourceMode, ResourcePreset, ResourceSchedule, ResourceSettings,
+        decide_policy, duty_cycle_pause_ms, is_within_schedule, DutyCyclePause, IdleState,
+        PolicyDecision, PolicyInput, PowerState, ResourceMode, ResourcePreset, ResourceSchedule,
+        ResourceSettings,
     };
 
     fn input(mode: ResourceMode) -> PolicyInput {
@@ -344,6 +364,7 @@ mod tests {
             mode,
             idle_threshold: Duration::from_secs(60),
             do_not_run_on_battery: true,
+            performance_percent: 50,
         }
     }
 
@@ -362,7 +383,7 @@ mod tests {
 
     #[test]
     fn validates_performance_slider_bounds() {
-        for value in [10, 50, 100] {
+        for value in [0, 1, 50, 100] {
             assert!(ResourceSettings {
                 performance_percent: value,
                 ..ResourceSettings::default()
@@ -370,7 +391,7 @@ mod tests {
             .validate()
             .is_ok());
         }
-        for value in [0, 9, 101, u8::MAX] {
+        for value in [101, u8::MAX] {
             assert!(ResourceSettings {
                 performance_percent: value,
                 ..ResourceSettings::default()
@@ -382,11 +403,33 @@ mod tests {
 
     #[test]
     fn duty_cycle_scales_the_post_job_pause() {
-        assert_eq!(duty_cycle_pause_ms(10_000, 50).unwrap(), 10_000);
-        assert_eq!(duty_cycle_pause_ms(10_000, 100).unwrap(), 0);
-        assert_eq!(duty_cycle_pause_ms(10_000, 10).unwrap(), 90_000);
-        assert!(duty_cycle_pause_ms(10_000, 9).is_err());
+        assert_eq!(
+            duty_cycle_pause_ms(10_000, 0).unwrap(),
+            DutyCyclePause::NoWork
+        );
+        assert_eq!(
+            duty_cycle_pause_ms(10_000, 1).unwrap(),
+            DutyCyclePause::PauseMs(990_000)
+        );
+        assert_eq!(
+            duty_cycle_pause_ms(10_000, 50).unwrap(),
+            DutyCyclePause::PauseMs(10_000)
+        );
+        assert_eq!(
+            duty_cycle_pause_ms(10_000, 99).unwrap(),
+            DutyCyclePause::PauseMs(101)
+        );
+        assert_eq!(
+            duty_cycle_pause_ms(10_000, 100).unwrap(),
+            DutyCyclePause::PauseMs(0)
+        );
+        assert_eq!(
+            duty_cycle_pause_ms(60_000, 1).unwrap(),
+            DutyCyclePause::PauseMs(30 * 60 * 1000)
+        );
+        assert!(duty_cycle_pause_ms(10_000, -1).is_err());
         assert!(duty_cycle_pause_ms(10_000, 101).is_err());
+        assert!(duty_cycle_pause_ms(10_000, 255).is_err());
     }
 
     #[test]
@@ -436,9 +479,17 @@ mod tests {
     fn pause_and_battery_rules_take_precedence() {
         let mut paused = input(ResourceMode::AlwaysOnLowPriority);
         paused.user_paused = true;
+        paused.performance_percent = 0;
         assert_eq!(
             decide_policy(paused),
             PolicyDecision::Paused("Paused by user".to_string())
+        );
+
+        let mut no_work = input(ResourceMode::AlwaysOnLowPriority);
+        no_work.performance_percent = 0;
+        assert_eq!(
+            decide_policy(no_work),
+            PolicyDecision::Paused("Performance is set to 0%, no work is accepted".to_string())
         );
 
         let mut on_battery = input(ResourceMode::AlwaysOnLowPriority);

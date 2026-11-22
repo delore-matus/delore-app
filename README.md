@@ -22,6 +22,16 @@ The desktop UI does not shell out to `gpuswarm`. Both the app and CLI use
 `provider-core` for provider control, configuration, the managed process, and
 job execution.
 
+### Performance slider
+
+The Performance slider now ranges from 0% to 100%, with a default of 50%.
+At 0%, the provider finishes any current job, then stops accepting work. From
+1% to 100%, the slider is an approximate workload limit, not a hard GPU cap:
+after each job it pauses for `job_duration × (100 / percentage - 1)`, capped at
+30 minutes. At 100% there is no duty-cycle pause. The Pause button always takes
+precedence over the slider; increasing the slider does not override a manual
+pause.
+
 ## Configuration
 
 | Variable | Default | Used by |
