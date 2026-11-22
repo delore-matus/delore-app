@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { isValidPerformancePercent } from './performance.ts'
-import { providerDisplayState } from './provider-state.ts'
+import { coordinatorDisplayState, providerDisplayState } from './provider-state.ts'
 import './style.css'
 
 type Theme = 'dark' | 'light' | 'system'
@@ -320,12 +320,11 @@ function renderStatus(): void {
   const status = snapshot
   const prefs = status.desktop_preferences
   applyTheme(prefs.theme)
+  const coordinatorState = coordinatorDisplayState(status.connection)
   const connected = status.connection === 'connected'
   $('connection').classList.toggle('is-connected', connected)
-  $('connection-label').textContent = connected
-    ? 'Coordinator connected'
-    : status.connection === 'connecting' ? 'Connecting to coordinator' : 'Coordinator disconnected'
-  $('coordinator-state').textContent = connected ? 'Connected' : 'Disconnected'
+  $('connection-label').textContent = coordinatorState.label
+  $('coordinator-state').textContent = coordinatorState.status
 
   $('gpu-name').textContent = status.gpu.gpu_name
   $('gpu-support').textContent = supportDescription(status.gpu.support)
@@ -344,6 +343,7 @@ function renderStatus(): void {
   providerState.className = 'state-chip'
   const displayState = providerDisplayState({
     running: status.provider_running,
+    connection: status.connection,
     confirmationRequired:
       status.hardware_support.status === 'not_recommended' && !status.hardware_confirmed,
     jobId: job.state === 'running' ? job.job_id : null,

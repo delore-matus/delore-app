@@ -1,5 +1,6 @@
 export interface ProviderDisplayInput {
   running: boolean
+  connection: 'connecting' | 'connected' | 'disconnected'
   confirmationRequired: boolean
   jobId: string | null
   policyReason: string
@@ -11,6 +12,24 @@ export interface ProviderDisplayState {
   detail: string
 }
 
+export interface CoordinatorDisplayState {
+  label: string
+  status: string
+}
+
+export function coordinatorDisplayState(
+  connection: 'connecting' | 'connected' | 'disconnected',
+): CoordinatorDisplayState {
+  switch (connection) {
+    case 'connected':
+      return { label: 'Coordinator connected', status: 'Connected' }
+    case 'connecting':
+      return { label: 'Connecting to coordinator', status: 'Connecting' }
+    case 'disconnected':
+      return { label: 'Coordinator unreachable', status: 'Coordinator unreachable' }
+  }
+}
+
 export function providerDisplayState(input: ProviderDisplayInput): ProviderDisplayState {
   if (!input.running && input.confirmationRequired) {
     return {
@@ -20,6 +39,15 @@ export function providerDisplayState(input: ProviderDisplayInput): ProviderDispl
   }
   if (!input.running) {
     return { label: 'Offline', detail: 'Start DeLore to accept work.' }
+  }
+  if (input.connection === 'connecting') {
+    return { label: 'Connecting', detail: 'Waiting for the coordinator.' }
+  }
+  if (input.connection === 'disconnected') {
+    return {
+      label: 'Coordinator unreachable',
+      detail: 'Waiting to reconnect to the coordinator.',
+    }
   }
   if (input.jobId !== null) {
     return { label: 'Running a job', detail: `Job ${input.jobId} is in progress.` }

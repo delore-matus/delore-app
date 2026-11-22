@@ -1,4 +1,8 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::VecDeque,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result};
 use common::{FeeConfig, JobPayload, JobResult, ProviderRegistration, WsMessage};
@@ -130,6 +134,7 @@ struct ProviderConnectionContext<'a> {
     settings_rx: &'a mut watch::Receiver<ResourceSettings>,
     system_probe: &'a dyn SystemProbe,
     event_callback: &'a ProviderEventCallback,
+    backoff: &'a mut ReconnectBackoff,
 }
 
 pub async fn run_provider(config: ProviderConfig) -> Result<()> {
@@ -323,7 +328,7 @@ async fn run_provider_inner(
             runtime_callback.clone(),
         ) => result?,
     };
-    let resource_settings = settings_rx.borrow_and_update().clone();
+    let mut resource_settings = settings_rx.borrow_and_update().clone();
     crate::technical_log!(
         "Managed Ollama runtime listening on 127.0.0.1:{}",
         runtime.port()
@@ -344,21 +349,45 @@ async fn run_provider_inner(
         if *stop_rx.borrow() {
             return Ok(());
         }
-        run_provider_connection(
-            config,
-            model,
-            ProviderConnectionContext {
-                runtime: &runtime,
-                options,
-                stop_rx: &mut stop_rx,
-                pause_rx: &mut pause_rx,
-                resource_settings,
-                settings_rx: &mut settings_rx,
-                system_probe: system_probe.as_ref(),
-                event_callback: &event_callback,
-            },
-        )
-        .await
+        let mut backoff = ReconnectBackoff::default();
+        loop {
+            resource_settings = settings_rx.borrow_and_update().clone();
+            resource_settings.validate()?;
+            run_provider_connection(
+                config.clone(),
+                model.clone(),
+                ProviderConnectionContext {
+                    runtime: &runtime,
+                    options,
+                    stop_rx: &mut stop_rx,
+                    pause_rx: &mut pause_rx,
+                    resource_settings: resource_settings.clone(),
+                    settings_rx: &mut settings_rx,
+                    system_probe: system_probe.as_ref(),
+                    event_callback: &event_callback,
+                    backoff: &mut backoff,
+                },
+            )
+            .await?;
+
+            if options.stop_after_job || options.use_cli_environment_overrides {
+                return Ok(());
+            }
+            if *stop_rx.borrow() {
+                return Ok(());
+            }
+
+            let delay = backoff.next_delay();
+            crate::technical_log!(
+                "Retrying coordinator connection in {} ms",
+                delay.as_millis()
+            );
+            tokio::select! {
+                biased;
+                _ = wait_for_stop(&mut stop_rx) => return Ok(()),
+                _ = tokio::time::sleep(delay) => {}
+            }
+        }
     }
     .await;
 
@@ -396,6 +425,7 @@ async fn run_provider_connection(
         mut resource_settings,
         system_probe,
         event_callback,
+        backoff,
     } = context;
     let coordinator_url = if options.use_cli_environment_overrides {
         std::env::var("COORDINATOR_WS").unwrap_or(config.coordinator_ws.clone())
@@ -439,6 +469,7 @@ async fn run_provider_connection(
         !options.use_cli_environment_overrides,
         stop_rx,
         event_callback,
+        backoff,
     )
     .await?
     else {
@@ -455,14 +486,18 @@ async fn run_provider_connection(
         model: model.clone(),
         accepting_jobs,
     });
-    sender
-        .send(Message::Text(
-            serde_json::to_string(&registration).context("failed to serialize registration")?,
-        ))
-        .await
-        .context("failed to send provider registration")?;
+    let registration = Message::Text(
+        serde_json::to_string(&registration).context("failed to serialize registration")?,
+    );
+    if let Err(error) = sender.send(registration).await {
+        let message = format!("Coordinator connection was lost: {error}");
+        crate::technical_log!("{message}");
+        emit_connection(event_callback, ConnectionState::Disconnected, Some(message));
+        return Ok(());
+    }
 
     let mut deferred_job: Option<JobPayload> = None;
+    let mut pending_messages = VecDeque::new();
     let mut policy_refresh = tokio::time::interval(Duration::from_secs(2));
     let mut resource_monitor = ResourceMonitor::default();
     let mut pause_control_open = true;
@@ -473,7 +508,9 @@ async fn run_provider_connection(
         } else {
             None
         };
-        let message = if let Some(job) = deferred {
+        let message = if let Some(message) = pending_messages.pop_front() {
+            message
+        } else if let Some(job) = deferred {
             Message::Text(
                 serde_json::to_string(&WsMessage::Job(job))
                     .context("failed to serialize deferred provider job")?,
@@ -490,7 +527,7 @@ async fn run_provider_connection(
                     break;
                 }
                 _ = policy_refresh.tick() => {
-                    refresh_policy(
+                    if !refresh_policy(
                         &resource_settings,
                         pause_rx,
                         system_probe,
@@ -498,7 +535,10 @@ async fn run_provider_connection(
                         &mut sender,
                         event_callback,
                     )
-                    .await?;
+                    .await?
+                    {
+                        break 'connection;
+                    }
                     event_callback(ProviderEvent::ResourceMonitor {
                         metrics: resource_monitor.sample(runtime.process_id()),
                     });
@@ -506,7 +546,7 @@ async fn run_provider_connection(
                 }
                 changed = pause_rx.changed(), if pause_control_open => {
                     if changed.is_ok() {
-                        refresh_policy(
+                        if !refresh_policy(
                             &resource_settings,
                             pause_rx,
                             system_probe,
@@ -514,7 +554,10 @@ async fn run_provider_connection(
                             &mut sender,
                             event_callback,
                         )
-                        .await?;
+                        .await?
+                        {
+                            break 'connection;
+                        }
                     } else {
                         pause_control_open = false;
                     }
@@ -524,7 +567,7 @@ async fn run_provider_connection(
                     if changed.is_ok() {
                         resource_settings = settings_rx.borrow_and_update().clone();
                         resource_settings.validate()?;
-                        refresh_policy(
+                        if !refresh_policy(
                             &resource_settings,
                             pause_rx,
                             system_probe,
@@ -532,7 +575,10 @@ async fn run_provider_connection(
                             &mut sender,
                             event_callback,
                         )
-                        .await?;
+                        .await?
+                        {
+                            break 'connection;
+                        }
                     } else {
                         settings_channel_open = false;
                     }
@@ -540,8 +586,26 @@ async fn run_provider_connection(
                 }
                 message = receiver.next() => {
                     match message {
-                        Some(message) => message.context("failed to read WebSocket message")?,
-                        None => break,
+                        Some(Ok(message)) => message,
+                        Some(Err(error)) => {
+                            let message = format!("Coordinator connection was lost: {error}");
+                            crate::technical_log!("{message}");
+                            emit_connection(
+                                event_callback,
+                                ConnectionState::Disconnected,
+                                Some(message),
+                            );
+                            break 'connection;
+                        }
+                        None => {
+                            crate::technical_log!("Coordinator closed the WebSocket connection");
+                            emit_connection(
+                                event_callback,
+                                ConnectionState::Disconnected,
+                                None,
+                            );
+                            break 'connection;
+                        }
                     }
                 }
             }
@@ -553,7 +617,7 @@ async fn run_provider_connection(
                     serde_json::from_str(&json).context("coordinator sent invalid JSON")?;
                 match message {
                     WsMessage::Job(job) => {
-                        refresh_policy(
+                        if !refresh_policy(
                             &resource_settings,
                             pause_rx,
                             system_probe,
@@ -561,7 +625,10 @@ async fn run_provider_connection(
                             &mut sender,
                             event_callback,
                         )
-                        .await?;
+                        .await?
+                        {
+                            break 'connection;
+                        }
                         if !matches!(&policy_decision, PolicyDecision::Run) {
                             crate::technical_log!(
                                 "Coordinator sent job {} while provider is paused; holding it until resume",
@@ -592,8 +659,70 @@ async fn run_provider_connection(
                                     break 'connection;
                                 }
                                 result = &mut inference => break result,
+                                message = receiver.next() => {
+                                    match message {
+                                        Some(Ok(Message::Ping(payload))) => {
+                                            if let Err(error) = sender.send(Message::Pong(payload)).await {
+                                                let message = format!("Coordinator connection was lost: {error}");
+                                                crate::technical_log!("{message}");
+                                                emit_connection(
+                                                    event_callback,
+                                                    ConnectionState::Disconnected,
+                                                    Some(message),
+                                                );
+                                                break 'connection;
+                                            }
+                                        }
+                                        Some(Ok(Message::Pong(_))) => {}
+                                        Some(Ok(Message::Close(frame))) => {
+                                            let message = frame.map(|frame| {
+                                                format!(
+                                                    "Coordinator disconnected: code={} reason={}",
+                                                    frame.code, frame.reason
+                                                )
+                                            });
+                                            crate::technical_log!(
+                                                "Coordinator disconnected during job {}; discarding its result",
+                                                job.id
+                                            );
+                                            emit_connection(
+                                                event_callback,
+                                                ConnectionState::Disconnected,
+                                                message,
+                                            );
+                                            break 'connection;
+                                        }
+                                        Some(Ok(message)) => pending_messages.push_back(message),
+                                        Some(Err(error)) => {
+                                            let message =
+                                                format!("Coordinator connection was lost: {error}");
+                                            crate::technical_log!(
+                                                "Coordinator disconnected during job {}; discarding its result: {message}",
+                                                job.id
+                                            );
+                                            emit_connection(
+                                                event_callback,
+                                                ConnectionState::Disconnected,
+                                                Some(message),
+                                            );
+                                            break 'connection;
+                                        }
+                                        None => {
+                                            crate::technical_log!(
+                                                "Coordinator disconnected during job {}; discarding its result",
+                                                job.id
+                                            );
+                                            emit_connection(
+                                                event_callback,
+                                                ConnectionState::Disconnected,
+                                                None,
+                                            );
+                                            break 'connection;
+                                        }
+                                    }
+                                }
                                 _ = policy_refresh.tick() => {
-                                    refresh_policy(
+                                    if !refresh_policy(
                                         &resource_settings,
                                         pause_rx,
                                         system_probe,
@@ -601,14 +730,21 @@ async fn run_provider_connection(
                                         &mut sender,
                                         event_callback,
                                     )
-                                    .await?;
+                                    .await?
+                                    {
+                                        crate::technical_log!(
+                                            "Coordinator disconnected during job {}; discarding its result",
+                                            job.id
+                                        );
+                                        break 'connection;
+                                    }
                                     event_callback(ProviderEvent::ResourceMonitor {
                                         metrics: resource_monitor.sample(runtime.process_id()),
                                     });
                                 }
                                 changed = pause_rx.changed(), if pause_control_open => {
                                     if changed.is_ok() {
-                                        refresh_policy(
+                                        if !refresh_policy(
                                             &resource_settings,
                                             pause_rx,
                                             system_probe,
@@ -616,7 +752,14 @@ async fn run_provider_connection(
                                             &mut sender,
                                             event_callback,
                                         )
-                                        .await?;
+                                        .await?
+                                        {
+                                            crate::technical_log!(
+                                                "Coordinator disconnected during job {}; discarding its result",
+                                                job.id
+                                            );
+                                            break 'connection;
+                                        }
                                     } else {
                                         pause_control_open = false;
                                     }
@@ -647,7 +790,7 @@ async fn run_provider_connection(
                             },
                         };
 
-                        refresh_policy(
+                        if !refresh_policy(
                             &resource_settings,
                             pause_rx,
                             system_probe,
@@ -655,7 +798,10 @@ async fn run_provider_connection(
                             &mut sender,
                             event_callback,
                         )
-                        .await?;
+                        .await?
+                        {
+                            break 'connection;
+                        }
                         let cooldown = if options.stop_after_job {
                             DutyCyclePause::PauseMs(0)
                         } else {
@@ -672,15 +818,22 @@ async fn run_provider_connection(
                             let decision = PolicyDecision::Paused(
                                 "Taking a short break to limit GPU workload".to_string(),
                             );
-                            sender
-                                .send(Message::Text(
-                                    serde_json::to_string(&WsMessage::Availability {
-                                        accepting_jobs: false,
-                                    })
-                                    .context("failed to serialize provider availability")?,
-                                ))
-                                .await
-                                .context("failed to pause job assignment during cooldown")?;
+                            let availability = Message::Text(
+                                serde_json::to_string(&WsMessage::Availability {
+                                    accepting_jobs: false,
+                                })
+                                .context("failed to serialize provider availability")?,
+                            );
+                            if let Err(error) = sender.send(availability).await {
+                                let message = format!("Coordinator connection was lost: {error}");
+                                crate::technical_log!("{message}");
+                                emit_connection(
+                                    event_callback,
+                                    ConnectionState::Disconnected,
+                                    Some(message),
+                                );
+                                break 'connection;
+                            }
                             event_callback(ProviderEvent::Policy {
                                 decision: decision.clone(),
                                 diagnostic: None,
@@ -689,10 +842,19 @@ async fn run_provider_connection(
                         }
                         let result_json = serde_json::to_string(&WsMessage::Result(result.clone()))
                             .context("failed to serialize job result")?;
-                        sender
-                            .send(Message::Text(result_json))
-                            .await
-                            .context("failed to send job result")?;
+                        if let Err(error) = sender.send(Message::Text(result_json)).await {
+                            let message = format!("Coordinator connection was lost: {error}");
+                            crate::technical_log!(
+                                "Discarding job {} result after send failure: {message}",
+                                job.id
+                            );
+                            emit_connection(
+                                event_callback,
+                                ConnectionState::Disconnected,
+                                Some(message),
+                            );
+                            break 'connection;
+                        }
                         event_callback(ProviderEvent::JobFinished {
                             result: result.clone(),
                         });
@@ -722,7 +884,7 @@ async fn run_provider_connection(
                                 _ = tokio::time::sleep(Duration::from_millis(cooldown_ms)) => {}
                             }
                             crate::technical_log!("Performance cooldown end: job_id={}", job.id);
-                            refresh_policy(
+                            if !refresh_policy(
                                 &resource_settings,
                                 pause_rx,
                                 system_probe,
@@ -730,7 +892,10 @@ async fn run_provider_connection(
                                 &mut sender,
                                 event_callback,
                             )
-                            .await?;
+                            .await?
+                            {
+                                break 'connection;
+                            }
                         }
                         if options.stop_after_job {
                             crate::technical_log!("One-job mode complete; stopping provider.");
@@ -768,10 +933,12 @@ async fn run_provider_connection(
                 crate::technical_log!("Ignoring unexpected binary message")
             }
             Message::Ping(payload) => {
-                sender
-                    .send(Message::Pong(payload))
-                    .await
-                    .context("failed to send Pong")?;
+                if let Err(error) = sender.send(Message::Pong(payload)).await {
+                    let message = format!("Coordinator connection was lost: {error}");
+                    crate::technical_log!("{message}");
+                    emit_connection(event_callback, ConnectionState::Disconnected, Some(message));
+                    break 'connection;
+                }
             }
             Message::Pong(_) => {}
             Message::Close(frame) => {
@@ -803,22 +970,25 @@ async fn refresh_policy(
     current: &mut PolicyDecision,
     sender: &mut futures_util::stream::SplitSink<CoordinatorSocket, Message>,
     event_callback: &ProviderEventCallback,
-) -> Result<()> {
+) -> Result<bool> {
     let sample = system_probe.sample();
     let next = decide_current_policy(settings, sample.idle, sample.power, *pause_rx.borrow());
     if *current == next {
-        return Ok(());
+        return Ok(true);
     }
 
     let accepting_jobs = matches!(&next, PolicyDecision::Run);
     let availability = WsMessage::Availability { accepting_jobs };
-    sender
-        .send(Message::Text(
-            serde_json::to_string(&availability)
-                .context("failed to serialize provider availability")?,
-        ))
-        .await
-        .context("failed to send provider availability")?;
+    let message = Message::Text(
+        serde_json::to_string(&availability)
+            .context("failed to serialize provider availability")?,
+    );
+    if let Err(error) = sender.send(message).await {
+        let message = format!("Coordinator connection was lost: {error}");
+        crate::technical_log!("{message}");
+        emit_connection(event_callback, ConnectionState::Disconnected, Some(message));
+        return Ok(false);
+    }
     match &next {
         PolicyDecision::Run => crate::technical_log!("Provider policy: Run; accepting jobs"),
         PolicyDecision::Paused(reason) => {
@@ -830,7 +1000,38 @@ async fn refresh_policy(
         diagnostic: sample.diagnostic,
     });
     *current = next;
-    Ok(())
+    Ok(true)
+}
+
+#[derive(Debug, Default)]
+struct ReconnectBackoff {
+    failed_attempts: u32,
+    connected_at: Option<Instant>,
+}
+
+impl ReconnectBackoff {
+    fn mark_connected(&mut self) {
+        self.connected_at = Some(Instant::now());
+    }
+
+    fn next_delay(&mut self) -> Duration {
+        if self
+            .connected_at
+            .take()
+            .is_some_and(|connected_at| connected_at.elapsed() >= Duration::from_secs(30))
+        {
+            self.failed_attempts = 0;
+        }
+
+        let base_seconds = (1_u64 << self.failed_attempts.min(6)).min(60);
+        self.failed_attempts = self.failed_attempts.saturating_add(1).min(6);
+
+        let base_ms = base_seconds * 1_000;
+        let spread_ms = base_ms / 5;
+        let jitter_width = spread_ms * 2 + 1;
+        let jittered_ms = base_ms - spread_ms + rand::random::<u64>() % jitter_width;
+        Duration::from_millis(jittered_ms.clamp(1_000, 60_000))
+    }
 }
 
 async fn connect_with_retry(
@@ -838,6 +1039,7 @@ async fn connect_with_retry(
     retry: bool,
     stop_rx: &mut watch::Receiver<bool>,
     event_callback: &ProviderEventCallback,
+    backoff: &mut ReconnectBackoff,
 ) -> Result<Option<CoordinatorSocket>> {
     loop {
         emit_connection(event_callback, ConnectionState::Connecting, None);
@@ -853,6 +1055,7 @@ async fn connect_with_retry(
         match result {
             Ok((websocket, _response)) => {
                 crate::technical_log!("Provider connected");
+                backoff.mark_connected();
                 emit_connection(event_callback, ConnectionState::Connected, None);
                 return Ok(Some(websocket));
             }
@@ -866,10 +1069,15 @@ async fn connect_with_retry(
                 let message = format!("{error:#}");
                 crate::technical_log!("{message}");
                 emit_connection(event_callback, ConnectionState::Disconnected, Some(message));
+                let delay = backoff.next_delay();
+                crate::technical_log!(
+                    "Retrying coordinator connection in {} ms",
+                    delay.as_millis()
+                );
                 tokio::select! {
                     biased;
                     _ = wait_for_stop(stop_rx) => return Ok(None),
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+                    _ = tokio::time::sleep(delay) => {}
                 }
             }
         }
@@ -907,11 +1115,14 @@ fn emit_failure(callback: &ProviderEventCallback, error: &anyhow::Error) {
 mod tests {
     use super::{
         connect_with_retry, provider_control_channel, run_provider_managed, ConnectionState,
-        ProviderConfig, ProviderEvent, ProviderEventCallback, RuntimeProgressCallback,
-        RuntimeState,
+        ProviderConfig, ProviderEvent, ProviderEventCallback, ReconnectBackoff,
+        RuntimeProgressCallback, RuntimeState,
     };
     use crate::{ResourceMode, ResourceSettings};
-    use std::sync::{Arc, Mutex};
+    use std::{
+        sync::{Arc, Mutex},
+        time::{Duration, Instant},
+    };
     use tokio::{net::TcpListener, sync::watch, time::timeout};
     use tokio_tungstenite::accept_async;
 
@@ -977,33 +1188,55 @@ mod tests {
 
     #[tokio::test]
     async fn managed_connection_recovers_when_coordinator_returns() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (first, _) = listener.accept().await.unwrap();
-            drop(first);
-
-            let (second, _) = timeout(std::time::Duration::from_secs(5), listener.accept())
-                .await
-                .unwrap()
-                .unwrap();
-            accept_async(second).await.unwrap();
-        });
+        let reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = reservation.local_addr().unwrap();
+        drop(reservation);
 
         let events = Arc::new(Mutex::new(Vec::new()));
         let observed_events = events.clone();
         let event_callback: ProviderEventCallback =
             Arc::new(move |event| observed_events.lock().unwrap().push(event));
-        let (_stop, mut stop_rx) = watch::channel(false);
-        let socket = connect_with_retry(
-            &format!("ws://{address}/ws"),
-            true,
-            &mut stop_rx,
-            &event_callback,
-        )
+        let url = format!("ws://{address}/ws");
+        let connector = tokio::spawn(async move {
+            let (_stop, mut stop_rx) = watch::channel(false);
+            connect_with_retry(
+                &url,
+                true,
+                &mut stop_rx,
+                &event_callback,
+                &mut ReconnectBackoff::default(),
+            )
+            .await
+        });
+
+        timeout(Duration::from_secs(3), async {
+            loop {
+                if events.lock().unwrap().iter().any(|event| {
+                    matches!(
+                        event,
+                        ProviderEvent::Connection {
+                            state: ConnectionState::Disconnected,
+                            ..
+                        }
+                    )
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
         .await
-        .unwrap()
-        .unwrap();
+        .expect("closed port should produce an initial connection failure");
+
+        let listener = TcpListener::bind(address).await.unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            accept_async(socket).await.unwrap();
+        });
+        let socket = connector.await.unwrap().unwrap().unwrap();
         drop(socket);
         server.await.unwrap();
 
@@ -1032,5 +1265,29 @@ mod tests {
                 message: Some(message),
             } if message.contains("failed to connect to coordinator")
         )));
+    }
+
+    #[test]
+    fn reconnect_backoff_grows_caps_and_resets_after_a_stable_connection() {
+        let mut backoff = ReconnectBackoff::default();
+        let ranges = [
+            (1_000, 1_200),
+            (1_600, 2_400),
+            (3_200, 4_800),
+            (6_400, 9_600),
+            (12_800, 19_200),
+            (25_600, 38_400),
+            (48_000, 60_000),
+            (48_000, 60_000),
+        ];
+
+        for (minimum, maximum) in ranges {
+            let delay_ms = backoff.next_delay().as_millis() as u64;
+            assert!((minimum..=maximum).contains(&delay_ms));
+        }
+
+        backoff.connected_at = Some(Instant::now() - Duration::from_secs(31));
+        let reset_delay_ms = backoff.next_delay().as_millis() as u64;
+        assert!((1_000..=1_200).contains(&reset_delay_ms));
     }
 }

@@ -543,6 +543,11 @@ async fn start_provider(
         update_status(&event_state, &event_app, |snapshot| match event {
             ProviderEvent::Connection { state, message } => {
                 let connected = matches!(&state, provider_core::ConnectionState::Connected);
+                if matches!(&state, provider_core::ConnectionState::Disconnected)
+                    && matches!(snapshot.current_job, CurrentJob::Running { .. })
+                {
+                    snapshot.current_job = CurrentJob::Idle;
+                }
                 snapshot.connection = state;
                 if let Some(message) = message {
                     snapshot.error_message = Some(map_error(&message));
@@ -965,6 +970,21 @@ fn main() {
             None,
         ))
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_single_instance::init(
+            |app, _arguments, _working_directory| {
+                if let Some(window) = app.get_webview_window("main") {
+                    if let Err(error) = window
+                        .unminimize()
+                        .and_then(|_| window.show())
+                        .and_then(|_| window.set_focus())
+                    {
+                        log_technical(&format!(
+                            "Could not focus the existing application window: {error}"
+                        ));
+                    }
+                }
+            },
+        ))
         .setup(|app| {
             let open = MenuItem::with_id(app, "open", "Open", true, None::<&str>)?;
             let provider = MenuItem::with_id(app, "provider", "Start / Stop", true, None::<&str>)?;
@@ -978,7 +998,11 @@ fn main() {
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "open" => {
                         if let Some(window) = app.get_webview_window("main") {
-                            if let Err(error) = window.show().and_then(|_| window.set_focus()) {
+                            if let Err(error) = window
+                                .unminimize()
+                                .and_then(|_| window.show())
+                                .and_then(|_| window.set_focus())
+                            {
                                 log_technical(&format!("Could not open the main window: {error}"));
                             }
                         }
