@@ -62,7 +62,15 @@ try {
             provider_id = "test-provider"
             coordinator_ws = "ws://127.0.0.1:8081/ws"
             ollama_model = "llama3.2:1b"
-            resource_settings = [ordered]@{}
+            resource_settings = [ordered]@{
+                mode = "only_when_idle"
+                idle_threshold_minutes = 5
+                schedule = $null
+                preset = "balanced"
+                do_not_run_on_battery = $true
+                not_recommended_confirmed = $true
+                performance_percent = 50
+            }
             desktop_preferences = [ordered]@{}
         }
         $config = $config | ConvertTo-Json -Depth 8 | ConvertFrom-Json
