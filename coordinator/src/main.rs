@@ -127,6 +127,20 @@ fn parse_fee_settings() -> Result<FeeSettings> {
     })
 }
 
+fn configured_port(name: &str, default: u16) -> Result<u16> {
+    let value = std::env::var(name).ok();
+    parse_configured_port(name, value.as_deref(), default)
+}
+
+fn parse_configured_port(name: &str, value: Option<&str>, default: u16) -> Result<u16> {
+    match value {
+        Some(value) => value
+            .parse::<u16>()
+            .with_context(|| format!("{name} must be a port number between 0 and 65535")),
+        None => Ok(default),
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct ProviderInfo {
     provider_id: String,
@@ -805,17 +819,25 @@ async fn main() -> Result<()> {
         .route("/fees", get(get_fees))
         .with_state(state.clone());
 
-    let http_address: SocketAddr = "0.0.0.0:8080".parse()?;
+    let http_port = configured_port("GPUSWARM_HTTP_PORT", 8080)?;
+    let http_address = SocketAddr::from(([0, 0, 0, 0], http_port));
     let http_listener = tokio::net::TcpListener::bind(http_address)
         .await
-        .context("failed to bind coordinator HTTP server to 0.0.0.0:8080")?;
-    let ws_address: SocketAddr = "0.0.0.0:8081".parse()?;
+        .with_context(|| format!("failed to bind coordinator HTTP server to {http_address}"))?;
+    let ws_port = configured_port("GPUSWARM_WS_PORT", 8081)?;
+    let ws_address = SocketAddr::from(([0, 0, 0, 0], ws_port));
     let ws_listener = tokio::net::TcpListener::bind(ws_address)
         .await
-        .context("failed to bind coordinator WebSocket server to 0.0.0.0:8081")?;
+        .with_context(|| format!("failed to bind coordinator WebSocket server to {ws_address}"))?;
 
-    println!("Coordinator listening on http://0.0.0.0:8080/request-job");
-    println!("Coordinator listening on ws://0.0.0.0:8081/ws");
+    println!(
+        "Coordinator listening on http://{}/request-job",
+        http_listener.local_addr()?
+    );
+    println!(
+        "Coordinator listening on ws://{}/ws",
+        ws_listener.local_addr()?
+    );
     let dispatcher_state = state.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(100));
@@ -854,8 +876,8 @@ async fn main() -> Result<()> {
 mod tests {
     use super::{
         apply_completed_job_result, assign_pending_job, calculate_fee,
-        fail_running_jobs_for_provider, validate_fee_address, AppState, FeeSettings, JobPayload,
-        JobRecord, JobResult, ProviderInfo,
+        fail_running_jobs_for_provider, parse_configured_port, validate_fee_address, AppState,
+        FeeSettings, JobPayload, JobRecord, JobResult, ProviderInfo,
     };
     use std::{
         collections::{HashMap, VecDeque},
@@ -863,6 +885,18 @@ mod tests {
         time::Duration,
     };
     use tokio::sync::{mpsc, Mutex};
+
+    #[test]
+    fn configured_ports_support_defaults_and_ephemeral_ports() {
+        assert_eq!(parse_configured_port("PORT", None, 8080).unwrap(), 8080);
+        assert_eq!(parse_configured_port("PORT", Some("0"), 8080).unwrap(), 0);
+        assert_eq!(
+            parse_configured_port("PORT", Some("65535"), 8080).unwrap(),
+            65535
+        );
+        assert!(parse_configured_port("PORT", Some("65536"), 8080).is_err());
+        assert!(parse_configured_port("PORT", Some("invalid"), 8080).is_err());
+    }
 
     #[test]
     fn fee_is_zero_at_zero_bps() {
