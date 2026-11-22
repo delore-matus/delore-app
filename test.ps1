@@ -9,15 +9,19 @@ if (-not $env:OLLAMA_MODEL) {
 }
 
 $coordinatorLog = Join-Path $PSScriptRoot "coordinator-test.log"
+$coordinatorErrorLog = Join-Path $PSScriptRoot "coordinator-test.err.log"
 $providerLog = Join-Path $PSScriptRoot "provider-test.log"
+$providerErrorLog = Join-Path $PSScriptRoot "provider-test.err.log"
 Set-Content -Path $coordinatorLog -Value ""
+Set-Content -Path $coordinatorErrorLog -Value ""
 Set-Content -Path $providerLog -Value ""
+Set-Content -Path $providerErrorLog -Value ""
 
 $coordinator = Start-Process -FilePath "cargo" `
     -ArgumentList "run", "-p", "coordinator" `
     -WorkingDirectory $PSScriptRoot `
     -RedirectStandardOutput $coordinatorLog `
-    -RedirectStandardError $coordinatorLog `
+    -RedirectStandardError $coordinatorErrorLog `
     -PassThru
 
 try {
@@ -40,7 +44,7 @@ try {
         -ArgumentList "run", "-p", "provider-daemon" `
         -WorkingDirectory $PSScriptRoot `
         -RedirectStandardOutput $providerLog `
-        -RedirectStandardError $providerLog `
+        -RedirectStandardError $providerErrorLog `
         -PassThru
 
     Write-Output "Waiting for provider registration..."
