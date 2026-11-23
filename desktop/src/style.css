@@ -63,7 +63,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 }
 
 .topbar { padding-bottom: 20px; border-bottom: 1px solid var(--line); }
-.wordmark { color: var(--accent); font-size: 19px; font-weight: 700; letter-spacing: -0.07em; text-decoration: none; }
+.wordmark { display: inline-flex; align-items: center; color: var(--accent); text-decoration: none; }
+.wordmark img { display: block; width: 34px; height: 34px; object-fit: contain; }
 .testnet-badge { padding: 7px 10px; border: 1px solid color-mix(in srgb, var(--accent) 55%, transparent); color: var(--accent); font-size: 11px; }
 .layout { display: grid; grid-template-columns: 150px minmax(0, 1fr); gap: 28px; }
 .navigation { display: flex; flex-direction: column; gap: 6px; padding-top: 37px; }

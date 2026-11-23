@@ -8,6 +8,14 @@ import {
 } from './provider-state.ts'
 import './style.css'
 
+declare global {
+  interface Window {
+    ethereum?: {
+      request(args: { method: string }): Promise<unknown>
+    }
+  }
+}
+
 type Theme = 'dark' | 'light' | 'system'
 type ConnectionState = 'connecting' | 'connected' | 'disconnected'
 type PolicyDecision = { state: 'run' } | { state: 'paused'; reason: string }
@@ -61,6 +69,7 @@ interface StatusSnapshot {
     | { state: 'finished'; job_id: string; succeeded: boolean }
   user_paused: boolean
   payout_address: string | null
+  coordinator_ws: string
   setup_progress_percent: number
   artifact_progress_percent: number
   expected_setup_bytes: number | null
@@ -103,7 +112,7 @@ let settingsError = ''
 root.innerHTML = `
   <main class="shell">
     <header class="topbar">
-      <a class="wordmark" href="#" aria-label="DeLore home">DeLore</a>
+      <a class="wordmark" href="#" aria-label="DeLore home"><img src="/logo.png" alt="DeLore" /></a>
       <span class="testnet-badge">TESTNET — no real payouts</span>
     </header>
 
@@ -266,6 +275,7 @@ root.innerHTML = `
                 <input id="payout-address" name="payout-address" type="text" autocomplete="off"
                   spellcheck="false" placeholder="0x followed by 40 hex characters" />
                 <button class="button button-secondary" id="save-address" type="submit">Save address</button>
+                <button class="button button-secondary" id="connect-wallet" type="button">Connect Wallet</button>
               </div>
               <p class="field-error" id="address-error" role="alert" hidden></p>
               <p class="field-success" id="address-success" role="status" hidden></p>
@@ -294,6 +304,10 @@ root.innerHTML = `
             <p class="eyebrow">ABOUT</p>
             <h2>DeLore</h2>
             <p class="muted">Version 0.1.0</p>
+            <label class="settings-field">
+              <span>Advanced — coordinator address</span>
+              <input id="coordinator-address" type="text" readonly>
+            </label>
             <div class="about-links">
               <a href="#" class="placeholder-link">Terms</a>
               <a href="#" class="placeholder-link">Privacy</a>
@@ -341,6 +355,8 @@ const $ = <T extends HTMLElement>(id: string) => {
 
 function updateStatus(next: StatusSnapshot): void {
   snapshot = next
+  const coordinatorAddress = document.getElementById('coordinator-address') as HTMLInputElement | null
+  if (coordinatorAddress) coordinatorAddress.value = next.coordinator_ws
   renderStatus()
 }
 
@@ -743,6 +759,26 @@ $<HTMLFormElement>('payout-form').addEventListener('submit', async (event) => {
   } finally {
     working = false
     if (snapshot) renderStatus()
+  }
+})
+
+$<HTMLButtonElement>('connect-wallet').addEventListener('click', async () => {
+  try {
+    if (!window.ethereum) {
+      throw new Error('MetaMask or an Ethereum-compatible wallet is required.')
+    }
+    const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' })
+    const address = Array.isArray(accounts) ? accounts[0] : null
+    if (typeof address !== 'string') throw new Error('No wallet address was returned.')
+    $<HTMLInputElement>('payout-address').value = address
+    const next = await invoke<StatusSnapshot>('set_payout_address', { address })
+    updateStatus(next)
+    payoutMessage = 'Wallet address connected.'
+  } catch (error) {
+    payoutError = errorMessage(error)
+  } finally {
+    working = false
+    renderStatus()
   }
 })
 

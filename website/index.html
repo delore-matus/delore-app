@@ -70,7 +70,13 @@
       height: 100%;
       display: flex;
       align-items: center;
-      justify-content: center;
+      justify-content: space-between;
+    }
+
+    .brand-logo {
+      width: 44px;
+      height: 44px;
+      object-fit: contain;
     }
 
     .nav-links {
@@ -115,10 +121,10 @@
 
     .hero-name {
       margin: 0;
-      font-size: clamp(48px, 6vw, 72px);
-      font-weight: 700;
-      line-height: 1;
-      letter-spacing: -0.04em;
+      width: clamp(180px, 32vw, 300px);
+      max-width: 100%;
+      height: auto;
+      object-fit: contain;
     }
 
     .hero-description {
@@ -310,6 +316,7 @@
 <body>
   <header class="nav">
     <div class="nav-inner">
+      <a href="#home" aria-label="DeLore home"><img class="brand-logo" src="/logo.png" alt="DeLore"></a>
       <nav class="nav-links" aria-label="Primary navigation">
         <a href="#home">Home</a>
         <a href="about.html">About</a>
@@ -321,7 +328,7 @@
 
   <main class="page" id="home">
     <section class="hero" aria-labelledby="hero-heading">
-      <h1 class="hero-name" id="hero-heading">DeLore</h1>
+      <img class="hero-name" src="/logo.png" alt="DeLore" id="hero-heading">
       <div class="hero-detail">
         <p class="hero-description">
           DeLore lets people rent out idle GPU capacity to run AI compute jobs for others.
