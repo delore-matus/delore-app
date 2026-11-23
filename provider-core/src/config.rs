@@ -14,6 +14,8 @@ use crate::resource::ResourceSettings;
 pub struct ProviderConfig {
     pub payout_address: Option<String>,
     pub provider_id: String,
+    #[serde(default)]
+    pub auth_token: String,
     pub coordinator_ws: String,
     pub ollama_model: String,
     #[serde(default)]
@@ -82,6 +84,7 @@ impl ProviderConfig {
         Self {
             payout_address: None,
             provider_id: uuid::Uuid::new_v4().to_string(),
+            auth_token: uuid::Uuid::new_v4().to_string(),
             coordinator_ws: "ws://127.0.0.1:8081/ws".to_string(),
             ollama_model: "llama3.2:3b".to_string(),
             resource_settings: ResourceSettings::default(),

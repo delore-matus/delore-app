@@ -44,6 +44,7 @@ async fn managed_provider_runs_a_job_and_stops() {
     let config = ProviderConfig {
         payout_address: Some("0x1111111111111111111111111111111111111111".to_string()),
         provider_id,
+        auth_token: uuid::Uuid::new_v4().to_string(),
         coordinator_ws,
         ollama_model: "llama3.2:1b".to_string(),
         resource_settings: ResourceSettings {

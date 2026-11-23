@@ -11,14 +11,14 @@ use std::{
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        State,
+        ConnectInfo, State,
     },
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json},
@@ -28,10 +28,13 @@ use axum::{
 use common::{FeeConfig as SharedFeeConfig, JobPayload, JobResult, WsMessage};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, watch, Mutex};
 
 mod storage;
 use storage::JobStore;
+
+mod payout;
 
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 type ProviderSenderMap = HashMap<String, (u64, mpsc::UnboundedSender<JobPayload>)>;
@@ -52,6 +55,10 @@ struct AppState {
     provider_senders: Arc<Mutex<ProviderSenderMap>>,
     /// Connected provider details and mock earning counters.
     providers: Arc<Mutex<HashMap<String, ProviderInfo>>>,
+    /// SHA-256 hashes for provider authentication secrets; old providers use no secret.
+    provider_token_hashes: Arc<Mutex<HashMap<String, String>>>,
+    /// Fixed-window request counts keyed by client IP.
+    request_windows: Arc<Mutex<HashMap<String, (Instant, u32)>>>,
     fees: FeeSettings,
     job_timeout_secs: u64,
 }
@@ -208,7 +215,16 @@ fn apply_completed_job_result(
     jobs: &mut HashMap<String, JobRecord>,
     result: &JobResult,
     fees: &FeeSettings,
-) {
+) -> bool {
+    if let Some(existing) = jobs.get(&result.job_id) {
+        if matches!(existing.status.as_str(), "completed" | "failed") {
+            eprintln!(
+                "Ignoring repeated result for terminal job {}",
+                result.job_id
+            );
+            return false;
+        }
+    }
     let (platform_fee, provider_payout) = calculate_fee(fees.job_price_units, fees.fee_bps);
     let record = jobs
         .entry(result.job_id.clone())
@@ -230,6 +246,7 @@ fn apply_completed_job_result(
         platform_fee,
         provider_payout,
     });
+    true
 }
 
 fn fail_running_jobs_for_provider(
@@ -277,19 +294,114 @@ struct AcceptedResponse {
     job_id: String,
 }
 
+fn job_id_is_available(jobs: &HashMap<String, JobRecord>, job_id: &str) -> bool {
+    !jobs.contains_key(job_id)
+}
+
+fn payment_header_status(header: Option<&str>) -> StatusCode {
+    match header {
+        None => StatusCode::PAYMENT_REQUIRED,
+        Some(value) if value.trim().is_empty() => StatusCode::PAYMENT_REQUIRED,
+        Some(value) if value == "mock" || value.starts_with("0x") => StatusCode::OK,
+        Some(_) => StatusCode::UNAUTHORIZED,
+    }
+}
+
+fn check_request_rate_limit(
+    windows: &mut HashMap<String, (Instant, u32)>,
+    ip: &str,
+    now: Instant,
+    limit: u32,
+) -> bool {
+    let window = windows.entry(ip.to_string()).or_insert((now, 0));
+    if now.duration_since(window.0) >= Duration::from_secs(60) {
+        *window = (now, 0);
+    }
+    if window.1 >= limit {
+        return false;
+    }
+    window.1 += 1;
+    true
+}
+
+fn hash_provider_secret(secret: &str) -> String {
+    format!("{:x}", Sha256::digest(secret.as_bytes()))
+}
+
+fn validate_provider_credentials(
+    known: &HashMap<String, String>,
+    provider_id: &str,
+    wallet_address: &str,
+    auth_token: &str,
+) -> bool {
+    if auth_token.is_empty() {
+        return wallet_address == "not-set" || validate_fee_address(Some(wallet_address)).is_ok();
+    }
+    if validate_fee_address(Some(wallet_address)).is_err() {
+        return false;
+    }
+    match known.get(provider_id) {
+        Some(expected) => expected == &hash_provider_secret(auth_token),
+        None => true,
+    }
+}
+
 /// POST /request-job: require X-Payment, then enqueue a valid JobPayload.
 async fn request_job(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(job): Json<JobPayload>,
 ) -> impl IntoResponse {
     // Header presence is intentionally treated as the entire mock payment
     // check. This prototype does not validate currency or perform any payment.
-    if !headers.contains_key("x-payment") {
-        let body = ErrorResponse {
-            error: "Payment required: include X-Payment".to_string(),
-        };
-        return (StatusCode::PAYMENT_REQUIRED, Json(body)).into_response();
+    let payment_status = payment_header_status(
+        headers
+            .get("x-payment")
+            .and_then(|value| value.to_str().ok()),
+    );
+    if payment_status != StatusCode::OK {
+        return (
+            payment_status,
+            Json(ErrorResponse {
+                error: if payment_status == StatusCode::PAYMENT_REQUIRED {
+                    "Payment required: include X-Payment".to_string()
+                } else {
+                    "Payment signature is invalid".to_string()
+                },
+            }),
+        )
+            .into_response();
+    }
+    {
+        let mut windows = state.request_windows.lock().await;
+        if !check_request_rate_limit(
+            &mut windows,
+            &peer.ip().to_string(),
+            Instant::now(),
+            60,
+        ) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(ErrorResponse {
+                    error: "Too many job requests; try again later".to_string(),
+                }),
+            )
+                .into_response();
+        }
+    }
+
+    {
+        let jobs = state.jobs.lock().await;
+        if !job_id_is_available(&jobs, &job.id) {
+            return (
+                StatusCode::CONFLICT,
+                Json(ErrorResponse {
+                    error: "A job with this ID already exists".to_string(),
+                }),
+            )
+                .into_response();
+        }
     }
 
     let record = JobRecord {
@@ -544,25 +656,19 @@ async fn handle_websocket(socket: WebSocket, state: AppState) {
                 return;
             }
         }
-        loop {
-            let job = match tokio::select! {
-                changed = close_rx.changed() => {
-                    let _ = changed;
-                    break;
+        while let Some(job) = tokio::select! {
+            changed = close_rx.changed() => {
+                let _ = changed;
+                None
+            }
+            received = job_rx.recv() => received,
+            _ = keepalive.tick() => {
+                if sender.send(Message::Ping(Vec::new())).await.is_err() {
+                    let _ = send_close_tx.send(true);
                 }
-                received = job_rx.recv() => received,
-                _ = keepalive.tick() => {
-                    if sender.send(Message::Ping(Vec::new())).await.is_err() {
-                        let _ = send_close_tx.send(true);
-                        break;
-                    }
-                    continue;
-                },
-            } {
-                Some(job) => job,
-                None => break,
-            };
-
+                None
+            },
+        } {
             match serde_json::to_string(&WsMessage::Job(job)) {
                 Ok(json) => {
                     if sender.send(Message::Text(json)).await.is_err() {
@@ -601,15 +707,37 @@ async fn handle_websocket(socket: WebSocket, state: AppState) {
                                 calculate_fee(receive_fees.job_price_units, receive_fees.fee_bps);
                             let completed_job = {
                                 let mut jobs = receive_state.jobs.lock().await;
-                                apply_completed_job_result(&mut jobs, &result, &receive_fees);
-                                jobs.get(&result.job_id).cloned()
+                                if apply_completed_job_result(&mut jobs, &result, &receive_fees) {
+                                    jobs.get(&result.job_id).cloned()
+                                } else {
+                                    None
+                                }
                             };
+                            let settlement_applied = completed_job.is_some();
                             if let Some(job) = completed_job {
                                 if let Err(error) = receive_state.job_store.save_job(job).await {
                                     eprintln!(
                                         "Failed to persist completed job {}: {error:#}",
                                         result.job_id
                                     );
+                                }
+                            }
+                            if settlement_applied {
+                                if let Err(error) = receive_state
+                                    .job_store
+                                    .add_pending_payout(
+                                        &result.provider_id,
+                                        receive_providers
+                                            .lock()
+                                            .await
+                                            .get(&result.provider_id)
+                                            .map(|provider| provider.payout_address.as_str())
+                                            .unwrap_or("not-set"),
+                                        provider_payout,
+                                    )
+                                    .await
+                                {
+                                    eprintln!("Failed to persist pending payout: {error:#}");
                                 }
                             }
                             append_line(
@@ -702,6 +830,36 @@ async fn handle_websocket(socket: WebSocket, state: AppState) {
                     }
                     Ok(WsMessage::Register(registration)) => {
                         let provider_id = registration.provider_id.clone();
+                        let credentials_valid = {
+                            let known = receive_state.provider_token_hashes.lock().await;
+                            validate_provider_credentials(
+                                &known,
+                                &provider_id,
+                                &registration.payout_address,
+                                &registration.auth_token,
+                            )
+                        };
+                        if !credentials_valid {
+                            eprintln!(
+                                "Rejected provider registration '{}' because wallet or authentication is invalid",
+                                provider_id
+                            );
+                            continue;
+                        }
+                        if !registration.auth_token.is_empty() {
+                            let mut known = receive_state.provider_token_hashes.lock().await;
+                            known.insert(
+                                provider_id.clone(),
+                                hash_provider_secret(&registration.auth_token),
+                            );
+                        }
+                        if let Err(error) = receive_state
+                            .job_store
+                            .upsert_provider(&provider_id, &registration.payout_address)
+                            .await
+                        {
+                            eprintln!("Failed to persist provider wallet: {error:#}");
+                        }
                         let duplicate_connection = receive_state
                             .provider_senders
                             .lock()
@@ -921,6 +1079,8 @@ async fn main() -> Result<()> {
         job_store,
         provider_senders: Arc::new(Mutex::new(HashMap::new())),
         providers: Arc::new(Mutex::new(HashMap::new())),
+        provider_token_hashes: Arc::new(Mutex::new(HashMap::new())),
+        request_windows: Arc::new(Mutex::new(HashMap::new())),
         fees,
         job_timeout_secs,
     };
@@ -964,7 +1124,10 @@ async fn main() -> Result<()> {
         }
     });
     let http_task = tokio::spawn(async move {
-        axum::serve(http_listener, http_app)
+        axum::serve(
+            http_listener,
+            http_app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
             .await
             .context("coordinator HTTP server stopped unexpectedly")
     });
@@ -994,15 +1157,17 @@ mod tests {
     use super::storage::JobStore;
     use super::{
         apply_completed_job_result, assign_pending_job, calculate_fee, configured_database_path,
-        fail_running_jobs_for_provider, parse_configured_port, parse_network_model,
-        validate_fee_address, AppState, FeeSettings, JobPayload, JobRecord, JobResult,
+        check_request_rate_limit, fail_running_jobs_for_provider, payment_header_status, parse_configured_port,
+        parse_network_model, hash_provider_secret, job_id_is_available, validate_fee_address,
+        validate_provider_credentials, AppState, FeeSettings, JobPayload, JobRecord, JobResult,
         ProviderInfo,
     };
+    use axum::http::StatusCode;
     use std::{
         collections::{HashMap, VecDeque},
         path::PathBuf,
         sync::Arc,
-        time::Duration,
+        time::{Duration, Instant},
     };
     use tokio::sync::{mpsc, Mutex};
 
@@ -1049,6 +1214,24 @@ mod tests {
     #[test]
     fn fee_is_ten_percent_at_1000_bps() {
         assert_eq!(calculate_fee(10_000, 1_000), (1_000, 9_000));
+    }
+
+    #[test]
+    fn usdc_odd_price_splits_to_fee_and_pending_payout_without_rounding_loss() {
+        let (fee, payout) = calculate_fee(13_000, 1_000);
+        assert_eq!(fee, 1_300);
+        assert_eq!(payout, 11_700);
+        assert_eq!(fee + payout, 13_000);
+    }
+
+    #[test]
+    fn missing_payment_is_distinct_from_invalid_payment() {
+        assert_eq!(payment_header_status(None), StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(payment_header_status(Some("")), StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(
+            payment_header_status(Some("invalid")),
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     #[test]
@@ -1111,6 +1294,81 @@ mod tests {
         assert_eq!(found.status, "completed");
         assert_eq!(found.result.unwrap().job_id, "job-401");
         assert_eq!(found.fee_breakdown.unwrap().gross_price, 10_000);
+    }
+
+    #[tokio::test]
+    async fn repeated_completed_result_is_ignored_without_resetting_settlement() {
+        let jobs = Arc::new(Mutex::new(HashMap::new()));
+        let result = JobResult {
+            job_id: "job-duplicate-result".to_string(),
+            provider_id: "provider-node-01".to_string(),
+            result_data: "first result".to_string(),
+            duration_ms: 123,
+            eval_count: 45,
+            tokens_per_sec: 12.5,
+            error: None,
+        };
+        let fees = FeeSettings {
+            fee_bps: 1_000,
+            job_price_units: 10_001,
+            platform_address: "0xPLATFORM_PLACEHOLDER".to_string(),
+            network_model: "llama3.2:3b".to_string(),
+        };
+
+        {
+            let mut map = jobs.lock().await;
+            map.insert(
+                result.job_id.clone(),
+                JobRecord {
+                    id: result.job_id.clone(),
+                    prompt: "test".to_string(),
+                    status: "running".to_string(),
+                    provider_id: Some(result.provider_id.clone()),
+                    result: None,
+                    fee_breakdown: None,
+                    error: None,
+                },
+            );
+        }
+
+        let first_applied = apply_completed_job_result(
+            &mut *jobs.lock().await,
+            &result,
+            &fees,
+        );
+        let mut duplicate = result.clone();
+        duplicate.result_data = "duplicate result".to_string();
+        let second_applied = apply_completed_job_result(
+            &mut *jobs.lock().await,
+            &duplicate,
+            &fees,
+        );
+
+        assert!(first_applied, "the first result should settle the job");
+        assert!(!second_applied, "the repeated result should be ignored");
+        let found = jobs.lock().await.get(&result.job_id).cloned().unwrap();
+        assert_eq!(found.status, "completed");
+        assert_eq!(found.result.unwrap().result_data, "first result");
+        assert_eq!(found.fee_breakdown.unwrap().gross_price, 10_001);
+    }
+
+    #[test]
+    fn duplicate_job_id_is_rejected_before_storage() {
+        let jobs = HashMap::from([(
+            "job-existing".to_string(),
+            JobRecord {
+                id: "job-existing".to_string(),
+                prompt: "already submitted".to_string(),
+                status: "queued".to_string(),
+                provider_id: None,
+                result: None,
+                fee_breakdown: None,
+                error: None,
+            },
+        )]);
+
+        assert!(!job_id_is_available(&jobs, "job-existing"));
+        assert!(job_id_is_available(&jobs, "job-new"));
     }
 
     #[test]
@@ -1177,6 +1435,68 @@ mod tests {
         assert!(validate_fee_address(Some("0xzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz")).is_err());
     }
 
+    #[test]
+    fn provider_credentials_reject_wrong_secret_but_allow_documented_legacy_providers() {
+        let mut known = HashMap::new();
+        known.insert(
+            "provider-1".to_string(),
+            hash_provider_secret("known-secret"),
+        );
+        let wallet = "0x1111111111111111111111111111111111111111";
+
+        assert!(!validate_provider_credentials(
+            &known,
+            "provider-1",
+            wallet,
+            "wrong-secret"
+        ));
+        assert!(!validate_provider_credentials(
+            &known,
+            "provider-2",
+            "not-a-wallet",
+            "new-secret"
+        ));
+        assert!(validate_provider_credentials(
+            &known,
+            "provider-1",
+            wallet,
+            "known-secret"
+        ));
+        assert!(validate_provider_credentials(
+            &known,
+            "legacy-provider",
+            "not-set",
+            ""
+        ));
+    }
+
+    #[test]
+    fn per_ip_request_limit_allows_then_rejects_burst() {
+        let mut windows = HashMap::new();
+        let now = Instant::now();
+        assert!(check_request_rate_limit(&mut windows, "127.0.0.1", now, 60));
+        for _ in 1..60 {
+            assert!(check_request_rate_limit(
+                &mut windows,
+                "127.0.0.1",
+                now,
+                60
+            ));
+        }
+        assert!(!check_request_rate_limit(
+            &mut windows,
+            "127.0.0.1",
+            now,
+            60
+        ));
+        assert!(check_request_rate_limit(
+            &mut windows,
+            "127.0.0.2",
+            now,
+            60
+        ));
+    }
+
     #[tokio::test]
     async fn concurrent_assignment_sends_queued_job_only_once() {
         let (sender, mut receiver) = mpsc::unbounded_channel::<JobPayload>();
@@ -1216,6 +1536,8 @@ mod tests {
                     total_earned_units: 0,
                 },
             )]))),
+            provider_token_hashes: Arc::new(Mutex::new(HashMap::new())),
+            request_windows: Arc::new(Mutex::new(HashMap::new())),
             fees: FeeSettings {
                 fee_bps: 1_000,
                 job_price_units: 10_000,

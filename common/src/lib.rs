@@ -56,6 +56,8 @@ pub struct ProviderRegistration {
     pub model: String,
     #[serde(default = "provider_accepts_jobs_by_default")]
     pub accepting_jobs: bool,
+    #[serde(default)]
+    pub auth_token: String,
 }
 
 fn provider_accepts_jobs_by_default() -> bool {

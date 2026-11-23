@@ -9,7 +9,7 @@ use rusqlite::{params, Connection, TransactionBehavior};
 
 use crate::{timestamp_millis, JobRecord};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 #[derive(Clone)]
 pub(super) struct JobStore {
@@ -64,7 +64,43 @@ impl JobStore {
                         updated_at INTEGER NOT NULL
                     );
                     CREATE INDEX jobs_status_created_at ON jobs(status, created_at, job_id);
-                    PRAGMA user_version = 1;",
+                    CREATE TABLE providers (
+                        provider_id TEXT PRIMARY KEY NOT NULL,
+                        wallet_address TEXT NOT NULL,
+                        total_earned INTEGER NOT NULL DEFAULT 0,
+                        pending_payout INTEGER NOT NULL DEFAULT 0,
+                        tx_hash TEXT
+                    );
+                    CREATE TABLE payouts (
+                        provider_id TEXT NOT NULL,
+                        amount INTEGER NOT NULL,
+                        tx_hash TEXT,
+                        settled_at INTEGER,
+                        FOREIGN KEY(provider_id) REFERENCES providers(provider_id)
+                    );
+                    PRAGMA user_version = 2;",
+                )?;
+                transaction.commit()?;
+            }
+            1 => {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                transaction.execute_batch(
+                    "CREATE TABLE providers (
+                        provider_id TEXT PRIMARY KEY NOT NULL,
+                        wallet_address TEXT NOT NULL,
+                        total_earned INTEGER NOT NULL DEFAULT 0,
+                        pending_payout INTEGER NOT NULL DEFAULT 0,
+                        tx_hash TEXT
+                    );
+                    CREATE TABLE payouts (
+                        provider_id TEXT NOT NULL,
+                        amount INTEGER NOT NULL,
+                        tx_hash TEXT,
+                        settled_at INTEGER,
+                        FOREIGN KEY(provider_id) REFERENCES providers(provider_id)
+                    );
+                    PRAGMA user_version = 2;",
                 )?;
                 transaction.commit()?;
             }
@@ -124,6 +160,72 @@ impl JobStore {
         })
         .await
         .context("SQLite job writer task failed")?
+    }
+
+    pub(super) async fn upsert_provider(&self, provider_id: &str, wallet_address: &str) -> Result<()> {
+        let connection = Arc::clone(&self.connection);
+        let provider_id = provider_id.to_string();
+        let wallet_address = wallet_address.to_string();
+        tokio::task::spawn_blocking(move || {
+            let connection = connection
+                .lock()
+                .map_err(|_| anyhow!("SQLite connection mutex was poisoned"))?;
+            connection.execute(
+                "INSERT INTO providers (provider_id, wallet_address)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(provider_id) DO UPDATE SET wallet_address=excluded.wallet_address",
+                params![provider_id, wallet_address],
+            )?;
+            Ok(())
+        })
+        .await
+        .context("SQLite provider writer task failed")?
+    }
+
+    pub(super) async fn add_pending_payout(
+        &self,
+        provider_id: &str,
+        wallet_address: &str,
+        amount: u64,
+    ) -> Result<()> {
+        let connection = Arc::clone(&self.connection);
+        let provider_id = provider_id.to_string();
+        let wallet_address = wallet_address.to_string();
+        tokio::task::spawn_blocking(move || {
+            let connection = connection
+                .lock()
+                .map_err(|_| anyhow!("SQLite connection mutex was poisoned"))?;
+            connection.execute(
+                "INSERT INTO providers (provider_id, wallet_address, pending_payout)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(provider_id) DO UPDATE SET
+                   wallet_address=excluded.wallet_address,
+                   pending_payout=providers.pending_payout+excluded.pending_payout",
+                params![provider_id, wallet_address, i64::try_from(amount).unwrap_or(i64::MAX)],
+            )?;
+            Ok(())
+        })
+        .await
+        .context("SQLite payout writer task failed")?
+    }
+
+    #[cfg(test)]
+    pub(super) async fn pending_payout(&self, provider_id: &str) -> Result<u64> {
+        let connection = Arc::clone(&self.connection);
+        let provider_id = provider_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let connection = connection
+                .lock()
+                .map_err(|_| anyhow!("SQLite connection mutex was poisoned"))?;
+            let value: i64 = connection.query_row(
+                "SELECT pending_payout FROM providers WHERE provider_id=?1",
+                params![provider_id],
+                |row| row.get(0),
+            )?;
+            Ok(u64::try_from(value).unwrap_or(0))
+        })
+        .await
+        .context("SQLite payout reader task failed")?
     }
 }
 
@@ -234,6 +336,32 @@ mod tests {
         );
 
         drop(reopened);
+        remove_database(&path);
+    }
+
+    #[tokio::test]
+    async fn provider_wallet_and_pending_payout_are_persisted_once() {
+        let path = database_path();
+        let store = JobStore::open(&path).unwrap();
+        let wallet = "0x1111111111111111111111111111111111111111";
+
+        store
+            .upsert_provider("provider-1", wallet)
+            .await
+            .unwrap();
+        store
+            .add_pending_payout("provider-1", wallet, 11_700)
+            .await
+            .unwrap();
+        store
+            .add_pending_payout("provider-1", wallet, 11_700)
+            .await
+            .unwrap();
+
+        let pending = store.pending_payout("provider-1").await.unwrap();
+        assert_eq!(pending, 23_400);
+
+        drop(store);
         remove_database(&path);
     }
 }

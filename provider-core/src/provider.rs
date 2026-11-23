@@ -572,6 +572,7 @@ async fn run_provider_connection(
         gpu_memory: gpu.gpu_memory,
         model: model.clone(),
         accepting_jobs,
+        auth_token: config.auth_token.clone(),
     });
     let registration = Message::Text(
         serde_json::to_string(&registration).context("failed to serialize registration")?,
