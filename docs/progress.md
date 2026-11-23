@@ -8,9 +8,9 @@
 | 4. Coordinator hardening (SQLite) | PASS | Durable job lifecycle and restart recovery verified with a real coordinator restart. |
 | 5. Coordinator URL and TLS | PASS | Supports secure remote WebSocket endpoints and loopback-only plaintext; remote certificate handshake not live-verified. |
 | 6. Network-selected model | PASS | Coordinator `/fees` publishes the validated network model; providers prefer it over saved config, with backward-compatible fallback. |
-| 7. Branding and installers | PASS | Built an unsigned Windows MSI using the existing interim icon; signing and final brand assets remain unverified. |
-| 8. Installed-app behavior (Windows) | TODO | |
-| 9. Whole-app end-to-end test | TODO | |
+| 7. Branding and installers | PASS | Official logo installed, MSI and NSIS targets configured, cross-platform workflow added. Signing and live 3-OS build remain external. |
+| 8. Installed-app behavior (Windows) | BLOCKED | MSI inspection reports ALLUSERS=1; no system-wide install was performed. Per-user install authorization was not granted. |
+| 9. Whole-app end-to-end test | NOT DONE | Blocked behind Phase 8 installed-app verification. |
 
 Implementation commits are recorded in git history.
 
@@ -66,3 +66,13 @@ Phase 7 evidence:
 - The first ignored-test attempt selected the coordinator's default `llama3.2:3b` and timed out while preparing that uncached selection. No user data was deleted. Restarting the owned test coordinator with the cached `llama3.2:1b` made all four ignored tests pass. No managed engine process remained after the runs.
 
 Next: Phase 8 — installed-app behavior on Windows.
+
+Phase 7 logo and packaging update:
+- The official attached green/black D logo was copied to `desktop/logo.png` and `website/logo.png`, Tauri icons were generated, and the desktop sidebar plus website navbar/hero now render the image.
+- Logo snapshot test passed; `npm --prefix desktop test` passed 6 tests and `npm --prefix desktop run build` passed.
+- Tauri bundle targets were expanded to MSI and NSIS. A fresh release build produced MSI 5,668,864 bytes and NSIS 4,020,180 bytes using the new icons.
+- GitHub Actions workflow provides Windows/macOS/Linux matrix build jobs, Cargo/npm caching, stable artifact collection names, and a draft release on `v*` tags. Signing secrets are placeholders.
+
+Phase 8 safety report:
+- The MSI properties report `ALLUSERS=1` and no `MSIINSTALLPERUSER` property. It is machine-wide in scope.
+- No MSI or NSIS installation was performed; no system-wide registry, Add/Remove Programs, or autostart changes were made.

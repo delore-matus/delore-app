@@ -24,6 +24,11 @@ the existing `icons/icon.ico`; the installer is not code-signed or intended for
 public distribution until a signing certificate and final brand assets are
 available.
 
+Windows unsigned MSI packages may show a SmartScreen warning until signed.
+macOS unsigned DMGs may require manual Gatekeeper approval. Linux AppImages
+should have the executable bit set and may require a local AppArmor or package
+policy exception.
+
 The desktop UI does not shell out to `gpuswarm`. Both the app and CLI use
 `provider-core` for provider control, configuration, the managed process, and
 job execution.

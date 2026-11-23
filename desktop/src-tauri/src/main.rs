@@ -204,6 +204,7 @@ struct StatusSnapshot {
     current_job: CurrentJob,
     user_paused: bool,
     payout_address: Option<String>,
+    coordinator_ws: String,
     #[serde(rename = "setup_progress_percent")]
     runtime_percent: u8,
     #[serde(rename = "artifact_progress_percent")]
@@ -315,6 +316,8 @@ impl DesktopState {
             current_job: CurrentJob::Idle,
             user_paused: false,
             payout_address: config.payout_address,
+            coordinator_ws: std::env::var("COORDINATOR_WS")
+                .unwrap_or_else(|_| config.coordinator_ws.clone()),
             runtime_percent: 0,
             model_percent: 0,
             expected_total_download_bytes: None,

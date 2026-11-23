@@ -27,12 +27,12 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost http://127.0.0.1:1420 ws://127.0.0.1:1420"
+      "csp": "default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost https://cdn.jsdelivr.net http://127.0.0.1:1420 ws://127.0.0.1:1420"
     }
   },
   "bundle": {
     "active": true,
-    "targets": ["msi"],
+    "targets": ["msi", "nsis"],
     "icon": ["icons/icon.ico"],
     "shortDescription": "DeLore TESTNET provider",
     "longDescription": "The DeLore desktop app for participating in the GPU Swarm TESTNET."

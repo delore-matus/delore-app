@@ -1,0 +1,66 @@
+name: Build DeLore
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            rust-target: x86_64-pc-windows-msvc
+            artifact: windows
+          - os: macos-latest
+            rust-target: universal-apple-darwin
+            artifact: macos
+          - os: ubuntu-latest
+            rust-target: x86_64-unknown-linux-gnu
+            artifact: linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: delore
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - run: npm ci --prefix desktop
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          # APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          # WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          # WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        with:
+          projectPath: desktop
+          tagName: ${{ github.ref_name }}
+          releaseDraft: true
+      - name: Collect stable artifact names
+        shell: bash
+        run: |
+          mkdir -p dist-packages
+          if [[ "${{ matrix.artifact }}" == "windows" ]]; then
+            find desktop/src-tauri/target/release/bundle -type f -name "*.msi" -exec cp {} dist-packages/DeLore-windows-x64.msi \;
+            find desktop/src-tauri/target/release/bundle -type f -name "*.exe" -exec cp {} dist-packages/DeLore-windows-x64.exe \;
+          elif [[ "${{ matrix.artifact }}" == "macos" ]]; then
+            find desktop/src-tauri/target/release/bundle -type f -name "*.dmg" -exec cp {} dist-packages/DeLore-macos-universal.dmg \;
+          else
+            find desktop/src-tauri/target/release/bundle -type f -name "*.AppImage" -exec cp {} dist-packages/DeLore-linux-amd64.AppImage \;
+            find desktop/src-tauri/target/release/bundle -type f -name "*.deb" -exec cp {} dist-packages/DeLore-linux-amd64.deb \;
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist-packages/*
