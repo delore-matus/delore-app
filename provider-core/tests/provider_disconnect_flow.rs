@@ -10,6 +10,7 @@ use provider_core::{
     ProviderEventCallback, ResourceMode, RuntimeManager, RuntimeProgressCallback,
 };
 use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
     sync::{mpsc, oneshot, watch},
     time::timeout,
@@ -77,6 +78,31 @@ async fn disconnect_during_job_discards_result_and_reconnects() {
     let server_provider_id = provider_id.clone();
     let server_job_id = job_id.clone();
     let server = tokio::spawn(async move {
+        let (mut fees_socket, _) = timeout(Duration::from_secs(90), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut request = Vec::new();
+        let mut chunk = [0; 512];
+        timeout(Duration::from_secs(5), async {
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = fees_socket.read(&mut chunk).await.unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..count]);
+            }
+        })
+        .await
+        .unwrap();
+        fees_socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+            )
+            .await
+            .unwrap();
+        drop(fees_socket);
+
         let (stream, _) = timeout(Duration::from_secs(90), listener.accept())
             .await
             .unwrap()

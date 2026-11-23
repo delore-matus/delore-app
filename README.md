@@ -37,8 +37,10 @@ pause.
 | Variable | Default | Used by |
 |---|---|---|
 | `COORDINATOR_WS` | `ws://127.0.0.1:8081/ws` | Provider WebSocket URL and process override |
+| `COORDINATOR_HTTP` | inferred from WebSocket URL | Optional HTTP API origin when the HTTP and WebSocket ports differ |
 | `PROVIDER_ID` | `provider-node-01` | Provider identity |
 | `OLLAMA_MODEL` | `llama3.2:3b` | Model fetched by the managed inference runtime |
+| `GPUSWARM_NETWORK_MODEL` | `llama3.2:3b` | Coordinator's network-selected model |
 
 Set variables in PowerShell before starting a process, for example:
 
@@ -54,6 +56,13 @@ Use `wss://` for any network host. TLS certificate validation uses the
 operating system's trusted certificate store; certificate-validation bypasses
 are not supported. The desktop app reads the saved `coordinator_ws` value and
 also honors `COORDINATOR_WS` when that environment variable is set at launch.
+The provider reads the network-selected model from the coordinator's `/fees`
+response before preparing its local resources. If an older coordinator omits
+that field, the saved model is used; an explicit `OLLAMA_MODEL` environment
+override takes precedence. By default, `ws://...:8081/ws` maps to the HTTP API
+at port 8080, while secure WebSocket endpoints use the same host and port for
+HTTPS. Set `COORDINATOR_HTTP` to an HTTP(S) origin when the API uses a different
+address.
 
 For local testing only, set `PROVIDER_ID` before starting a provider to override
 the saved config for that process without changing `config.json`. This is useful

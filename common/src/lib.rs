@@ -5,6 +5,19 @@
 
 use serde::{Deserialize, Serialize};
 
+pub fn is_valid_model_name(model: &str) -> bool {
+    let bytes = model.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 128
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes[bytes.len() - 1].is_ascii_alphanumeric()
+        && bytes.iter().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':' | b'/')
+        })
+        && !model.contains("..")
+        && !model.contains("//")
+}
+
 /// A unit of mock GPU work submitted to the coordinator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobPayload {
@@ -88,7 +101,23 @@ pub enum WsMessage {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProviderRegistration, WsMessage};
+    use super::{is_valid_model_name, ProviderRegistration, WsMessage};
+
+    #[test]
+    fn model_names_use_a_restricted_safe_character_set() {
+        assert!(is_valid_model_name("llama3.2:3b"));
+        assert!(is_valid_model_name("hf.co/example/model:Q4_K_M"));
+        for invalid in [
+            "",
+            "../escape",
+            "model//tag",
+            "bad name",
+            "bad\\name",
+            ".bad",
+        ] {
+            assert!(!is_valid_model_name(invalid), "{invalid:?}");
+        }
+    }
 
     #[test]
     fn older_provider_registration_defaults_to_accepting_jobs() {

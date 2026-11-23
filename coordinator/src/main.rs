@@ -61,6 +61,7 @@ struct FeeSettings {
     fee_bps: u64,
     job_price_units: u64,
     platform_address: String,
+    network_model: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -69,6 +70,15 @@ struct FeesResponse {
     provider_share_percent: u64,
     platform_share_percent: u64,
     fee_address: String,
+    network_model: String,
+}
+
+fn parse_network_model(value: Option<&str>) -> Result<String> {
+    let model = value.unwrap_or("llama3.2:3b");
+    if !common::is_valid_model_name(model) {
+        anyhow::bail!("GPUSWARM_NETWORK_MODEL is not a valid model name");
+    }
+    Ok(model.to_string())
 }
 
 fn calculate_fee(price_units: u64, fee_bps: u64) -> (u64, u64) {
@@ -125,11 +135,19 @@ fn parse_fee_settings() -> Result<FeeSettings> {
             }
         }
     };
+    let network_model = match std::env::var("GPUSWARM_NETWORK_MODEL") {
+        Ok(model) => parse_network_model(Some(&model))?,
+        Err(std::env::VarError::NotPresent) => parse_network_model(None)?,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("GPUSWARM_NETWORK_MODEL must contain valid Unicode")
+        }
+    };
 
     Ok(FeeSettings {
         fee_bps,
         job_price_units,
         platform_address,
+        network_model,
     })
 }
 
@@ -467,6 +485,7 @@ async fn get_fees(State(state): State<AppState>) -> impl IntoResponse {
         provider_share_percent: 100 - platform_share_percent,
         platform_share_percent,
         fee_address: state.fees.platform_address.clone(),
+        network_model: state.fees.network_model.clone(),
     })
 }
 
@@ -975,8 +994,9 @@ mod tests {
     use super::storage::JobStore;
     use super::{
         apply_completed_job_result, assign_pending_job, calculate_fee, configured_database_path,
-        fail_running_jobs_for_provider, parse_configured_port, validate_fee_address, AppState,
-        FeeSettings, JobPayload, JobRecord, JobResult, ProviderInfo,
+        fail_running_jobs_for_provider, parse_configured_port, parse_network_model,
+        validate_fee_address, AppState, FeeSettings, JobPayload, JobRecord, JobResult,
+        ProviderInfo,
     };
     use std::{
         collections::{HashMap, VecDeque},
@@ -985,6 +1005,16 @@ mod tests {
         time::Duration,
     };
     use tokio::sync::{mpsc, Mutex};
+
+    #[test]
+    fn network_model_defaults_and_rejects_invalid_values() {
+        assert_eq!(parse_network_model(None).unwrap(), "llama3.2:3b");
+        assert_eq!(
+            parse_network_model(Some("llama3.2:1b")).unwrap(),
+            "llama3.2:1b"
+        );
+        assert!(parse_network_model(Some("../invalid")).is_err());
+    }
 
     #[test]
     fn coordinator_database_path_has_a_safe_default_and_rejects_empty_values() {
@@ -1071,6 +1101,7 @@ mod tests {
             fee_bps: 1_000,
             job_price_units: 10_000,
             platform_address: "0xPLATFORM_PLACEHOLDER".to_string(),
+            network_model: "llama3.2:3b".to_string(),
         };
 
         apply_completed_job_result(&mut *jobs.lock().await, &result, &fees);
@@ -1189,6 +1220,7 @@ mod tests {
                 fee_bps: 1_000,
                 job_price_units: 10_000,
                 platform_address: "0xPLATFORM_PLACEHOLDER".to_string(),
+                network_model: "llama3.2:3b".to_string(),
             },
             job_timeout_secs: 120,
         };

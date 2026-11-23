@@ -7,7 +7,7 @@
 | 3. First-run onboarding and data management | PASS | Adaptive startup readiness, first-run welcome, and local data-folder access verified. |
 | 4. Coordinator hardening (SQLite) | PASS | Durable job lifecycle and restart recovery verified with a real coordinator restart. |
 | 5. Coordinator URL and TLS | PASS | Supports secure remote WebSocket endpoints and loopback-only plaintext; remote certificate handshake not live-verified. |
-| 6. Network-selected model | TODO | |
+| 6. Network-selected model | PASS | Coordinator `/fees` publishes the validated network model; providers prefer it over saved config, with backward-compatible fallback. |
 | 7. Branding and installers | TODO | |
 | 8. Installed-app behavior (Windows) | TODO | |
 | 9. Whole-app end-to-end test | TODO | |
@@ -52,4 +52,10 @@ Phase 5 evidence (all timestamps UTC):
 - Pre-build free space was C: 21.39 GB and Q: 4.26 GB. Cargo used isolated `Q:\\gpu-swarm-phase5-88e391cb1c1c460d98e7` with reduced debug output and two build jobs. No live remote TLS endpoint/certificate was available, so a trusted remote TLS handshake remains NOT VERIFIED; local URL policy, TLS-enabled compilation, and HTTP/HTTPS endpoint selection are verified.
 - Final recheck after tightening raw URL parsing: `cargo test --workspace` again passed (95 passed, 0 failed, 4 ignored), formatting passed, and workspace clippy passed with only the pre-existing coordinator loop warning. Re-ran all three ignored integration tests explicitly against a fresh owned coordinator; all passed. Their log timestamps were `2026-11-23T00:15:08.621Z` (fee config), `00:15:16.412Z` (first completed job), `00:15:47.479Z` (provider listed paused at 0%), and `00:16:13.407Z` (100% job completed). Each job settlement showed payout 9000 and platform fee 1000. Temporary `GPUSWARM_CONFIG_DIR` and `GPUSWARM_DB_PATH` values were used; runtime/model cache remained in the existing LocalAppData install. Final pre-build free space: C: 21.35 GB, Q: 1.21 GB.
 
-Next: Phase 6 — network-selected model.
+Phase 6 evidence (all timestamps UTC):
+- Added coordinator `GPUSWARM_NETWORK_MODEL` (validated; default `llama3.2:3b`) to `GET /fees`. Providers fetch the network selection before setup, prefer it over the saved value, and retain `OLLAMA_MODEL` as an explicit developer override. Older coordinators without `network_model` fall back to saved config. HTTP discovery uses the default 8081→8080 port mapping, supports an optional `COORDINATOR_HTTP` origin, requires HTTPS for non-loopback HTTP endpoints, and has URL/compatibility tests.
+- On the final integration run, the coordinator published `llama3.2:1b` while the policy test's saved config deliberately specified `llama3.2:3b`; the test passed after verifying registration used the network-selected value. A job then ran through the selected model. The same run verified pause/queue/resume behavior: paused at `2026-11-23T00:50:52.336Z`, resumed job completed at `00:50:58.105Z`, and the two 100% jobs completed by `00:51:17.067Z`.
+- `cargo test --workspace`: 100 passed, 0 failed, 4 ignored. `cargo clippy --workspace --all-targets` passed with only the existing coordinator `while_let_loop` warning; `cargo fmt --all -- --check` passed. Explicitly ran all three ignored integration tests (`managed_provider_runs_a_job_and_stops`, `disconnect_during_job_discards_result_and_reconnects`, `performance_slider_controls_registration_and_job_flow`); all passed against an owned coordinator with isolated `GPUSWARM_CONFIG_DIR` and `GPUSWARM_DB_PATH`.
+- Before the Phase 6 full build, free space was C: 21.34 GB and Q: 4.26 GB. Cargo used isolated `Q:\\gpu-swarm-phase6-88e391cb1c1c460d98e7`; no real `%APPDATA%\\GpuSwarm\\config.json` was accessed.
+
+Next: Phase 7 — branding and installers.

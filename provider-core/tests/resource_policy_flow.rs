@@ -41,7 +41,7 @@ async fn performance_slider_controls_registration_and_job_flow() {
     let mut config = ProviderConfig::defaults();
     config.provider_id = provider_id.clone();
     config.coordinator_ws = coordinator_ws;
-    config.ollama_model = "llama3.2:1b".into();
+    config.ollama_model = "llama3.2:3b".into();
     config.resource_settings = provider_core::ResourceSettings {
         mode: ResourceMode::AlwaysOnLowPriority,
         preset: ResourcePreset::Low,
@@ -129,6 +129,7 @@ async fn performance_slider_controls_registration_and_job_flow() {
         .iter()
         .find(|provider| provider["provider_id"] == provider_id)
         .expect("provider must be listed while paused at 0%");
+    assert_eq!(provider_entry["model"], "llama3.2:1b");
     assert_eq!(provider_entry["status"], "paused");
     assert_eq!(provider_entry["accepting_jobs"], false);
     println!(

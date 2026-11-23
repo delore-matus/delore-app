@@ -7,17 +7,85 @@ use std::{
 use anyhow::{Context, Result};
 use common::{FeeConfig, JobPayload, JobResult, ProviderRegistration, WsMessage};
 use futures_util::{SinkExt, StreamExt};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::{
-    confirm_not_recommended_runtime, decide_current_policy, detect_gpu, duty_cycle_pause_ms,
-    effective_ollama_model, ensure_provider_confirmation, run_ollama_with_settings,
-    runtime_suitability, DutyCyclePause, NativeSystemProbe, PolicyDecision, ProviderConfig,
-    ResourceMetrics, ResourceMonitor, ResourceSettings, RunningRuntime, RuntimeManager,
-    RuntimeProgressCallback, RuntimeState, RuntimeSuitability, SystemProbe,
+    confirm_not_recommended_runtime, coordinator_fees_url_with_override, decide_current_policy,
+    detect_gpu, duty_cycle_pause_ms, effective_ollama_model, ensure_provider_confirmation,
+    run_ollama_with_settings, runtime_suitability, validate_ollama_model, DutyCyclePause,
+    NativeSystemProbe, OllamaModelSelection, PolicyDecision, ProviderConfig, ResourceMetrics,
+    ResourceMonitor, ResourceSettings, RunningRuntime, RuntimeManager, RuntimeProgressCallback,
+    RuntimeState, RuntimeSuitability, SystemProbe,
 };
+
+#[derive(Debug, Deserialize)]
+struct CoordinatorFeesResponse {
+    #[serde(default)]
+    network_model: Option<String>,
+}
+
+async fn fetch_network_model(coordinator_ws: &str) -> Result<Option<String>> {
+    let http_override = match std::env::var("COORDINATOR_HTTP") {
+        Ok(url) => Some(url),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("COORDINATOR_HTTP contains invalid non-Unicode data")
+        }
+    };
+    let url = coordinator_fees_url_with_override(coordinator_ws, http_override.as_deref())?;
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(5))
+        .build()
+        .context("failed to configure coordinator settings client")?;
+    let response = match client.get(&url).send().await {
+        Ok(response) => response,
+        Err(error) => {
+            log_model_selection_issue(&format!(
+                "Could not fetch coordinator model selection from {url}: {error:#}"
+            ));
+            return Ok(None);
+        }
+    };
+    if !response.status().is_success() {
+        log_model_selection_issue(&format!(
+            "Coordinator model selection request returned HTTP {}; using saved model",
+            response.status()
+        ));
+        return Ok(None);
+    }
+    match response.json::<CoordinatorFeesResponse>().await {
+        Ok(fees) => Ok(fees.network_model),
+        Err(error) => {
+            log_model_selection_issue(&format!(
+                "Could not parse coordinator model selection: {error:#}; using saved model"
+            ));
+            Ok(None)
+        }
+    }
+}
+
+fn log_model_selection_issue(message: &str) {
+    if let Err(error) = crate::config::append_technical_log(message) {
+        eprintln!("Could not append technical log: {error:#}");
+    }
+}
+
+fn select_network_model(
+    selection: &OllamaModelSelection,
+    network_model: Option<&str>,
+) -> Result<String> {
+    if selection.environment_override {
+        return Ok(selection.effective.clone());
+    }
+    let Some(model) = network_model else {
+        return Ok(selection.configured.clone());
+    };
+    validate_ollama_model(model).context("coordinator selected an invalid model name")?;
+    Ok(model.to_string())
+}
 
 #[derive(Debug, Clone)]
 pub struct JobHistoryEntry {
@@ -272,7 +340,7 @@ async fn run_provider_inner(
     config.resource_settings.validate()?;
     let coordinator_url = std::env::var("COORDINATOR_WS").unwrap_or(config.coordinator_ws.clone());
     crate::validate_coordinator_ws_url(&coordinator_url)?;
-    let model = effective_ollama_model(&config)?.effective;
+    let model_selection = effective_ollama_model(&config)?;
     let runtime_manager = RuntimeManager::new()?;
     if *stop_rx.borrow() {
         runtime_callback(RuntimeState::Stopping);
@@ -295,6 +363,26 @@ async fn run_provider_inner(
         config.resource_settings.not_recommended_confirmed = true;
         confirm_not_recommended_runtime()?;
     }
+    runtime_callback(RuntimeState::Starting);
+    let network_model = if model_selection.environment_override {
+        None
+    } else {
+        tokio::select! {
+            biased;
+            _ = wait_for_stop(&mut stop_rx) => {
+                runtime_callback(RuntimeState::Stopping);
+                runtime_callback(if runtime_manager.runtime_dir().exists() {
+                    RuntimeState::Ready
+                } else {
+                    RuntimeState::NotInstalled
+                });
+                emit_connection(&event_callback, ConnectionState::Disconnected, None);
+                return Ok(());
+            }
+            result = fetch_network_model(&coordinator_url) => result?,
+        }
+    };
+    let model = select_network_model(&model_selection, network_model.as_deref())?;
     let runtime_install = tokio::select! {
         biased;
         _ = wait_for_stop(&mut stop_rx) => {
@@ -1117,6 +1205,7 @@ mod tests {
         ProviderConfig, ProviderEvent, ProviderEventCallback, ReconnectBackoff,
         RuntimeProgressCallback, RuntimeState,
     };
+    use super::{select_network_model, CoordinatorFeesResponse};
     use crate::{ResourceMode, ResourceSettings};
     use std::{
         sync::{Arc, Mutex},
@@ -1124,6 +1213,40 @@ mod tests {
     };
     use tokio::{net::TcpListener, sync::watch, time::timeout};
     use tokio_tungstenite::accept_async;
+
+    #[test]
+    fn coordinator_model_selection_wins_unless_explicitly_overridden() {
+        let configured = crate::OllamaModelSelection {
+            configured: "llama3.2:3b".to_string(),
+            effective: "llama3.2:3b".to_string(),
+            environment_override: false,
+        };
+        assert_eq!(
+            select_network_model(&configured, Some("llama3.2:1b")).unwrap(),
+            "llama3.2:1b"
+        );
+        assert_eq!(
+            select_network_model(&configured, None).unwrap(),
+            "llama3.2:3b"
+        );
+        assert!(select_network_model(&configured, Some("../invalid")).is_err());
+
+        let explicit_override = crate::OllamaModelSelection {
+            configured: "llama3.2:3b".to_string(),
+            effective: "llama3.2:1b".to_string(),
+            environment_override: true,
+        };
+        assert_eq!(
+            select_network_model(&explicit_override, Some("llama3.2:3b")).unwrap(),
+            "llama3.2:1b"
+        );
+    }
+
+    #[test]
+    fn older_coordinator_fees_response_uses_saved_model() {
+        let fees: CoordinatorFeesResponse = serde_json::from_str(r#"{"fee_bps":1000}"#).unwrap();
+        assert_eq!(fees.network_model, None);
+    }
 
     #[tokio::test]
     async fn provider_control_publishes_valid_resource_settings_updates() {

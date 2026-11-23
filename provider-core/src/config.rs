@@ -146,18 +146,61 @@ pub fn validate_coordinator_ws_url(coordinator_ws: &str) -> Result<()> {
     }
 }
 
+pub fn coordinator_fees_url(coordinator_ws: &str) -> Result<String> {
+    coordinator_fees_url_with_override(coordinator_ws, None)
+}
+
+pub fn coordinator_fees_url_with_override(
+    coordinator_ws: &str,
+    http_override: Option<&str>,
+) -> Result<String> {
+    validate_coordinator_ws_url(coordinator_ws)?;
+    let mut url = if let Some(http_override) = http_override {
+        let url = Url::parse(http_override)
+            .context("COORDINATOR_HTTP must be a valid absolute HTTP URL")?;
+        let host = url.host().context("COORDINATOR_HTTP must include a host")?;
+        let is_loopback = match host {
+            Host::Domain(host) => host.eq_ignore_ascii_case("localhost"),
+            Host::Ipv4(address) => address.is_loopback(),
+            Host::Ipv6(address) => address.is_loopback(),
+        };
+        if !matches!(url.scheme(), "http" | "https")
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.port() == Some(0)
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || !matches!(url.path(), "" | "/")
+            || (url.scheme() == "http" && !is_loopback)
+        {
+            anyhow::bail!(
+                "COORDINATOR_HTTP must be a safe HTTP(S) origin without credentials, query, fragment, or path"
+            );
+        }
+        url
+    } else {
+        let mut url = Url::parse(coordinator_ws)
+            .context("coordinator URL must be a valid absolute WebSocket URL")?;
+        let http_scheme = if url.scheme() == "wss" {
+            "https"
+        } else {
+            "http"
+        };
+        url.set_scheme(http_scheme)
+            .map_err(|_| anyhow::anyhow!("could not map coordinator URL to HTTP"))?;
+        if url.scheme() == "http" && url.port() == Some(8081) {
+            url.set_port(Some(8080)).map_err(|_| {
+                anyhow::anyhow!("could not map WebSocket port 8081 to HTTP port 8080")
+            })?;
+        }
+        url
+    };
+    url.set_path("/fees");
+    Ok(url.to_string())
+}
+
 pub fn validate_ollama_model(model: &str) -> Result<()> {
-    let bytes = model.as_bytes();
-    if bytes.is_empty()
-        || bytes.len() > 128
-        || !bytes[0].is_ascii_alphanumeric()
-        || !bytes[bytes.len() - 1].is_ascii_alphanumeric()
-        || !bytes.iter().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':' | b'/')
-        })
-        || model.contains("..")
-        || model.contains("//")
-    {
+    if !common::is_valid_model_name(model) {
         anyhow::bail!(
             "Ollama model must be 1-128 characters using letters, numbers, '.', '_', '-', '/', or ':' and must start and end with a letter or number."
         );
@@ -428,7 +471,8 @@ mod tests {
     };
 
     use super::{
-        load_config_from, load_config_with_recovery_from, save_config_to, select_ollama_model,
+        coordinator_fees_url, coordinator_fees_url_with_override, load_config_from,
+        load_config_with_recovery_from, save_config_to, select_ollama_model,
         set_desktop_preferences_at, set_ollama_model_at, set_payout_address_at,
         set_performance_percent_at, set_resource_settings_at, validate_coordinator_ws_url,
         validate_ollama_model, validate_payout_address, AppLanguage, DesktopPreferences,
@@ -492,6 +536,36 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), original);
 
         remove_test_config(&path);
+    }
+
+    #[test]
+    fn coordinator_fees_url_preserves_tls_and_authority() {
+        assert_eq!(
+            coordinator_fees_url("ws://127.0.0.1:8081/ws").unwrap(),
+            "http://127.0.0.1:8080/fees"
+        );
+        assert_eq!(
+            coordinator_fees_url("wss://coordinator.example/ws").unwrap(),
+            "https://coordinator.example/fees"
+        );
+        assert_eq!(
+            coordinator_fees_url_with_override(
+                "wss://coordinator.example/ws",
+                Some("https://fees.example")
+            )
+            .unwrap(),
+            "https://fees.example/fees"
+        );
+        assert!(coordinator_fees_url_with_override(
+            "ws://127.0.0.1:8081/ws",
+            Some("https://user:secret@fees.example")
+        )
+        .is_err());
+        assert!(coordinator_fees_url_with_override(
+            "ws://127.0.0.1:8081/ws",
+            Some("http://fees.example")
+        )
+        .is_err());
     }
 
     #[test]

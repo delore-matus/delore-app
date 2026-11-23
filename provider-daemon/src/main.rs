@@ -193,21 +193,14 @@ struct FeesStatus {
 }
 
 fn coordinator_http_url(coordinator_ws: &str) -> Result<String> {
-    provider_core::validate_coordinator_ws_url(coordinator_ws)?;
-    let (scheme, endpoint) = coordinator_ws
-        .split_once("://")
-        .context("invalid coordinator WebSocket endpoint")?;
-    let http_scheme = if scheme.eq_ignore_ascii_case("wss") {
-        "https"
-    } else if scheme.eq_ignore_ascii_case("ws") {
-        "http"
-    } else {
-        anyhow::bail!("invalid coordinator WebSocket endpoint")
+    let http_override = match std::env::var("COORDINATOR_HTTP") {
+        Ok(url) => Some(url),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("COORDINATOR_HTTP contains invalid non-Unicode data")
+        }
     };
-    let authority = endpoint
-        .strip_suffix("/ws")
-        .context("invalid coordinator WebSocket endpoint")?;
-    Ok(format!("{http_scheme}://{authority}/fees"))
+    provider_core::coordinator_fees_url_with_override(coordinator_ws, http_override.as_deref())
 }
 
 fn percent_from_bps(fee_bps: u64) -> String {
@@ -390,7 +383,7 @@ mod tests {
     fn fee_endpoint_uses_http_or_https_for_the_coordinator_scheme() {
         assert_eq!(
             coordinator_http_url("ws://127.0.0.1:8081/ws").unwrap(),
-            "http://127.0.0.1:8081/fees"
+            "http://127.0.0.1:8080/fees"
         );
         assert_eq!(
             coordinator_http_url("wss://coordinator.example/ws").unwrap(),
