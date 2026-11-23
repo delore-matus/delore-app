@@ -6,6 +6,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use url::{Host, Url};
 
 use crate::resource::ResourceSettings;
 
@@ -101,6 +102,48 @@ pub fn validate_payout_address(address: &str) -> Result<()> {
         anyhow::bail!("Payout address contains non-hexadecimal characters.");
     }
     Ok(())
+}
+
+pub fn validate_coordinator_ws_url(coordinator_ws: &str) -> Result<()> {
+    if coordinator_ws.trim() != coordinator_ws {
+        anyhow::bail!("coordinator URL must not contain surrounding whitespace");
+    }
+    let (scheme, remainder) = coordinator_ws
+        .split_once("://")
+        .context("coordinator URL must use ws:// or wss://")?;
+    if !scheme.eq_ignore_ascii_case("ws") && !scheme.eq_ignore_ascii_case("wss") {
+        anyhow::bail!("coordinator URL must use ws:// or wss://");
+    }
+    if remainder.contains('\\') {
+        anyhow::bail!("coordinator URL must not contain backslashes");
+    }
+    let url = Url::parse(coordinator_ws)
+        .context("coordinator URL must be a valid absolute WebSocket URL")?;
+    let authority = remainder.split('/').next().unwrap_or_default();
+    if authority.contains('@') || !url.username().is_empty() || url.password().is_some() {
+        anyhow::bail!("coordinator URL must not contain credentials");
+    }
+    if url.port() == Some(0) {
+        anyhow::bail!("coordinator URL port must be greater than zero");
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        anyhow::bail!("coordinator URL must not contain a query or fragment");
+    }
+    if url.path() != "/ws" {
+        anyhow::bail!("coordinator URL path must be /ws");
+    }
+
+    let is_loopback = match url.host().context("coordinator URL must include a host")? {
+        Host::Domain(host) => host.eq_ignore_ascii_case("localhost"),
+        Host::Ipv4(address) => address.is_loopback(),
+        Host::Ipv6(address) => address.is_loopback(),
+    };
+    match url.scheme() {
+        "wss" => Ok(()),
+        "ws" if is_loopback => Ok(()),
+        "ws" => anyhow::bail!("unencrypted coordinator URLs are allowed only for loopback hosts"),
+        _ => anyhow::bail!("coordinator URL must use ws:// or wss://"),
+    }
 }
 
 pub fn validate_ollama_model(model: &str) -> Result<()> {
@@ -363,6 +406,7 @@ fn save_config_to(config: &ProviderConfig, path: &Path) -> Result<()> {
     if let Some(address) = config.payout_address.as_deref() {
         validate_payout_address(address)?;
     }
+    validate_coordinator_ws_url(&config.coordinator_ws)?;
     validate_ollama_model(&config.ollama_model)?;
     config.resource_settings.validate()?;
     let dir = path
@@ -386,8 +430,9 @@ mod tests {
     use super::{
         load_config_from, load_config_with_recovery_from, save_config_to, select_ollama_model,
         set_desktop_preferences_at, set_ollama_model_at, set_payout_address_at,
-        set_performance_percent_at, set_resource_settings_at, validate_ollama_model,
-        validate_payout_address, AppLanguage, DesktopPreferences, ProviderConfig, Theme,
+        set_performance_percent_at, set_resource_settings_at, validate_coordinator_ws_url,
+        validate_ollama_model, validate_payout_address, AppLanguage, DesktopPreferences,
+        ProviderConfig, Theme,
     };
     use crate::resource::{ResourceMode, ResourceSchedule, ResourceSettings};
 
@@ -404,6 +449,49 @@ mod tests {
     #[test]
     fn valid_payout_address() {
         assert!(validate_payout_address("0x1111111111111111111111111111111111111111").is_ok());
+    }
+
+    #[test]
+    fn coordinator_url_requires_tls_for_non_loopback_hosts() {
+        for valid in [
+            "ws://localhost:8081/ws",
+            "ws://127.0.0.1:8081/ws",
+            "ws://[::1]:8081/ws",
+            "wss://coordinator.example/ws",
+        ] {
+            assert!(validate_coordinator_ws_url(valid).is_ok(), "{valid}");
+        }
+
+        for invalid in [
+            "ws://coordinator.example/ws",
+            "http://localhost:8081/ws",
+            "wss://coordinator.example/",
+            "wss://user:secret@coordinator.example/ws",
+            "wss://@coordinator.example/ws",
+            "wss://coordinator.example:0/ws",
+            "wss://coordinator.example/ws?token=secret",
+            "wss://coordinator.example/ws#fragment",
+            " WS://localhost:8081/ws ",
+            "ws:localhost:8081/ws",
+            r"ws:\\localhost:8081\ws",
+        ] {
+            assert!(validate_coordinator_ws_url(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn invalid_coordinator_url_is_not_saved() {
+        let path = test_config_path();
+        let config = ProviderConfig::defaults();
+        save_config_to(&config, &path).unwrap();
+        let original = fs::read(&path).unwrap();
+
+        let mut invalid = config;
+        invalid.coordinator_ws = "ws://coordinator.example/ws".to_string();
+        assert!(save_config_to(&invalid, &path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+
+        remove_test_config(&path);
     }
 
     #[test]

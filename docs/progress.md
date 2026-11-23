@@ -6,7 +6,7 @@
 | 2. Connection resilience and single instance | PASS | Reconnect backoff, in-flight result discard, explicit connection state, and focus/restore on second launch verified. |
 | 3. First-run onboarding and data management | PASS | Adaptive startup readiness, first-run welcome, and local data-folder access verified. |
 | 4. Coordinator hardening (SQLite) | PASS | Durable job lifecycle and restart recovery verified with a real coordinator restart. |
-| 5. Coordinator URL and TLS | TODO | |
+| 5. Coordinator URL and TLS | PASS | Supports secure remote WebSocket endpoints and loopback-only plaintext; remote certificate handshake not live-verified. |
 | 6. Network-selected model | TODO | |
 | 7. Branding and installers | TODO | |
 | 8. Installed-app behavior (Windows) | TODO | |
@@ -44,4 +44,12 @@ Phase 4 evidence (all timestamps UTC):
 - Real restart check: submitted job `phase4-restart-73b1132341c8456ca2d3e24fa7f57b57`; it was queued at `2026-11-22T23:40:30.831Z`. Stopped coordinator PID `14916` at `23:40:38.565Z`; restarted as PID `2844` at `23:40:47.843Z`. Startup reported `1 jobs loaded; 1 queued`, and `GET /jobs/{id}` returned `status=queued`. Both runs used a temporary database and the configured test fee address.
 - Disk space before the first Phase 4 rebuild was C: 25.06 GB free and Q: 3.99 GB free. The first default-debug ignored-test build exhausted Q:. Only the dedicated build target `Q:\\gpu-swarm-phase4-88e391cb1c1c460d98e7` was removed; builds were then retried with reduced debug output and two jobs. No files under the repository other than project build output were deleted.
 
-Next: Phase 5 — coordinator URL and TLS.
+Phase 5 evidence (all timestamps UTC):
+- Added strict coordinator URL validation: `/ws` only, no credentials/query/fragment, and `ws://` restricted to `localhost`, `127.0.0.1`, and `::1`. Network hosts require `wss://`. Invalid values are rejected before managed setup and are never saved over the existing config.
+- Enabled native TLS for both provider WebSocket clients. TLS uses the operating system trust store; no certificate-validation bypass was added. The CLI fee endpoint maps `ws://.../ws` to `http://.../fees` and `wss://.../ws` to `https://.../fees`, with an explicit unit test.
+- `COORDINATOR_WS` now overrides the saved endpoint for both desktop and CLI processes. README documents URL rules and the override.
+- Full workspace tests: 95 passed, 0 failed, 4 ignored. Workspace clippy passed with the existing `while_let_loop` warning in `coordinator/src/main.rs`; `cargo fmt --all -- --check` passed. Explicitly ran all three ignored integration tests (`managed_provider_runs_a_job_and_stops`, `disconnect_during_job_discards_result_and_reconnects`, `performance_slider_controls_registration_and_job_flow`); all passed against a temporary coordinator and isolated config directory.
+- Pre-build free space was C: 21.39 GB and Q: 4.26 GB. Cargo used isolated `Q:\\gpu-swarm-phase5-88e391cb1c1c460d98e7` with reduced debug output and two build jobs. No live remote TLS endpoint/certificate was available, so a trusted remote TLS handshake remains NOT VERIFIED; local URL policy, TLS-enabled compilation, and HTTP/HTTPS endpoint selection are verified.
+- Final recheck after tightening raw URL parsing: `cargo test --workspace` again passed (95 passed, 0 failed, 4 ignored), formatting passed, and workspace clippy passed with only the pre-existing coordinator loop warning. Re-ran all three ignored integration tests explicitly against a fresh owned coordinator; all passed. Their log timestamps were `2026-11-23T00:15:08.621Z` (fee config), `00:15:16.412Z` (first completed job), `00:15:47.479Z` (provider listed paused at 0%), and `00:16:13.407Z` (100% job completed). Each job settlement showed payout 9000 and platform fee 1000. Temporary `GPUSWARM_CONFIG_DIR` and `GPUSWARM_DB_PATH` values were used; runtime/model cache remained in the existing LocalAppData install. Final pre-build free space: C: 21.35 GB, Q: 1.21 GB.
+
+Next: Phase 6 — network-selected model.

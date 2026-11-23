@@ -270,6 +270,8 @@ async fn run_provider_inner(
         resource_settings: mut settings_rx,
     } = control_receivers;
     config.resource_settings.validate()?;
+    let coordinator_url = std::env::var("COORDINATOR_WS").unwrap_or(config.coordinator_ws.clone());
+    crate::validate_coordinator_ws_url(&coordinator_url)?;
     let model = effective_ollama_model(&config)?.effective;
     let runtime_manager = RuntimeManager::new()?;
     if *stop_rx.borrow() {
@@ -356,6 +358,7 @@ async fn run_provider_inner(
             run_provider_connection(
                 config.clone(),
                 model.clone(),
+                coordinator_url.clone(),
                 ProviderConnectionContext {
                     runtime: &runtime,
                     options,
@@ -414,6 +417,7 @@ async fn run_provider_inner(
 async fn run_provider_connection(
     config: ProviderConfig,
     model: String,
+    coordinator_url: String,
     context: ProviderConnectionContext<'_>,
 ) -> Result<()> {
     let ProviderConnectionContext {
@@ -427,11 +431,6 @@ async fn run_provider_connection(
         event_callback,
         backoff,
     } = context;
-    let coordinator_url = if options.use_cli_environment_overrides {
-        std::env::var("COORDINATOR_WS").unwrap_or(config.coordinator_ws.clone())
-    } else {
-        config.coordinator_ws.clone()
-    };
     let provider_id = if options.use_cli_environment_overrides {
         std::env::var("PROVIDER_ID").unwrap_or(config.provider_id.clone())
     } else {

@@ -92,6 +92,11 @@ fn classify_error(technical: &str) -> UiError {
             UiErrorCategory::InvalidSetting,
             "Enter a valid payout address with a 0x prefix and 40 hexadecimal characters.",
         )
+    } else if lower.contains("coordinator url") || lower.contains("unencrypted coordinator urls") {
+        (
+            UiErrorCategory::InvalidSetting,
+            "The saved coordinator address is invalid. Update coordinator_ws in your settings file.",
+        )
     } else if lower.contains("did not become ready within") {
         (
             UiErrorCategory::SetupFailed,
@@ -1217,6 +1222,10 @@ mod tests {
         );
         assert_eq!(
             classify_error("Payout address must be 0x followed by 40 hex characters").category,
+            super::UiErrorCategory::InvalidSetting
+        );
+        assert_eq!(
+            classify_error("coordinator URL path must be /ws").category,
             super::UiErrorCategory::InvalidSetting
         );
     }

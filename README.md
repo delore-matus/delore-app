@@ -36,7 +36,7 @@ pause.
 
 | Variable | Default | Used by |
 |---|---|---|
-| `COORDINATOR_WS` | `ws://127.0.0.1:8081/ws` | Provider WebSocket URL |
+| `COORDINATOR_WS` | `ws://127.0.0.1:8081/ws` | Provider WebSocket URL and process override |
 | `PROVIDER_ID` | `provider-node-01` | Provider identity |
 | `OLLAMA_MODEL` | `llama3.2:3b` | Model fetched by the managed inference runtime |
 
@@ -47,6 +47,13 @@ $env:OLLAMA_MODEL = "llama3.2:3b"
 $env:PROVIDER_ID = "provider-node-01"
 $env:COORDINATOR_WS = "ws://127.0.0.1:8081/ws"
 ```
+
+Coordinator addresses must use the `/ws` endpoint. Plain `ws://` connections
+are accepted only for loopback hosts (`localhost`, `127.0.0.1`, or `::1`).
+Use `wss://` for any network host. TLS certificate validation uses the
+operating system's trusted certificate store; certificate-validation bypasses
+are not supported. The desktop app reads the saved `coordinator_ws` value and
+also honors `COORDINATOR_WS` when that environment variable is set at launch.
 
 For local testing only, set `PROVIDER_ID` before starting a provider to override
 the saved config for that process without changing `config.json`. This is useful

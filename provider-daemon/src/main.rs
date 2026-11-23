@@ -192,17 +192,22 @@ struct FeesStatus {
     fee_address: String,
 }
 
-fn coordinator_http_url(coordinator_ws: &str) -> String {
-    coordinator_ws
-        .strip_prefix("wss://")
-        .map(|url| format!("https://{url}"))
-        .or_else(|| {
-            coordinator_ws
-                .strip_prefix("ws://")
-                .map(|url| format!("http://{url}"))
-        })
-        .unwrap_or_else(|| coordinator_ws.to_string())
-        .replace("/ws", "/fees")
+fn coordinator_http_url(coordinator_ws: &str) -> Result<String> {
+    provider_core::validate_coordinator_ws_url(coordinator_ws)?;
+    let (scheme, endpoint) = coordinator_ws
+        .split_once("://")
+        .context("invalid coordinator WebSocket endpoint")?;
+    let http_scheme = if scheme.eq_ignore_ascii_case("wss") {
+        "https"
+    } else if scheme.eq_ignore_ascii_case("ws") {
+        "http"
+    } else {
+        anyhow::bail!("invalid coordinator WebSocket endpoint")
+    };
+    let authority = endpoint
+        .strip_suffix("/ws")
+        .context("invalid coordinator WebSocket endpoint")?;
+    Ok(format!("{http_scheme}://{authority}/fees"))
 }
 
 fn percent_from_bps(fee_bps: u64) -> String {
@@ -235,7 +240,7 @@ async fn print_status() -> Result<()> {
     if let Some(config) = config.as_ref() {
         let coordinator_ws =
             std::env::var("COORDINATOR_WS").unwrap_or_else(|_| config.coordinator_ws.clone());
-        let url = coordinator_http_url(&coordinator_ws);
+        let url = coordinator_http_url(&coordinator_ws)?;
         match reqwest::Client::new().get(url).send().await {
             Ok(response) if response.status().is_success() => {
                 match response.json::<FeesStatus>().await {
@@ -375,4 +380,26 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::coordinator_http_url;
+
+    #[test]
+    fn fee_endpoint_uses_http_or_https_for_the_coordinator_scheme() {
+        assert_eq!(
+            coordinator_http_url("ws://127.0.0.1:8081/ws").unwrap(),
+            "http://127.0.0.1:8081/fees"
+        );
+        assert_eq!(
+            coordinator_http_url("wss://coordinator.example/ws").unwrap(),
+            "https://coordinator.example/fees"
+        );
+        assert_eq!(
+            coordinator_http_url("WSS://coordinator.example/ws").unwrap(),
+            "https://coordinator.example/fees"
+        );
+        assert!(coordinator_http_url("ws://coordinator.example/ws").is_err());
+    }
 }
