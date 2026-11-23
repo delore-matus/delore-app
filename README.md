@@ -18,6 +18,12 @@ npm install
 cargo tauri dev
 ```
 
+For an unsigned Windows MSI, install the WiX Toolset v3.14 build tools and run
+`cargo tauri build --bundles msi --no-sign` from `desktop/`. The package uses
+the existing `icons/icon.ico`; the installer is not code-signed or intended for
+public distribution until a signing certificate and final brand assets are
+available.
+
 The desktop UI does not shell out to `gpuswarm`. Both the app and CLI use
 `provider-core` for provider control, configuration, the managed process, and
 job execution.

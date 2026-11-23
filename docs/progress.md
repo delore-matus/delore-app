@@ -8,7 +8,7 @@
 | 4. Coordinator hardening (SQLite) | PASS | Durable job lifecycle and restart recovery verified with a real coordinator restart. |
 | 5. Coordinator URL and TLS | PASS | Supports secure remote WebSocket endpoints and loopback-only plaintext; remote certificate handshake not live-verified. |
 | 6. Network-selected model | PASS | Coordinator `/fees` publishes the validated network model; providers prefer it over saved config, with backward-compatible fallback. |
-| 7. Branding and installers | TODO | |
+| 7. Branding and installers | PASS | Built an unsigned Windows MSI using the existing interim icon; signing and final brand assets remain unverified. |
 | 8. Installed-app behavior (Windows) | TODO | |
 | 9. Whole-app end-to-end test | TODO | |
 
@@ -58,4 +58,11 @@ Phase 6 evidence (all timestamps UTC):
 - `cargo test --workspace`: 100 passed, 0 failed, 4 ignored. `cargo clippy --workspace --all-targets` passed with only the existing coordinator `while_let_loop` warning; `cargo fmt --all -- --check` passed. Explicitly ran all three ignored integration tests (`managed_provider_runs_a_job_and_stops`, `disconnect_during_job_discards_result_and_reconnects`, `performance_slider_controls_registration_and_job_flow`); all passed against an owned coordinator with isolated `GPUSWARM_CONFIG_DIR` and `GPUSWARM_DB_PATH`.
 - Before the Phase 6 full build, free space was C: 21.34 GB and Q: 4.26 GB. Cargo used isolated `Q:\\gpu-swarm-phase6-88e391cb1c1c460d98e7`; no real `%APPDATA%\\GpuSwarm\\config.json` was accessed.
 
-Next: Phase 7 — branding and installers.
+Phase 7 evidence:
+- Enabled the Windows MSI bundle in Tauri and documented the unsigned build command and distribution caveats. Used the existing `desktop/src-tauri/icons/icon.ico` unchanged; no final logo or signing certificate was supplied or used.
+- `cargo tauri build --bundles msi --no-sign --ci` passed and produced `DeLore_0.1.0_x64_en-US.msi` (4,874,240 bytes). The MSI was retained separately from the removable Cargo target.
+- `npm --prefix desktop test`: 5 passed. `npm --prefix desktop run build` passed. `cargo fmt --all -- --check` passed. `cargo test --workspace`: 100 passed, 0 failed, 4 ignored. `cargo clippy --workspace --all-targets` passed with the existing coordinator `while_let_loop` warning.
+- Explicitly ran all four ignored tests: `close_shutdown_helper_stops_the_managed_runtime`, `managed_provider_runs_a_job_and_stops`, `disconnect_during_job_discards_result_and_reconnects`, and `performance_slider_controls_registration_and_job_flow`; all passed. The coordinator used `GPUSWARM_NETWORK_MODEL=llama3.2:1b`, the configured fee address, and a temporary SQLite database; providers used an isolated `GPUSWARM_CONFIG_DIR`.
+- The first ignored-test attempt selected the coordinator's default `llama3.2:3b` and timed out while preparing that uncached selection. No user data was deleted. Restarting the owned test coordinator with the cached `llama3.2:1b` made all four ignored tests pass. No managed engine process remained after the runs.
+
+Next: Phase 8 — installed-app behavior on Windows.
