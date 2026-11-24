@@ -8,9 +8,9 @@
 | 4. Coordinator hardening (SQLite) | PASS | Durable job lifecycle and restart recovery verified with a real coordinator restart. |
 | 5. Coordinator URL and TLS | PASS | Supports secure remote WebSocket endpoints and loopback-only plaintext; remote certificate handshake not live-verified. |
 | 6. Network-selected model | PASS | Coordinator `/fees` publishes the validated network model; providers prefer it over saved config, with backward-compatible fallback. |
-| 7. Branding and installers | PASS | Official logo installed, MSI and NSIS targets configured, cross-platform workflow added. Signing and live 3-OS build remain external. |
-| 8. Installed-app behavior (Windows) | BLOCKED | MSI inspection reports ALLUSERS=1; no system-wide install was performed. Per-user install authorization was not granted. |
-| 9. Whole-app end-to-end test | NOT DONE | Blocked behind Phase 8 installed-app verification. |
+| 7. Branding and installers | PASS | Official logo and Windows NSIS package verified; workflow syntax passes actionlint. macOS/Linux builds and signing remain external. |
+| 8. Installed-app behavior (Windows) | PARTIAL | Per-user NSIS install/uninstall and key cleanup pass. Fresh-cache setup, visible notification delivery, and native tray Quit remain unverified. |
+| 9. Whole-app end-to-end test | PARTIAL | Slider, settlement acknowledgements, duplicate-job rejection, UI pause/resume, tray-close, and single-instance restore verified; tray-menu actions and data deletion remain unverified. |
 
 Implementation commits are recorded in git history.
 
@@ -65,14 +65,25 @@ Phase 7 evidence:
 - Explicitly ran all four ignored tests: `close_shutdown_helper_stops_the_managed_runtime`, `managed_provider_runs_a_job_and_stops`, `disconnect_during_job_discards_result_and_reconnects`, and `performance_slider_controls_registration_and_job_flow`; all passed. The coordinator used `GPUSWARM_NETWORK_MODEL=llama3.2:1b`, the configured fee address, and a temporary SQLite database; providers used an isolated `GPUSWARM_CONFIG_DIR`.
 - The first ignored-test attempt selected the coordinator's default `llama3.2:3b` and timed out while preparing that uncached selection. No user data was deleted. Restarting the owned test coordinator with the cached `llama3.2:1b` made all four ignored tests pass. No managed engine process remained after the runs.
 
-Next: Phase 8 — installed-app behavior on Windows.
+Phase 7 branding and packaging update:
+- The official green/black D asset is used by the desktop and website; the website files were not changed in this verification pass. The logo snapshot test passes.
+- The workflow uses a Windows/macOS/Linux matrix, Rust and npm caching, stable NSIS/DMG/AppImage/deb artifact names, and draft releases for `v*` tags. Signing values are commented placeholders. `actionlint .github/workflows/build.yml` exits 0 with no diagnostics.
+- Windows NSIS was built and installed per-user; MSI was built previously but was not installed or attached to the draft release. macOS and Linux remain unverified until the first GitHub Actions run.
 
-Phase 7 logo and packaging update:
-- The official attached green/black D logo was copied to `desktop/logo.png` and `website/logo.png`, Tauri icons were generated, and the desktop sidebar plus website navbar/hero now render the image.
-- Logo snapshot test passed; `npm --prefix desktop test` passed 6 tests and `npm --prefix desktop run build` passed.
-- Tauri bundle targets were expanded to MSI and NSIS. A fresh release build produced MSI 5,668,864 bytes and NSIS 4,020,180 bytes using the new icons.
-- GitHub Actions workflow provides Windows/macOS/Linux matrix build jobs, Cargo/npm caching, stable artifact collection names, and a draft release on `v*` tags. Signing secrets are placeholders.
+Phase 8/9 verification (2026-11-24, UTC):
+- Disk before the final build: C: 9.84 GB free; Q: 4.26 GB free. The isolated Cargo target was `C:\gpu-swarm-target-scope-88e391cb` on C:. The target remains build output and is removed after final verification.
+- Rebuilt the current-user NSIS installer with `cargo tauri build --bundles nsis --no-sign --ci`; output was `DeLore_0.1.0_x64-setup.exe` (3.84 MiB). No MSI was installed.
+- Silent per-user installation created `desktop.exe` and `uninstall.exe`, `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\DeLore`, and the Tauri install-location key `HKCU\Software\delore\DeLore`. Enabling Start on login through Settings created `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\DeLore` pointing to the installed executable; disabling it removed the value.
+- The first uninstaller removed the files, uninstall registration, and startup value but left the install-location key. Added `nsis-hooks.nsh` as a post-uninstall hook, rebuilt, and repeated installation/uninstallation. The final check reported the install directory, uninstall key, app key, company key, startup value, and app/engine processes all absent.
+- The installed app used the isolated `%TEMP%\DeLore-Phase9-Final\config` directory for `config.json`, `earnings.json`, and logs; the real `%APPDATA%\GpuSwarm\config.json` was not accessed. The shell was medium-integrity/non-elevated. Runtime/model files were already cached, so a cold download on a fresh install remains NOT VERIFIED.
+- The UI displayed “Preparing DeLore” at `2026-11-24T22:26:27Z`; `GET /providers` listed the provider at `22:26:58Z`. It was listed idle/accepting jobs after preparation. The configured 5-minute idle policy did not prevent registration on this run.
+- With the installed app and isolated coordinator, a 5-second coordinator timeout changed job `phase9-ack-rejection-d33fd45d699341478e5706930fd56ba6` from running (`22:27:12Z`) to failed (`22:27:16Z`). The inference completed later, but result acknowledgement prevented local earnings: the entry was failed, local balance was 0, and coordinator earnings remained 0.
+- After restarting the owned coordinator with `JOB_TIMEOUT_SECS=180` and `GPUSWARM_NETWORK_MODEL=llama3.2:1b`, job `phase9-ack-accepted-3819b1d3f6a744e38d3ceb107e89edf7` completed with gross 10000, payout 9000, fee 1000, and provider duration 7405 ms. A second completed notification-trigger job also settled at 9000/1000. Local completed earnings and the coordinator's exported pending-payout ledger both summed to 18000 units across the same two job IDs.
+- UI Pause showed “Paused by user”; Resume restored `user_paused=false` and provider availability. Reposting the completed ID returned HTTP 409 and left its result/settlement unchanged. The duplicate-result regression test confirms a second result is ignored.
+- With Keep running in tray enabled, a normal close hid the window while the app/provider remained alive and listed. Launching the installed executable again exited the second process and restored the original window. With the preference disabled, a follow-up close of the active-provider window stopped the app and managed engine. The UI Stop-then-close path also exited with no managed process.
+- Start-on-login enable/disable and keep-in-tray enable/disable were exercised through the real Settings controls. Notifications were enabled and a job completed, but a visible Windows toast was not observed. Native tray Pause/Resume and Quit menu selection were not driven, and no UI delete-data action was available to verify.
+- Real UI slider evidence from the prior phase: at 0% the provider stayed listed as paused and a job stayed queued for 30 seconds; moving to 50% resumed it and settled 9000/1000; at 100%, two back-to-back jobs completed without a cooldown. The latest explicit integration run also logged `pause_ms=9941` for a 9941 ms job at 50%, and completed two 100% jobs back-to-back.
+- Final validation: `cargo test --workspace` passed 113 tests (0 failed, 4 ignored); all four ignored tests passed explicitly; `cargo clippy --workspace --all-targets` passed without warnings; desktop tests passed 6/6 and the production build passed. Full raw output is recorded in the session transcript.
+- `desktop/index.html` and `desktop/dist` have no matches for `Ollama`, `runtime`, `sidecar`, model names, `pull`, or `model`.
 
-Phase 8 safety report:
-- The MSI properties report `ALLUSERS=1` and no `MSIINSTALLPERUSER` property. It is machine-wide in scope.
-- No MSI or NSIS installation was performed; no system-wide registry, Add/Remove Programs, or autostart changes were made.
+Remaining NOT VERIFIED: macOS/Linux builds, NVIDIA/AMD execution, real battery and idle transitions, a fresh-cache runtime/model download, visible notification delivery, native tray menu actions, and a UI data-deletion flow. Live payouts, signing, and hosting remain BLOCKED by the mock-only scope and unavailable external credentials/services.
