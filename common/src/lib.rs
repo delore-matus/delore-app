@@ -71,6 +71,8 @@ pub struct FeeConfig {
     pub job_price_units: u64,
     pub provider_payout_units: u64,
     pub fee_address: String,
+    #[serde(default)]
+    pub result_acknowledgements: bool,
 }
 
 /// Messages exchanged over the coordinator/provider WebSocket.
@@ -88,6 +90,14 @@ pub enum WsMessage {
     #[serde(rename = "result")]
     Result(JobResult),
 
+    /// Confirms whether the coordinator accepted a provider result.
+    #[serde(rename = "result_ack")]
+    ResultAck {
+        job_id: String,
+        accepted: bool,
+        error: Option<String>,
+    },
+
     /// A provider's identity and GPU details sent after connecting.
     #[serde(rename = "register")]
     Register(ProviderRegistration),
@@ -103,7 +113,7 @@ pub enum WsMessage {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_valid_model_name, ProviderRegistration, WsMessage};
+    use super::{is_valid_model_name, FeeConfig, ProviderRegistration, WsMessage};
 
     #[test]
     fn model_names_use_a_restricted_safe_character_set() {
@@ -144,5 +154,24 @@ mod tests {
         let json = serde_json::to_value(message).unwrap();
         assert_eq!(json["type"], "availability");
         assert_eq!(json["payload"]["accepting_jobs"], false);
+    }
+
+    #[test]
+    fn older_fee_config_defaults_to_no_result_acknowledgement() {
+        let fees: FeeConfig = serde_json::from_str(
+            r#"{"fee_bps":1000,"job_price_units":10000,"provider_payout_units":9000,"fee_address":"0x1111111111111111111111111111111111111111"}"#,
+        )
+        .unwrap();
+        assert!(!fees.result_acknowledgements);
+
+        let ack = WsMessage::ResultAck {
+            job_id: "job-1".to_string(),
+            accepted: false,
+            error: Some("rejected".to_string()),
+        };
+        let encoded = serde_json::to_value(ack).unwrap();
+        assert_eq!(encoded["type"], "result_ack");
+        assert_eq!(encoded["payload"]["job_id"], "job-1");
+        assert_eq!(encoded["payload"]["accepted"], false);
     }
 }

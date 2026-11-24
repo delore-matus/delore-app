@@ -565,6 +565,7 @@ async fn run_provider_connection(
 
     let (mut sender, mut receiver) = websocket.split();
     let mut fee_config: Option<FeeConfig> = None;
+    let mut result_acknowledgements = false;
     let registration = WsMessage::Register(ProviderRegistration {
         provider_id: provider_id.clone(),
         payout_address,
@@ -943,16 +944,33 @@ async fn run_provider_connection(
                             );
                             break 'connection;
                         }
+                        let mut finished_result = result.clone();
+                        if result_acknowledgements {
+                            let Some((accepted, error)) =
+                                await_result_ack(&mut receiver, &mut sender, stop_rx, &job.id)
+                                    .await?
+                            else {
+                                break 'connection;
+                            };
+                            apply_result_ack(&mut finished_result, accepted, error);
+                        }
                         event_callback(ProviderEvent::JobFinished {
-                            result: result.clone(),
+                            result: finished_result.clone(),
                         });
 
-                        if let Some(fees) = &fee_config {
+                        if finished_result.error.is_none() {
+                            if let Some(fees) = &fee_config {
+                                crate::technical_log!(
+                                    "Job {} complete. You earned {} units (fee: {} units)",
+                                    job.id,
+                                    fees.provider_payout_units,
+                                    fees.job_price_units - fees.provider_payout_units
+                                );
+                            }
+                        } else {
                             crate::technical_log!(
-                                "Job {} complete. You earned {} units (fee: {} units)",
-                                job.id,
-                                fees.provider_payout_units,
-                                fees.job_price_units - fees.provider_payout_units
+                                "Coordinator did not confirm a payout for job {}",
+                                job.id
                             );
                         }
                         crate::technical_log!("Sent inference result for job {}", job.id);
@@ -993,12 +1011,18 @@ async fn run_provider_connection(
                     WsMessage::Result(result) => {
                         crate::technical_log!("Ignoring unexpected result message: {result:?}");
                     }
+                    WsMessage::ResultAck { job_id, .. } => {
+                        crate::technical_log!(
+                            "Ignoring unexpected result acknowledgement for job {job_id}"
+                        );
+                    }
                     WsMessage::Register(registration) => {
                         crate::technical_log!(
                             "Ignoring unexpected provider registration: {registration:?}"
                         );
                     }
                     WsMessage::FeeConfig(fees) => {
+                        result_acknowledgements = fees.result_acknowledgements;
                         crate::technical_log!(
                             "Platform fee: {} bps — you receive {} units per job.",
                             fees.fee_bps,
@@ -1050,6 +1074,74 @@ async fn run_provider_connection(
 
 type CoordinatorSocket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+fn apply_result_ack(result: &mut JobResult, accepted: bool, error: Option<String>) {
+    if !accepted && result.error.is_none() {
+        result.error = Some(error.unwrap_or_else(|| {
+            "Coordinator rejected this result; no payout was recorded.".to_string()
+        }));
+    }
+}
+
+async fn await_result_ack(
+    receiver: &mut futures_util::stream::SplitStream<CoordinatorSocket>,
+    sender: &mut futures_util::stream::SplitSink<CoordinatorSocket, Message>,
+    stop_rx: &mut watch::Receiver<bool>,
+    job_id: &str,
+) -> Result<Option<(bool, Option<String>)>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let message = tokio::select! {
+            biased;
+            _ = wait_for_stop(stop_rx) => {
+                let _ = sender.send(Message::Close(None)).await;
+                return Ok(None);
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                anyhow::bail!("timed out waiting for coordinator result acknowledgement")
+            }
+            message = receiver.next() => message,
+        };
+        match message {
+            Some(Ok(Message::Text(json))) => match serde_json::from_str::<WsMessage>(&json) {
+                Ok(WsMessage::ResultAck {
+                    job_id: acknowledged_job_id,
+                    accepted,
+                    error,
+                }) if acknowledged_job_id == job_id => return Ok(Some((accepted, error))),
+                Ok(WsMessage::ResultAck {
+                    job_id: acknowledged_job_id,
+                    ..
+                }) => crate::technical_log!(
+                    "Ignoring result acknowledgement for unexpected job {}",
+                    acknowledged_job_id
+                ),
+                Ok(_) => crate::technical_log!(
+                    "Ignoring unexpected coordinator message while awaiting result acknowledgement"
+                ),
+                Err(error) => crate::technical_log!(
+                    "Ignoring invalid coordinator message while awaiting result acknowledgement: {error}"
+                ),
+            },
+            Some(Ok(Message::Ping(payload))) => {
+                sender
+                    .send(Message::Pong(payload))
+                    .await
+                    .context("failed to respond to coordinator keepalive")?;
+            }
+            Some(Ok(Message::Close(_))) | None => return Ok(None),
+            Some(Ok(Message::Pong(_))) => {}
+            Some(Ok(Message::Binary(_))) | Some(Ok(Message::Frame(_))) => {
+                crate::technical_log!(
+                    "Ignoring unexpected coordinator frame while awaiting result acknowledgement"
+                );
+            }
+            Some(Err(error)) => {
+                return Err(error).context("failed while awaiting coordinator result acknowledgement")
+            }
+        }
+    }
+}
 
 async fn refresh_policy(
     settings: &ResourceSettings,
@@ -1202,12 +1294,13 @@ fn emit_failure(callback: &ProviderEventCallback, error: &anyhow::Error) {
 #[cfg(test)]
 mod tests {
     use super::{
-        connect_with_retry, provider_control_channel, run_provider_managed, ConnectionState,
-        ProviderConfig, ProviderEvent, ProviderEventCallback, ReconnectBackoff,
+        apply_result_ack, connect_with_retry, provider_control_channel, run_provider_managed,
+        ConnectionState, ProviderConfig, ProviderEvent, ProviderEventCallback, ReconnectBackoff,
         RuntimeProgressCallback, RuntimeState,
     };
     use super::{select_network_model, CoordinatorFeesResponse};
     use crate::{ResourceMode, ResourceSettings};
+    use common::JobResult;
     use std::{
         sync::{Arc, Mutex},
         time::{Duration, Instant},
@@ -1247,6 +1340,30 @@ mod tests {
     fn older_coordinator_fees_response_uses_saved_model() {
         let fees: CoordinatorFeesResponse = serde_json::from_str(r#"{"fee_bps":1000}"#).unwrap();
         assert_eq!(fees.network_model, None);
+    }
+
+    #[test]
+    fn coordinator_rejection_marks_result_failed_for_ui_history() {
+        let mut result = JobResult {
+            job_id: "job-1".to_string(),
+            provider_id: "provider-1".to_string(),
+            result_data: "done".to_string(),
+            duration_ms: 10,
+            eval_count: 1,
+            tokens_per_sec: 1.0,
+            error: None,
+        };
+
+        apply_result_ack(
+            &mut result,
+            false,
+            Some("Job result was rejected; no payout was recorded.".to_string()),
+        );
+
+        assert_eq!(
+            result.error.as_deref(),
+            Some("Job result was rejected; no payout was recorded.")
+        );
     }
 
     #[tokio::test]
@@ -1388,6 +1505,65 @@ mod tests {
                 message: Some(message),
             } if message.contains("failed to connect to coordinator")
         )));
+    }
+
+    #[tokio::test]
+    async fn rejects_a_self_signed_websocket_certificate_by_default() {
+        use tokio::sync::oneshot;
+        use tokio_rustls::{
+            rustls::{
+                pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
+                ServerConfig,
+            },
+            TlsAcceptor,
+        };
+
+        let certificate =
+            rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let cert = CertificateDer::from(certificate.cert.der().to_vec());
+        let key = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(
+            certificate.key_pair.serialize_der(),
+        ));
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = accepted_tx.send(());
+            let _ = acceptor.accept(stream).await;
+        });
+
+        let url = format!("wss://{address}/ws");
+        let (stop, mut stop_rx) = watch::channel(false);
+        let callback: ProviderEventCallback = Arc::new(|_| {});
+        let result = timeout(
+            Duration::from_secs(5),
+            connect_with_retry(
+                &url,
+                false,
+                &mut stop_rx,
+                &callback,
+                &mut ReconnectBackoff::default(),
+            ),
+        )
+        .await
+        .expect("TLS connection attempt should finish promptly");
+
+        assert!(
+            accepted_rx.await.is_ok(),
+            "client must reach the TLS server"
+        );
+        assert!(
+            result.is_err(),
+            "a self-signed certificate must not be trusted by default"
+        );
+        drop(stop);
+        server.await.unwrap();
     }
 
     #[test]

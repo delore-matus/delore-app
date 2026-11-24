@@ -34,10 +34,8 @@ use tokio::sync::{mpsc, watch, Mutex};
 mod storage;
 use storage::JobStore;
 
-mod payout;
-
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
-type ProviderSenderMap = HashMap<String, (u64, mpsc::UnboundedSender<JobPayload>)>;
+type ProviderSenderMap = HashMap<String, (u64, mpsc::UnboundedSender<WsMessage>)>;
 
 /// Application state shared by HTTP and WebSocket handlers.
 #[derive(Clone)]
@@ -55,8 +53,6 @@ struct AppState {
     provider_senders: Arc<Mutex<ProviderSenderMap>>,
     /// Connected provider details and mock earning counters.
     providers: Arc<Mutex<HashMap<String, ProviderInfo>>>,
-    /// SHA-256 hashes for provider authentication secrets; old providers use no secret.
-    provider_token_hashes: Arc<Mutex<HashMap<String, String>>>,
     /// Fixed-window request counts keyed by client IP.
     request_windows: Arc<Mutex<HashMap<String, (Instant, u32)>>>,
     fees: FeeSettings,
@@ -216,27 +212,20 @@ fn apply_completed_job_result(
     result: &JobResult,
     fees: &FeeSettings,
 ) -> bool {
-    if let Some(existing) = jobs.get(&result.job_id) {
-        if matches!(existing.status.as_str(), "completed" | "failed") {
-            eprintln!(
-                "Ignoring repeated result for terminal job {}",
-                result.job_id
-            );
-            return false;
-        }
+    let Some(record) = jobs.get_mut(&result.job_id) else {
+        eprintln!("Ignoring result for unknown job {}", result.job_id);
+        return false;
+    };
+    if record.status != "running"
+        || record.provider_id.as_deref() != Some(result.provider_id.as_str())
+    {
+        eprintln!(
+            "Ignoring result for job {} that is not running on provider {}",
+            result.job_id, result.provider_id
+        );
+        return false;
     }
     let (platform_fee, provider_payout) = calculate_fee(fees.job_price_units, fees.fee_bps);
-    let record = jobs
-        .entry(result.job_id.clone())
-        .or_insert_with(|| JobRecord {
-            id: result.job_id.clone(),
-            prompt: String::new(),
-            status: "queued".to_string(),
-            provider_id: None,
-            result: None,
-            fee_breakdown: None,
-            error: None,
-        });
     record.status = "completed".to_string();
     record.provider_id = Some(result.provider_id.clone());
     record.result = Some(result.clone());
@@ -302,7 +291,7 @@ fn payment_header_status(header: Option<&str>) -> StatusCode {
     match header {
         None => StatusCode::PAYMENT_REQUIRED,
         Some(value) if value.trim().is_empty() => StatusCode::PAYMENT_REQUIRED,
-        Some(value) if value == "mock" || value.starts_with("0x") => StatusCode::OK,
+        Some("mock") => StatusCode::OK,
         Some(_) => StatusCode::UNAUTHORIZED,
     }
 }
@@ -328,33 +317,15 @@ fn hash_provider_secret(secret: &str) -> String {
     format!("{:x}", Sha256::digest(secret.as_bytes()))
 }
 
-fn validate_provider_credentials(
-    known: &HashMap<String, String>,
-    provider_id: &str,
-    wallet_address: &str,
-    auth_token: &str,
-) -> bool {
-    if auth_token.is_empty() {
-        return wallet_address == "not-set" || validate_fee_address(Some(wallet_address)).is_ok();
-    }
-    if validate_fee_address(Some(wallet_address)).is_err() {
-        return false;
-    }
-    match known.get(provider_id) {
-        Some(expected) => expected == &hash_provider_secret(auth_token),
-        None => true,
-    }
-}
-
-/// POST /request-job: require X-Payment, then enqueue a valid JobPayload.
+/// POST /request-job: require the explicit mock marker, then enqueue a job.
 async fn request_job(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(job): Json<JobPayload>,
 ) -> impl IntoResponse {
-    // Header presence is intentionally treated as the entire mock payment
-    // check. This prototype does not validate currency or perform any payment.
+    // This prototype accepts only a mock marker; signature verification and
+    // real payment processing are not implemented.
     let payment_status = payment_header_status(
         headers
             .get("x-payment")
@@ -375,12 +346,7 @@ async fn request_job(
     }
     {
         let mut windows = state.request_windows.lock().await;
-        if !check_request_rate_limit(
-            &mut windows,
-            &peer.ip().to_string(),
-            Instant::now(),
-            60,
-        ) {
+        if !check_request_rate_limit(&mut windows, &peer.ip().to_string(), Instant::now(), 60) {
             return (
                 StatusCode::TOO_MANY_REQUESTS,
                 Json(ErrorResponse {
@@ -459,9 +425,9 @@ async fn assign_pending_job(state: AppState) {
             let sender_map = state.provider_senders.lock().await;
             sender_map
                 .get(&provider_id)
-                .map(|(_, sender)| sender.clone())
+                .map(|(connection_id, sender)| (*connection_id, sender.clone()))
         };
-        let Some(sender) = sender else {
+        let Some((connection_id, sender)) = sender else {
             break;
         };
 
@@ -485,12 +451,26 @@ async fn assign_pending_job(state: AppState) {
             eprintln!("Failed to persist running job {job_id}: {error:#}");
             break;
         }
-        if sender.send(job).is_err() {
-            state.pending_jobs.lock().await.pop_front();
+        if sender.send(WsMessage::Job(job)).is_err() {
             if let Err(error) = state.job_store.save_job(record).await {
                 eprintln!("Failed to restore queued job {job_id}: {error:#}");
             }
-            continue;
+            let removed_connection = {
+                let mut senders = state.provider_senders.lock().await;
+                if senders
+                    .get(&provider_id)
+                    .is_some_and(|(active_id, _)| *active_id == connection_id)
+                {
+                    senders.remove(&provider_id);
+                    true
+                } else {
+                    false
+                }
+            };
+            if removed_connection {
+                state.providers.lock().await.remove(&provider_id);
+            }
+            break;
         }
         state.pending_jobs.lock().await.pop_front();
 
@@ -502,6 +482,7 @@ async fn assign_pending_job(state: AppState) {
             .lock()
             .await
             .insert(job_id.clone(), running_record);
+        println!("Assigned job {job_id} to provider {provider_id}");
 
         let timeout_state = state.clone();
         let timeout_job_id = job_id.clone();
@@ -535,14 +516,18 @@ async fn assign_pending_job(state: AppState) {
                 if let Err(error) = timeout_state.job_store.save_job(job).await {
                     eprintln!("Failed to persist timed-out job {timeout_job_id}: {error:#}");
                 }
-            }
-            if let Some(provider) = timeout_state
-                .providers
-                .lock()
-                .await
-                .get_mut(&timeout_provider_id)
-            {
-                provider.status = "idle".to_string();
+                if let Some(provider) = timeout_state
+                    .providers
+                    .lock()
+                    .await
+                    .get_mut(&timeout_provider_id)
+                {
+                    provider.status = if provider.accepting_jobs {
+                        "idle".to_string()
+                    } else {
+                        "paused".to_string()
+                    };
+                }
             }
         });
     }
@@ -629,7 +614,7 @@ async fn handle_websocket(socket: WebSocket, state: AppState) {
     let (mut sender, mut receiver) = socket.split();
     let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
     let active_provider_id = Arc::new(Mutex::new(None::<String>));
-    let (job_tx, mut job_rx) = mpsc::unbounded_channel::<JobPayload>();
+    let (job_tx, mut job_rx) = mpsc::unbounded_channel::<WsMessage>();
     // Closing this watch channel tells the send task to stop if the provider
     // disappears or the receive side of the socket closes.
     let (close_tx, close_rx) = watch::channel(false);
@@ -644,40 +629,50 @@ async fn handle_websocket(socket: WebSocket, state: AppState) {
     let send_task = tokio::spawn(async move {
         let mut close_rx = close_rx;
         let mut keepalive = tokio::time::interval(Duration::from_secs(30));
-        #[allow(clippy::while_let_loop)]
         if let Ok(json) = serde_json::to_string(&WsMessage::FeeConfig(SharedFeeConfig {
             fee_bps: send_fees.fee_bps,
             job_price_units: send_fees.job_price_units,
             provider_payout_units: calculate_fee(send_fees.job_price_units, send_fees.fee_bps).1,
             fee_address: send_fees.platform_address.clone(),
+            result_acknowledgements: true,
         })) {
             if sender.send(Message::Text(json)).await.is_err() {
                 let _ = send_close_tx.send(true);
                 return;
             }
         }
-        while let Some(job) = tokio::select! {
-            changed = close_rx.changed() => {
-                let _ = changed;
-                None
-            }
-            received = job_rx.recv() => received,
-            _ = keepalive.tick() => {
-                if sender.send(Message::Ping(Vec::new())).await.is_err() {
-                    let _ = send_close_tx.send(true);
+        loop {
+            let message = tokio::select! {
+                changed = close_rx.changed() => {
+                    let _ = changed;
+                    break;
                 }
-                None
-            },
-        } {
-            match serde_json::to_string(&WsMessage::Job(job)) {
+                received = job_rx.recv() => match received {
+                    Some(job) => job,
+                    None => break,
+                },
+                _ = keepalive.tick() => {
+                    if sender.send(Message::Ping(Vec::new())).await.is_err() {
+                        let _ = send_close_tx.send(true);
+                        break;
+                    }
+                    continue;
+                },
+            };
+            let is_job = matches!(&message, WsMessage::Job(_));
+            match serde_json::to_string(&message) {
                 Ok(json) => {
                     if sender.send(Message::Text(json)).await.is_err() {
                         let _ = send_close_tx.send(true);
                         break;
                     }
-                    if let Some(provider_id) = send_provider_id.lock().await.clone() {
-                        if let Some(provider) = send_providers.lock().await.get_mut(&provider_id) {
-                            provider.status = "busy".to_string();
+                    if is_job {
+                        if let Some(provider_id) = send_provider_id.lock().await.clone() {
+                            if let Some(provider) =
+                                send_providers.lock().await.get_mut(&provider_id)
+                            {
+                                provider.status = "busy".to_string();
+                            }
                         }
                     }
                 }
@@ -702,6 +697,8 @@ async fn handle_websocket(socket: WebSocket, state: AppState) {
                 Ok(Message::Text(json)) => match serde_json::from_str::<WsMessage>(&json) {
                     Ok(WsMessage::Result(result)) => {
                         println!("Received JobResult: {result:?}");
+                        let mut accepted = false;
+                        let mut acknowledgement_error = None;
                         if result.error.is_none() {
                             let (platform_fee, provider_payout) =
                                 calculate_fee(receive_fees.job_price_units, receive_fees.fee_bps);
@@ -733,60 +730,73 @@ async fn handle_websocket(socket: WebSocket, state: AppState) {
                                             .get(&result.provider_id)
                                             .map(|provider| provider.payout_address.as_str())
                                             .unwrap_or("not-set"),
+                                        &result.job_id,
                                         provider_payout,
                                     )
                                     .await
                                 {
                                     eprintln!("Failed to persist pending payout: {error:#}");
                                 }
-                            }
-                            append_line(
-                                "completed_jobs.log",
-                                &format!(
-                                    "[SUCCESS] Job {} completed by {}. Result: {}",
-                                    result.job_id, result.provider_id, result.result_data
-                                ),
-                            );
-                            {
-                                let mut providers = receive_providers.lock().await;
-                                if let Some(provider) = providers.get_mut(&result.provider_id) {
-                                    provider.status = if provider.accepting_jobs {
-                                        "idle".to_string()
-                                    } else {
-                                        "paused".to_string()
-                                    };
-                                    provider.jobs_completed =
-                                        provider.jobs_completed.saturating_add(1);
-                                    provider.total_earned_units =
-                                        provider.total_earned_units.saturating_add(provider_payout);
+                                accepted = true;
+                                append_line(
+                                    "completed_jobs.log",
+                                    &format!(
+                                        "[SUCCESS] Job {} completed by {}. Result: {}",
+                                        result.job_id, result.provider_id, result.result_data
+                                    ),
+                                );
+                                {
+                                    let mut providers = receive_providers.lock().await;
+                                    if let Some(provider) = providers.get_mut(&result.provider_id) {
+                                        provider.status = if provider.accepting_jobs {
+                                            "idle".to_string()
+                                        } else {
+                                            "paused".to_string()
+                                        };
+                                        provider.jobs_completed =
+                                            provider.jobs_completed.saturating_add(1);
+                                        provider.total_earned_units = provider
+                                            .total_earned_units
+                                            .saturating_add(provider_payout);
+                                    }
                                 }
+                                append_line(
+                                    "earnings.log",
+                                    &format!(
+                                        "timestamp={} job_id={} provider_id={} payout_address={} gross_price={} platform_fee={} provider_payout={} fee_bps={} fee_address={} fee_amount={}",
+                                        timestamp_millis(),
+                                        result.job_id,
+                                        result.provider_id,
+                                        receive_providers
+                                            .lock()
+                                            .await
+                                            .get(&result.provider_id)
+                                            .map(|provider| provider.payout_address.as_str())
+                                            .unwrap_or("not-set"),
+                                        receive_fees.job_price_units,
+                                        platform_fee,
+                                        provider_payout,
+                                        receive_fees.fee_bps,
+                                        receive_fees.platform_address,
+                                        platform_fee
+                                    ),
+                                );
+                            } else {
+                                acknowledgement_error = Some(
+                                    "The coordinator did not accept this result; no payout was recorded."
+                                        .to_string(),
+                                );
                             }
-                            assign_pending_job(receive_state.clone()).await;
-                            append_line(
-                                "earnings.log",
-                                &format!(
-                                    "timestamp={} job_id={} provider_id={} payout_address={} gross_price={} platform_fee={} provider_payout={} fee_bps={} fee_address={} fee_amount={}",
-                                    timestamp_millis(),
-                                    result.job_id,
-                                    result.provider_id,
-                                    receive_providers
-                                        .lock()
-                                        .await
-                                        .get(&result.provider_id)
-                                        .map(|provider| provider.payout_address.as_str())
-                                        .unwrap_or("not-set"),
-                                    receive_fees.job_price_units,
-                                    platform_fee,
-                                    provider_payout,
-                                    receive_fees.fee_bps,
-                                    receive_fees.platform_address,
-                                    platform_fee
-                                ),
-                            );
                         } else {
                             let failed_job = {
                                 let mut jobs = receive_state.jobs.lock().await;
-                                if let Some(record) = jobs.get_mut(&result.job_id) {
+                                if let Some(record) =
+                                    jobs.get_mut(&result.job_id).filter(|record| {
+                                        record.status == "running"
+                                            && record.provider_id.as_deref()
+                                                == Some(result.provider_id.as_str())
+                                    })
+                                {
                                     record.status = "failed".to_string();
                                     record.result = Some(result.clone());
                                     record.error = result.error.clone();
@@ -802,63 +812,107 @@ async fn handle_websocket(socket: WebSocket, state: AppState) {
                                         result.job_id
                                     );
                                 }
+                                accepted = true;
+                                append_line(
+                                    "failed_jobs.log",
+                                    &format!(
+                                        "timestamp={} job_id={} provider_id={} error={}",
+                                        timestamp_millis(),
+                                        result.job_id,
+                                        result.provider_id,
+                                        result.error.as_deref().unwrap_or("unknown error")
+                                    ),
+                                );
                             }
-                            if let Some(provider) =
-                                receive_providers.lock().await.get_mut(&result.provider_id)
+                            if accepted {
+                                if let Some(provider) =
+                                    receive_providers.lock().await.get_mut(&result.provider_id)
+                                {
+                                    provider.status = if provider.accepting_jobs {
+                                        "idle".to_string()
+                                    } else {
+                                        "paused".to_string()
+                                    };
+                                }
+                            } else {
+                                acknowledgement_error = Some(
+                                    "The coordinator did not accept this result; no payout was recorded."
+                                        .to_string(),
+                                );
+                                eprintln!(
+                                    "Ignoring failure result for terminal or unassigned job {}",
+                                    result.job_id
+                                );
+                            }
+                        }
+                        let acknowledgement_sender = receive_state
+                            .provider_senders
+                            .lock()
+                            .await
+                            .get(&result.provider_id)
+                            .filter(|(active_connection_id, _)| {
+                                *active_connection_id == connection_id
+                            })
+                            .map(|(_, sender)| sender.clone());
+                        if let Some(sender) = acknowledgement_sender {
+                            if sender
+                                .send(WsMessage::ResultAck {
+                                    job_id: result.job_id.clone(),
+                                    accepted,
+                                    error: acknowledgement_error,
+                                })
+                                .is_err()
                             {
-                                provider.status = if provider.accepting_jobs {
-                                    "idle".to_string()
-                                } else {
-                                    "paused".to_string()
-                                };
+                                eprintln!("Failed to acknowledge result for job {}", result.job_id);
                             }
-                            assign_pending_job(receive_state.clone()).await;
-                            append_line(
-                                "failed_jobs.log",
-                                &format!(
-                                    "timestamp={} job_id={} provider_id={} error={}",
-                                    timestamp_millis(),
-                                    result.job_id,
-                                    result.provider_id,
-                                    result.error.as_deref().unwrap_or("unknown error")
-                                ),
+                        } else {
+                            eprintln!(
+                                "No active provider connection for result acknowledgement of job {}",
+                                result.job_id
                             );
                         }
+                        assign_pending_job(receive_state.clone()).await;
+                    }
+                    Ok(WsMessage::ResultAck { job_id, .. }) => {
+                        eprintln!("Unexpected result acknowledgement from provider for {job_id}");
                     }
                     Ok(WsMessage::Job(job)) => {
                         eprintln!("Unexpected JobPayload from provider: {job:?}");
                     }
                     Ok(WsMessage::Register(registration)) => {
                         let provider_id = registration.provider_id.clone();
-                        let credentials_valid = {
-                            let known = receive_state.provider_token_hashes.lock().await;
-                            validate_provider_credentials(
-                                &known,
-                                &provider_id,
-                                &registration.payout_address,
-                                &registration.auth_token,
-                            )
+                        let wallet_valid = if registration.auth_token.is_empty() {
+                            registration.payout_address == "not-set"
+                                || validate_fee_address(Some(&registration.payout_address)).is_ok()
+                        } else {
+                            validate_fee_address(Some(&registration.payout_address)).is_ok()
                         };
+                        let auth_token_hash = (!registration.auth_token.is_empty())
+                            .then(|| hash_provider_secret(&registration.auth_token));
+                        let credentials_valid = wallet_valid
+                            && match receive_state
+                                .job_store
+                                .register_provider(
+                                    &provider_id,
+                                    &registration.payout_address,
+                                    auth_token_hash.as_deref(),
+                                )
+                                .await
+                            {
+                                Ok(valid) => valid,
+                                Err(error) => {
+                                    eprintln!(
+                                        "Failed to validate provider registration: {error:#}"
+                                    );
+                                    false
+                                }
+                            };
                         if !credentials_valid {
                             eprintln!(
                                 "Rejected provider registration '{}' because wallet or authentication is invalid",
                                 provider_id
                             );
                             continue;
-                        }
-                        if !registration.auth_token.is_empty() {
-                            let mut known = receive_state.provider_token_hashes.lock().await;
-                            known.insert(
-                                provider_id.clone(),
-                                hash_provider_secret(&registration.auth_token),
-                            );
-                        }
-                        if let Err(error) = receive_state
-                            .job_store
-                            .upsert_provider(&provider_id, &registration.payout_address)
-                            .await
-                        {
-                            eprintln!("Failed to persist provider wallet: {error:#}");
                         }
                         let duplicate_connection = receive_state
                             .provider_senders
@@ -883,11 +937,21 @@ async fn handle_websocket(socket: WebSocket, state: AppState) {
                             };
                             persist_job_records(&receive_state, failed_jobs).await;
                         }
+                        let (jobs_completed, total_earned_units) = match receive_state
+                            .job_store
+                            .provider_earnings(&provider_id)
+                            .await
+                        {
+                            Ok(earnings) => earnings,
+                            Err(error) => {
+                                eprintln!(
+                                    "Failed to load provider earnings for '{}': {error:#}",
+                                    provider_id
+                                );
+                                continue;
+                            }
+                        };
                         let mut providers = receive_providers.lock().await;
-                        let (jobs_completed, total_earned_units) = providers
-                            .get(&provider_id)
-                            .map(|provider| (provider.jobs_completed, provider.total_earned_units))
-                            .unwrap_or((0, 0));
                         providers.insert(
                             provider_id.clone(),
                             ProviderInfo {
@@ -1038,6 +1102,22 @@ async fn handle_websocket(socket: WebSocket, state: AppState) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let arguments = std::env::args().collect::<Vec<_>>();
+    if arguments.get(1).map(String::as_str) == Some("--export-pending-payouts") {
+        let output_path = arguments
+            .get(2)
+            .context("usage: coordinator --export-pending-payouts <output.json>")?;
+        if arguments.len() != 3 {
+            anyhow::bail!("usage: coordinator --export-pending-payouts <output.json>");
+        }
+        let database_path =
+            configured_database_path(std::env::var_os("GPUSWARM_DB_PATH").map(PathBuf::from))?;
+        let job_store = JobStore::open(&database_path)?;
+        let count = job_store.export_pending_payouts(&PathBuf::from(output_path))?;
+        println!("Exported {count} pending payouts to {output_path}");
+        return Ok(());
+    }
+
     let fees = parse_fee_settings()?;
     let database_path =
         configured_database_path(std::env::var_os("GPUSWARM_DB_PATH").map(PathBuf::from))?;
@@ -1079,7 +1159,6 @@ async fn main() -> Result<()> {
         job_store,
         provider_senders: Arc::new(Mutex::new(HashMap::new())),
         providers: Arc::new(Mutex::new(HashMap::new())),
-        provider_token_hashes: Arc::new(Mutex::new(HashMap::new())),
         request_windows: Arc::new(Mutex::new(HashMap::new())),
         fees,
         job_timeout_secs,
@@ -1128,8 +1207,8 @@ async fn main() -> Result<()> {
             http_listener,
             http_app.into_make_service_with_connect_info::<SocketAddr>(),
         )
-            .await
-            .context("coordinator HTTP server stopped unexpectedly")
+        .await
+        .context("coordinator HTTP server stopped unexpectedly")
     });
     let ws_task = tokio::spawn(async move {
         axum::serve(ws_listener, ws_app)
@@ -1156,13 +1235,17 @@ async fn main() -> Result<()> {
 mod tests {
     use super::storage::JobStore;
     use super::{
-        apply_completed_job_result, assign_pending_job, calculate_fee, configured_database_path,
-        check_request_rate_limit, fail_running_jobs_for_provider, payment_header_status, parse_configured_port,
-        parse_network_model, hash_provider_secret, job_id_is_available, validate_fee_address,
-        validate_provider_credentials, AppState, FeeSettings, JobPayload, JobRecord, JobResult,
-        ProviderInfo,
+        apply_completed_job_result, assign_pending_job, calculate_fee, check_request_rate_limit,
+        configured_database_path, fail_running_jobs_for_provider, parse_configured_port,
+        parse_network_model, payment_header_status, request_job, validate_fee_address, AppState,
+        FeeSettings, JobPayload, JobRecord, JobResult, ProviderInfo, WsMessage,
     };
-    use axum::http::StatusCode;
+    use axum::{
+        extract::{ConnectInfo, State},
+        http::{HeaderMap, HeaderValue, StatusCode},
+        response::IntoResponse,
+        Json,
+    };
     use std::{
         collections::{HashMap, VecDeque},
         path::PathBuf,
@@ -1170,6 +1253,42 @@ mod tests {
         time::{Duration, Instant},
     };
     use tokio::sync::{mpsc, Mutex};
+
+    fn empty_app_state() -> AppState {
+        AppState {
+            assignment_lock: Arc::new(Mutex::new(())),
+            pending_jobs: Arc::new(Mutex::new(VecDeque::new())),
+            jobs: Arc::new(Mutex::new(HashMap::new())),
+            job_store: JobStore::in_memory().unwrap(),
+            provider_senders: Arc::new(Mutex::new(HashMap::new())),
+            providers: Arc::new(Mutex::new(HashMap::new())),
+            request_windows: Arc::new(Mutex::new(HashMap::new())),
+            fees: FeeSettings {
+                fee_bps: 1_000,
+                job_price_units: 10_000,
+                platform_address: "0xPLATFORM_PLACEHOLDER".to_string(),
+                network_model: "llama3.2:1b".to_string(),
+            },
+            job_timeout_secs: 120,
+        }
+    }
+
+    async fn submit_request(state: AppState, peer: std::net::SocketAddr, id: &str) -> StatusCode {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-payment", HeaderValue::from_static("mock"));
+        request_job(
+            State(state),
+            ConnectInfo(peer),
+            headers,
+            Json(JobPayload {
+                id: id.to_string(),
+                prompt: "test".to_string(),
+            }),
+        )
+        .await
+        .into_response()
+        .status()
+    }
 
     #[test]
     fn network_model_defaults_and_rejects_invalid_values() {
@@ -1227,9 +1346,16 @@ mod tests {
     #[test]
     fn missing_payment_is_distinct_from_invalid_payment() {
         assert_eq!(payment_header_status(None), StatusCode::PAYMENT_REQUIRED);
-        assert_eq!(payment_header_status(Some("")), StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(
+            payment_header_status(Some("")),
+            StatusCode::PAYMENT_REQUIRED
+        );
         assert_eq!(
             payment_header_status(Some("invalid")),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            payment_header_status(Some("0xdeadbeef")),
             StatusCode::UNAUTHORIZED
         );
     }
@@ -1262,8 +1388,8 @@ mod tests {
                 JobRecord {
                     id: "job-401".to_string(),
                     prompt: "Napíš slovenskú básničku".to_string(),
-                    status: "queued".to_string(),
-                    provider_id: None,
+                    status: "running".to_string(),
+                    provider_id: Some("provider-node-01".to_string()),
                     result: None,
                     fee_breakdown: None,
                     error: None,
@@ -1331,18 +1457,10 @@ mod tests {
             );
         }
 
-        let first_applied = apply_completed_job_result(
-            &mut *jobs.lock().await,
-            &result,
-            &fees,
-        );
+        let first_applied = apply_completed_job_result(&mut *jobs.lock().await, &result, &fees);
         let mut duplicate = result.clone();
         duplicate.result_data = "duplicate result".to_string();
-        let second_applied = apply_completed_job_result(
-            &mut *jobs.lock().await,
-            &duplicate,
-            &fees,
-        );
+        let second_applied = apply_completed_job_result(&mut *jobs.lock().await, &duplicate, &fees);
 
         assert!(first_applied, "the first result should settle the job");
         assert!(!second_applied, "the repeated result should be ignored");
@@ -1352,23 +1470,35 @@ mod tests {
         assert_eq!(found.fee_breakdown.unwrap().gross_price, 10_001);
     }
 
-    #[test]
-    fn duplicate_job_id_is_rejected_before_storage() {
-        let jobs = HashMap::from([(
-            "job-existing".to_string(),
-            JobRecord {
-                id: "job-existing".to_string(),
-                prompt: "already submitted".to_string(),
-                status: "queued".to_string(),
-                provider_id: None,
-                result: None,
-                fee_breakdown: None,
-                error: None,
-            },
-        )]);
+    #[tokio::test]
+    async fn duplicate_job_id_returns_http_conflict() {
+        let state = empty_app_state();
+        let peer = "127.0.0.1:12345".parse().unwrap();
 
-        assert!(!job_id_is_available(&jobs, "job-existing"));
-        assert!(job_id_is_available(&jobs, "job-new"));
+        assert_eq!(
+            submit_request(state.clone(), peer, "job-http-duplicate").await,
+            StatusCode::ACCEPTED
+        );
+        assert_eq!(
+            submit_request(state, peer, "job-http-duplicate").await,
+            StatusCode::CONFLICT
+        );
+    }
+
+    #[tokio::test]
+    async fn request_job_enforces_per_ip_http_rate_limit() {
+        let state = empty_app_state();
+        let peer = "127.0.0.1:12345".parse().unwrap();
+        for id in 0..60 {
+            assert_eq!(
+                submit_request(state.clone(), peer, &format!("rate-limit-{id}")).await,
+                StatusCode::ACCEPTED
+            );
+        }
+        assert_eq!(
+            submit_request(state, peer, "rate-limit-exceeded").await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
     }
 
     #[test]
@@ -1436,52 +1566,12 @@ mod tests {
     }
 
     #[test]
-    fn provider_credentials_reject_wrong_secret_but_allow_documented_legacy_providers() {
-        let mut known = HashMap::new();
-        known.insert(
-            "provider-1".to_string(),
-            hash_provider_secret("known-secret"),
-        );
-        let wallet = "0x1111111111111111111111111111111111111111";
-
-        assert!(!validate_provider_credentials(
-            &known,
-            "provider-1",
-            wallet,
-            "wrong-secret"
-        ));
-        assert!(!validate_provider_credentials(
-            &known,
-            "provider-2",
-            "not-a-wallet",
-            "new-secret"
-        ));
-        assert!(validate_provider_credentials(
-            &known,
-            "provider-1",
-            wallet,
-            "known-secret"
-        ));
-        assert!(validate_provider_credentials(
-            &known,
-            "legacy-provider",
-            "not-set",
-            ""
-        ));
-    }
-
-    #[test]
     fn per_ip_request_limit_allows_then_rejects_burst() {
         let mut windows = HashMap::new();
         let now = Instant::now();
         assert!(check_request_rate_limit(&mut windows, "127.0.0.1", now, 60));
         for _ in 1..60 {
-            assert!(check_request_rate_limit(
-                &mut windows,
-                "127.0.0.1",
-                now,
-                60
-            ));
+            assert!(check_request_rate_limit(&mut windows, "127.0.0.1", now, 60));
         }
         assert!(!check_request_rate_limit(
             &mut windows,
@@ -1489,17 +1579,82 @@ mod tests {
             now,
             60
         ));
-        assert!(check_request_rate_limit(
-            &mut windows,
-            "127.0.0.2",
-            now,
-            60
-        ));
+        assert!(check_request_rate_limit(&mut windows, "127.0.0.2", now, 60));
+    }
+
+    #[tokio::test]
+    async fn completed_job_timeout_does_not_unpause_provider_after_slider_pause() {
+        let (sender, mut receiver) = mpsc::unbounded_channel::<WsMessage>();
+        let state = AppState {
+            assignment_lock: Arc::new(Mutex::new(())),
+            pending_jobs: Arc::new(Mutex::new(VecDeque::from([
+                "job-completed-before-timeout".to_string()
+            ]))),
+            jobs: Arc::new(Mutex::new(HashMap::from([(
+                "job-completed-before-timeout".to_string(),
+                JobRecord {
+                    id: "job-completed-before-timeout".to_string(),
+                    prompt: "test prompt".to_string(),
+                    status: "queued".to_string(),
+                    provider_id: None,
+                    result: None,
+                    fee_breakdown: None,
+                    error: None,
+                },
+            )]))),
+            job_store: JobStore::in_memory().unwrap(),
+            provider_senders: Arc::new(Mutex::new(HashMap::from([(
+                "test-provider-timeout".to_string(),
+                (1_u64, sender),
+            )]))),
+            providers: Arc::new(Mutex::new(HashMap::from([(
+                "test-provider-timeout".to_string(),
+                ProviderInfo {
+                    provider_id: "test-provider-timeout".to_string(),
+                    payout_address: "0xPLATFORM_PLACEHOLDER".to_string(),
+                    gpu_name: "test GPU".to_string(),
+                    gpu_memory: "test memory".to_string(),
+                    model: "test model".to_string(),
+                    status: "idle".to_string(),
+                    accepting_jobs: true,
+                    jobs_completed: 0,
+                    total_earned_units: 0,
+                },
+            )]))),
+            request_windows: Arc::new(Mutex::new(HashMap::new())),
+            fees: FeeSettings {
+                fee_bps: 1_000,
+                job_price_units: 10_000,
+                platform_address: "0xPLATFORM_PLACEHOLDER".to_string(),
+                network_model: "llama3.2:3b".to_string(),
+            },
+            job_timeout_secs: 1,
+        };
+
+        assign_pending_job(state.clone()).await;
+        receiver.recv().await.expect("job should be delivered");
+        {
+            let mut jobs = state.jobs.lock().await;
+            jobs.get_mut("job-completed-before-timeout").unwrap().status = "completed".to_string();
+        }
+        {
+            let mut providers = state.providers.lock().await;
+            let provider = providers.get_mut("test-provider-timeout").unwrap();
+            provider.accepting_jobs = false;
+            provider.status = "paused".to_string();
+        }
+
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+
+        assert_eq!(
+            state.providers.lock().await["test-provider-timeout"].status,
+            "paused"
+        );
     }
 
     #[tokio::test]
     async fn concurrent_assignment_sends_queued_job_only_once() {
-        let (sender, mut receiver) = mpsc::unbounded_channel::<JobPayload>();
+        let (sender, mut receiver) = mpsc::unbounded_channel::<WsMessage>();
         let state = AppState {
             assignment_lock: Arc::new(Mutex::new(())),
             pending_jobs: Arc::new(Mutex::new(VecDeque::from([
@@ -1536,7 +1691,6 @@ mod tests {
                     total_earned_units: 0,
                 },
             )]))),
-            provider_token_hashes: Arc::new(Mutex::new(HashMap::new())),
             request_windows: Arc::new(Mutex::new(HashMap::new())),
             fees: FeeSettings {
                 fee_bps: 1_000,
@@ -1566,7 +1720,10 @@ mod tests {
         let _ = tokio::join!(first, second);
 
         let delivered = receiver.recv().await.expect("job should be delivered");
-        assert_eq!(delivered.id, "job-single-assignment");
+        match delivered {
+            WsMessage::Job(job) => assert_eq!(job.id, "job-single-assignment"),
+            other => panic!("expected a job message, got {other:?}"),
+        }
         assert!(
             tokio::time::timeout(Duration::from_millis(50), receiver.recv())
                 .await

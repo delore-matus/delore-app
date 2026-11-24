@@ -289,6 +289,7 @@ mod tests {
             job_price_units: 10_000,
             provider_payout_units: 9_000,
             fee_address: "0x1111111111111111111111111111111111111111".into(),
+            result_acknowledgements: false,
         };
 
         let earnings = store.record_result("job-1", true, Some(&fees)).unwrap();
