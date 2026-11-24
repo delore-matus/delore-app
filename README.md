@@ -18,13 +18,14 @@ npm install
 cargo tauri dev
 ```
 
-For an unsigned Windows MSI, install the WiX Toolset v3.14 build tools and run
-`cargo tauri build --bundles msi --no-sign` from `desktop/`. The package uses
-the existing `icons/icon.ico`; the installer is not code-signed or intended for
-public distribution until a signing certificate and final brand assets are
-available.
+For local Windows packages, run `cargo tauri build --no-sign` from `desktop/`.
+The NSIS installer is configured for the current user. The CI workflow publishes
+the NSIS installer under the stable name `DeLore-windows-x64.exe`; it builds an
+MSI as a workflow artifact but does not attach it to draft releases until the
+installed-app checks are complete. macOS and Linux artifacts use stable
+platform-specific names.
 
-Windows unsigned MSI packages may show a SmartScreen warning until signed.
+Unsigned Windows installers may show a SmartScreen warning until signed.
 macOS unsigned DMGs may require manual Gatekeeper approval. Linux AppImages
 should have the executable bit set and may require a local AppArmor or package
 policy exception.
@@ -74,6 +75,10 @@ override takes precedence. By default, `ws://...:8081/ws` maps to the HTTP API
 at port 8080, while secure WebSocket endpoints use the same host and port for
 HTTPS. Set `COORDINATOR_HTTP` to an HTTP(S) origin when the API uses a different
 address.
+Current coordinators confirm whether each result was accepted before the
+desktop records it as earnings. New providers fall back to the legacy behavior
+when connected to a coordinator that does not advertise result confirmations;
+older providers can continue to submit results to current coordinators.
 
 For local testing only, set `PROVIDER_ID` before starting a provider to override
 the saved config for that process without changing `config.json`. This is useful
@@ -188,6 +193,12 @@ local testnet use only, `GPUSWARM_ALLOW_NO_FEE_ADDRESS=1` permits a missing
 address and emits a loud warning. The provider receives the configured fee
 address from the coordinator as read-only fee configuration.
 
+`X-Payment` currently accepts only the literal `mock` marker. Real x402 payment
+and signature verification are not implemented. The coordinator performs no
+blockchain or RPC calls and reads no private keys. Providers created by older
+versions that omit an authentication token remain accepted for compatibility;
+new providers are checked by provider ID and the hash of their token.
+
 ## Coordinator job storage
 
 The coordinator stores job state in SQLite at `coordinator.sqlite3` in its
@@ -195,6 +206,16 @@ working directory. Set `GPUSWARM_DB_PATH` to choose another file. Queued and
 terminal jobs survive coordinator restarts; any job that was running at restart
 is marked failed because its provider connection no longer exists. Provider
 connections themselves are temporary and must register again after a restart.
+
+Pending settlements can be exported for a separate offline process to handle:
+
+```powershell
+$env:GPUSWARM_DB_PATH="C:\path\to\coordinator.sqlite3"
+cargo run -p coordinator -- --export-pending-payouts C:\path\to\pending-payouts.json
+```
+
+The JSON contains one entry per job with its ID, provider ID, public payout
+address, and amount. Exporting does not mark a settlement as paid.
 
 ## Job reliability and disconnects
 

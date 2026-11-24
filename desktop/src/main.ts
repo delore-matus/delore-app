@@ -8,14 +8,6 @@ import {
 } from './provider-state.ts'
 import './style.css'
 
-declare global {
-  interface Window {
-    ethereum?: {
-      request(args: { method: string }): Promise<unknown>
-    }
-  }
-}
-
 type Theme = 'dark' | 'light' | 'system'
 type ConnectionState = 'connecting' | 'connected' | 'disconnected'
 type PolicyDecision = { state: 'run' } | { state: 'paused'; reason: string }
@@ -275,7 +267,6 @@ root.innerHTML = `
                 <input id="payout-address" name="payout-address" type="text" autocomplete="off"
                   spellcheck="false" placeholder="0x followed by 40 hex characters" />
                 <button class="button button-secondary" id="save-address" type="submit">Save address</button>
-                <button class="button button-secondary" id="connect-wallet" type="button">Connect Wallet</button>
               </div>
               <p class="field-error" id="address-error" role="alert" hidden></p>
               <p class="field-success" id="address-success" role="status" hidden></p>
@@ -745,12 +736,12 @@ for (const [id, key] of [
 
 $<HTMLFormElement>('payout-form').addEventListener('submit', async (event) => {
   event.preventDefault()
+  const address = $<HTMLInputElement>('payout-address').value.trim()
   payoutError = ''
   payoutMessage = ''
   working = true
   renderStatus()
   try {
-    const address = $<HTMLInputElement>('payout-address').value.trim()
     const next = await invoke<StatusSnapshot>('set_payout_address', { address })
     updateStatus(next)
     payoutMessage = 'Payout address saved.'
@@ -759,26 +750,6 @@ $<HTMLFormElement>('payout-form').addEventListener('submit', async (event) => {
   } finally {
     working = false
     if (snapshot) renderStatus()
-  }
-})
-
-$<HTMLButtonElement>('connect-wallet').addEventListener('click', async () => {
-  try {
-    if (!window.ethereum) {
-      throw new Error('MetaMask or an Ethereum-compatible wallet is required.')
-    }
-    const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' })
-    const address = Array.isArray(accounts) ? accounts[0] : null
-    if (typeof address !== 'string') throw new Error('No wallet address was returned.')
-    $<HTMLInputElement>('payout-address').value = address
-    const next = await invoke<StatusSnapshot>('set_payout_address', { address })
-    updateStatus(next)
-    payoutMessage = 'Wallet address connected.'
-  } catch (error) {
-    payoutError = errorMessage(error)
-  } finally {
-    working = false
-    renderStatus()
   }
 })
 
