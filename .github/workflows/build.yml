@@ -17,16 +17,24 @@ jobs:
           - os: windows-latest
             rust-target: x86_64-pc-windows-msvc
             artifact: windows
+            args: --bundles nsis
+            asset_pattern: DeLore-windows-x64[ext]
           - os: macos-latest
-            rust-target: universal-apple-darwin
+            rust-target: aarch64-apple-darwin,x86_64-apple-darwin
             artifact: macos
+            args: --target universal-apple-darwin --bundles dmg
+            asset_pattern: DeLore-macos-universal[ext]
           - os: ubuntu-latest
             rust-target: x86_64-unknown-linux-gnu
             artifact: linux
+            args: --bundles appimage,deb
+            asset_pattern: DeLore-linux-amd64[ext]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-target }}
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: delore
@@ -36,7 +44,7 @@ jobs:
           cache: npm
           cache-dependency-path: desktop/package-lock.json
       - run: npm ci --prefix desktop
-      - uses: tauri-apps/tauri-action@v0
+      - uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -47,20 +55,16 @@ jobs:
           projectPath: desktop
           tagName: ${{ github.ref_name }}
           releaseDraft: true
-      - name: Collect stable artifact names
-        shell: bash
-        run: |
-          mkdir -p dist-packages
-          if [[ "${{ matrix.artifact }}" == "windows" ]]; then
-            find desktop/src-tauri/target/release/bundle -type f -name "*.msi" -exec cp {} dist-packages/DeLore-windows-x64.msi \;
-            find desktop/src-tauri/target/release/bundle -type f -name "*.exe" -exec cp {} dist-packages/DeLore-windows-x64.exe \;
-          elif [[ "${{ matrix.artifact }}" == "macos" ]]; then
-            find desktop/src-tauri/target/release/bundle -type f -name "*.dmg" -exec cp {} dist-packages/DeLore-macos-universal.dmg \;
-          else
-            find desktop/src-tauri/target/release/bundle -type f -name "*.AppImage" -exec cp {} dist-packages/DeLore-linux-amd64.AppImage \;
-            find desktop/src-tauri/target/release/bundle -type f -name "*.deb" -exec cp {} dist-packages/DeLore-linux-amd64.deb \;
-          fi
-      - uses: actions/upload-artifact@v4
+          args: ${{ matrix.args }}
+          releaseAssetNamePattern: ${{ matrix.asset_pattern }}
+          workflowArtifactNamePattern: ${{ matrix.asset_pattern }}
+          uploadWorkflowArtifacts: true
+      - name: Build MSI without publishing it
+        if: matrix.artifact == 'windows'
+        uses: tauri-apps/tauri-action@v1
         with:
-          name: ${{ matrix.artifact }}
-          path: dist-packages/*
+          projectPath: desktop
+          args: --bundles msi --no-sign
+          uploadUpdaterJson: false
+          uploadWorkflowArtifacts: true
+          workflowArtifactNamePattern: DeLore-windows-x64[ext]
