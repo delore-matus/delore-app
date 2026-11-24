@@ -17,9 +17,24 @@ use tokio::{
 };
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
+#[path = "support/coordinator.rs"]
+mod coordinator;
+
 #[tokio::test]
-#[ignore = "requires installed runtime and cached llama3.2:1b"]
+#[ignore = "requires the installed provider runtime and cached llama3.2:1b model"]
 async fn disconnect_during_job_discards_result_and_reconnects() {
+    let owned_coordinator = coordinator::OwnedCoordinator::start()
+        .await
+        .expect("test coordinator should start on isolated ports");
+    let fees: serde_json::Value = reqwest::get(format!("{}/fees", owned_coordinator.http_url))
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(fees["network_model"], "llama3.2:1b");
     let runtime = RuntimeManager::new().unwrap();
     assert!(
         runtime.runtime_dir().exists(),

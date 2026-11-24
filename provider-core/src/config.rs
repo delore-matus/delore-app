@@ -527,6 +527,11 @@ mod tests {
     }
 
     #[test]
+    fn plaintext_non_loopback_coordinator_is_rejected() {
+        assert!(validate_coordinator_ws_url("ws://coordinator.example/ws").is_err());
+    }
+
+    #[test]
     fn invalid_coordinator_url_is_not_saved() {
         let path = test_config_path();
         let config = ProviderConfig::defaults();

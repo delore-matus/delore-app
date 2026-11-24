@@ -10,6 +10,9 @@ use provider_core::{
 use serde_json::Value;
 use tokio::sync::{mpsc, watch};
 
+#[path = "support/coordinator.rs"]
+mod coordinator;
+
 const FEE_ADDRESS: &str = "0x20759eE366409B7dFE73a5325bfe0Dd57B6d7850";
 
 fn utc_timestamp() -> String {
@@ -17,8 +20,12 @@ fn utc_timestamp() -> String {
 }
 
 #[tokio::test]
-#[ignore = "requires a running local coordinator and cached llama3.2:1b runtime model"]
+#[ignore = "requires the installed provider runtime and cached llama3.2:1b model"]
 async fn managed_provider_runs_a_job_and_stops() {
+    let coordinator = coordinator::OwnedCoordinator::start()
+        .await
+        .expect("test coordinator should start on isolated ports");
+    let coordinator_http = coordinator.http_url.clone();
     let runtime = RuntimeManager::new().unwrap();
     assert!(
         runtime.runtime_dir().exists(),
@@ -36,16 +43,12 @@ async fn managed_provider_runs_a_job_and_stops() {
         runtime.executable_path().unwrap().display()
     );
 
-    let coordinator_http =
-        std::env::var("GPUSWARM_E2E_HTTP").unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
-    let coordinator_ws =
-        std::env::var("GPUSWARM_E2E_WS").unwrap_or_else(|_| "ws://127.0.0.1:8081/ws".to_string());
     let provider_id = format!("desktop-e2e-{}", uuid::Uuid::new_v4());
     let config = ProviderConfig {
         payout_address: Some("0x1111111111111111111111111111111111111111".to_string()),
-        provider_id,
+        provider_id: provider_id.clone(),
         auth_token: uuid::Uuid::new_v4().to_string(),
-        coordinator_ws,
+        coordinator_ws: coordinator.ws_url.clone(),
         ollama_model: "llama3.2:1b".to_string(),
         resource_settings: ResourceSettings {
             mode: ResourceMode::AlwaysOnLowPriority,
@@ -63,7 +66,7 @@ async fn managed_provider_runs_a_job_and_stops() {
     let event_callback: ProviderEventCallback = Arc::new(move |event| {
         let _ = event_tx.send(event);
     });
-    let provider = tokio::spawn(run_provider_managed(
+    let mut provider = tokio::spawn(run_provider_managed(
         config,
         true,
         stop_rx,
@@ -71,7 +74,7 @@ async fn managed_provider_runs_a_job_and_stops() {
         event_callback,
     ));
 
-    let startup_deadline = Instant::now() + Duration::from_secs(120);
+    let startup_deadline = Instant::now() + Duration::from_secs(240);
     let mut runtime_states = Vec::new();
     let mut connected = false;
     let mut fee_config = None;
@@ -90,6 +93,17 @@ async fn managed_provider_runs_a_job_and_stops() {
                     );
                     runtime_states.push(state);
                 }
+            }
+            result = &mut provider => {
+                panic!("provider exited before connecting: {result:?}");
+            }
+            _ = tokio::time::sleep_until(startup_deadline.into()) => {
+                let log_path = provider_core::config_dir().unwrap().join("logs").join("engine.log");
+                let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+                let tail = log.lines().rev().take(40).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+                let _ = stop.send(true);
+                let result = tokio::time::timeout(Duration::from_secs(10), &mut provider).await;
+                panic!("provider did not connect before startup deadline; task={result:?}; engine log tail:\n{tail}");
             }
             event = event_rx.recv() => {
                 if let Some(event) = event {
@@ -120,6 +134,21 @@ async fn managed_provider_runs_a_job_and_stops() {
     let fee_config = fee_config.unwrap();
     assert_eq!(fee_config.fee_bps, 1000);
     assert_eq!(fee_config.fee_address, FEE_ADDRESS);
+    let providers: Value = reqwest::get(format!("{coordinator_http}/providers"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let provider_entry = providers
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|provider| provider["provider_id"] == provider_id)
+        .expect("provider should be registered before the job is submitted");
+    println!("GET /providers registered-provider={provider_entry}");
+    assert_eq!(provider_entry["status"], "idle");
+    assert_eq!(provider_entry["accepting_jobs"], true);
     while let Ok(state) = runtime_rx.try_recv() {
         println!(
             "provider-status runtime={} at={}",
@@ -152,6 +181,31 @@ async fn managed_provider_runs_a_job_and_stops() {
     assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
     let accepted: Value = response.json().await.unwrap();
     assert_eq!(accepted["job_id"], job_id);
+    let job_url = format!("{coordinator_http}/jobs/{job_id}");
+    let dispatch_deadline = Instant::now() + Duration::from_secs(5);
+    let job_status = loop {
+        let status: Value = reqwest::Client::new()
+            .get(&job_url)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if status["status"] != "queued" {
+            println!("GET /jobs/{job_id} assigned status: {status}");
+            break status;
+        }
+        assert!(
+            Instant::now() < dispatch_deadline,
+            "job remained queued after a registered accepting provider: {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(
+        matches!(job_status["status"].as_str(), Some("running" | "completed")),
+        "job should have been assigned to the connected provider: {job_status}"
+    );
 
     let job_deadline = Instant::now() + Duration::from_secs(180);
     let mut saw_running = false;

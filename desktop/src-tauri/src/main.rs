@@ -1155,6 +1155,31 @@ mod tests {
     };
     use tokio::sync::{mpsc, watch};
 
+    struct IsolatedConfigDir(std::path::PathBuf);
+
+    impl IsolatedConfigDir {
+        fn new() -> Self {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "gpuswarm-close-test-{}-{unique}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            std::env::set_var("GPUSWARM_CONFIG_DIR", &path);
+            Self(path)
+        }
+    }
+
+    impl Drop for IsolatedConfigDir {
+        fn drop(&mut self) {
+            std::env::remove_var("GPUSWARM_CONFIG_DIR");
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn technical_provider_errors_are_mapped_to_safe_messages() {
         let errors = [
@@ -1354,6 +1379,7 @@ mod tests {
     #[test]
     #[ignore = "requires an installed managed Ollama runtime"]
     fn close_shutdown_helper_stops_the_managed_runtime() {
+        let _isolated_config = IsolatedConfigDir::new();
         tauri::async_runtime::block_on(async {
             let manager = RuntimeManager::new().unwrap();
             let executable = manager.executable_path().unwrap();

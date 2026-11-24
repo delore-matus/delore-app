@@ -11,13 +11,20 @@ use provider_core::{
 use serde_json::Value;
 use tokio::sync::{mpsc, watch};
 
+#[path = "support/coordinator.rs"]
+mod coordinator;
+
 fn utc_timestamp() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 #[tokio::test]
-#[ignore = "requires a running coordinator, installed runtime, and cached model"]
+#[ignore = "requires the installed provider runtime and cached llama3.2:1b model"]
 async fn performance_slider_controls_registration_and_job_flow() {
+    let coordinator = coordinator::OwnedCoordinator::start()
+        .await
+        .expect("test coordinator should start on isolated ports");
+    let coordinator_http = coordinator.http_url.clone();
     let runtime = RuntimeManager::new().unwrap();
     assert!(
         runtime.runtime_dir().exists(),
@@ -31,16 +38,13 @@ async fn performance_slider_controls_registration_and_job_flow() {
         "cached llama3.2:1b model is required"
     );
 
-    let coordinator_http =
-        std::env::var("GPUSWARM_E2E_HTTP").unwrap_or_else(|_| "http://127.0.0.1:8080".into());
-    let coordinator_ws =
-        std::env::var("GPUSWARM_E2E_WS").unwrap_or_else(|_| "ws://127.0.0.1:8081/ws".into());
-    let expected_fee_address = std::env::var("GPUSWARM_EXPECTED_FEE_ADDRESS").ok();
+    let expected_fee_address = "0x20759eE366409B7dFE73a5325bfe0Dd57B6d7850";
     let provider_id = format!("performance-zero-provider-{}", uuid::Uuid::new_v4());
     let job_id = format!("performance-zero-{}", uuid::Uuid::new_v4());
     let mut config = ProviderConfig::defaults();
+    config.payout_address = Some("0x1111111111111111111111111111111111111111".into());
     config.provider_id = provider_id.clone();
-    config.coordinator_ws = coordinator_ws;
+    config.coordinator_ws = coordinator.ws_url.clone();
     config.ollama_model = "llama3.2:3b".into();
     config.resource_settings = provider_core::ResourceSettings {
         mode: ResourceMode::AlwaysOnLowPriority,
@@ -100,9 +104,7 @@ async fn performance_slider_controls_registration_and_job_flow() {
                         "fee_config fee_bps={} provider_payout={} fee={} recipient={}",
                         config.fee_bps, config.provider_payout_units, fee_units, config.fee_address
                     );
-                    if let Some(expected) = &expected_fee_address {
-                        assert_eq!(&config.fee_address, expected);
-                    }
+                    assert_eq!(config.fee_address, expected_fee_address);
                     assert_eq!(config.provider_payout_units, 9_000);
                     assert_eq!(fee_units, 1_000);
                     saw_fee_config = true;
