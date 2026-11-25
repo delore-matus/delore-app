@@ -52,6 +52,7 @@ pub struct DesktopPreferences {
     pub theme: Theme,
     pub language: AppLanguage,
     pub onboarding_complete: bool,
+    pub auth_status: bool,
     pub start_on_login: bool,
     pub start_minimized_to_tray: bool,
     pub keep_running_in_tray: bool,
@@ -64,6 +65,7 @@ impl Default for DesktopPreferences {
             theme: Theme::Dark,
             language: AppLanguage::English,
             onboarding_complete: false,
+            auth_status: false,
             start_on_login: false,
             start_minimized_to_tray: false,
             keep_running_in_tray: false,
@@ -260,6 +262,10 @@ pub fn set_desktop_preferences(preferences: DesktopPreferences) -> Result<Provid
     set_desktop_preferences_at(preferences, &config_path()?)
 }
 
+pub fn set_auth_status(auth_status: bool) -> Result<ProviderConfig> {
+    set_auth_status_at(auth_status, &config_path()?)
+}
+
 pub fn confirm_not_recommended_runtime() -> Result<ProviderConfig> {
     let mut config = load_config()?.unwrap_or_else(ProviderConfig::defaults);
     config.resource_settings.not_recommended_confirmed = true;
@@ -283,6 +289,13 @@ fn set_desktop_preferences_at(
 ) -> Result<ProviderConfig> {
     let mut config = load_config_from(path)?.unwrap_or_else(ProviderConfig::defaults);
     config.desktop_preferences = preferences;
+    save_config_to(&config, path)?;
+    Ok(config)
+}
+
+fn set_auth_status_at(auth_status: bool, path: &Path) -> Result<ProviderConfig> {
+    let mut config = load_config_from(path)?.unwrap_or_else(ProviderConfig::defaults);
+    config.desktop_preferences.auth_status = auth_status;
     save_config_to(&config, path)?;
     Ok(config)
 }
@@ -475,7 +488,7 @@ mod tests {
 
     use super::{
         coordinator_fees_url, coordinator_fees_url_with_override, load_config_from,
-        load_config_with_recovery_from, save_config_to, select_ollama_model,
+        load_config_with_recovery_from, save_config_to, select_ollama_model, set_auth_status_at,
         set_desktop_preferences_at, set_ollama_model_at, set_payout_address_at,
         set_performance_percent_at, set_resource_settings_at, validate_coordinator_ws_url,
         validate_ollama_model, validate_payout_address, AppLanguage, DesktopPreferences,
@@ -774,6 +787,7 @@ mod tests {
             theme: Theme::Light,
             language: AppLanguage::English,
             onboarding_complete: true,
+            auth_status: true,
             start_on_login: true,
             start_minimized_to_tray: true,
             keep_running_in_tray: true,
@@ -788,6 +802,31 @@ mod tests {
                 .desktop_preferences,
             preferences
         );
+        remove_test_config(&path);
+    }
+
+    #[test]
+    fn auth_status_is_persisted_and_legacy_preferences_default_to_signed_out() {
+        let legacy = serde_json::from_str::<DesktopPreferences>(
+            r#"{"theme":"dark","language":"english","onboarding_complete":true,"start_on_login":false,"start_minimized_to_tray":false,"keep_running_in_tray":false,"notifications_enabled":false}"#,
+        )
+        .unwrap();
+        assert!(!legacy.auth_status);
+
+        let path = test_config_path();
+        save_config_to(&ProviderConfig::defaults(), &path).unwrap();
+        let signed_in = set_auth_status_at(true, &path).unwrap();
+        assert!(signed_in.desktop_preferences.auth_status);
+        assert!(
+            load_config_from(&path)
+                .unwrap()
+                .unwrap()
+                .desktop_preferences
+                .auth_status
+        );
+
+        let signed_out = set_auth_status_at(false, &path).unwrap();
+        assert!(!signed_out.desktop_preferences.auth_status);
         remove_test_config(&path);
     }
 

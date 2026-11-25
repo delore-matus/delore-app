@@ -12,11 +12,12 @@ use std::{
 use provider_core::{
     confirm_not_recommended_runtime, detect_gpu, load_config, load_config_with_recovery,
     provider_control_channel, run_provider_managed_with_control, runtime_suitability,
-    set_desktop_preferences as save_desktop_preferences, set_payout_address as save_payout_address,
-    set_performance_percent as save_performance_percent, DesktopPreferences, FeeConfig, GpuInfo,
-    JobResult, PolicyDecision, ProviderConfig, ProviderControl, ProviderEvent,
-    ProviderEventCallback, ResourceMode, ResourceSettings, RuntimeDownloadPhase, RuntimeManager,
-    RuntimeProgressCallback, RuntimeState, RuntimeSuitability,
+    set_auth_status as save_auth_status, set_desktop_preferences as save_desktop_preferences,
+    set_payout_address as save_payout_address, set_performance_percent as save_performance_percent,
+    DesktopPreferences, FeeConfig, GpuInfo, JobResult, PolicyDecision, ProviderConfig,
+    ProviderControl, ProviderEvent, ProviderEventCallback, ResourceMode, ResourceSettings,
+    RuntimeDownloadPhase, RuntimeManager, RuntimeProgressCallback, RuntimeState,
+    RuntimeSuitability,
 };
 use serde::Serialize;
 use tauri::{
@@ -757,6 +758,32 @@ fn set_desktop_preferences(
 }
 
 #[tauri::command]
+fn set_auth_status(
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    status: bool,
+) -> Result<StatusSnapshot, String> {
+    let config =
+        save_auth_status(status).map_err(|error| map_invoke_error(&format!("{error:#}")))?;
+    update_status(&state.inner().inner, &app, |snapshot| {
+        snapshot.desktop_preferences = config.desktop_preferences;
+    });
+    state
+        .inner()
+        .inner
+        .snapshot
+        .lock()
+        .map(|snapshot| snapshot.clone())
+        .map_err(|error| map_invoke_error(&format!("Provider status is unavailable: {error}")))
+}
+
+#[tauri::command]
+fn mock_login(email: String) -> Result<(), String> {
+    let _ = email;
+    Ok(())
+}
+
+#[tauri::command]
 fn open_logs() -> Result<(), String> {
     open_logs_directory().map_err(|error| map_invoke_error(&error))
 }
@@ -1093,6 +1120,8 @@ fn main() {
             resume_provider,
             set_performance,
             set_desktop_preferences,
+            set_auth_status,
+            mock_login,
             open_logs,
             open_data_folder,
             confirm_hardware_use,

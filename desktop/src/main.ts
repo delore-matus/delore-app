@@ -1,5 +1,10 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
+import {
+  bindMockAuthButton,
+  setAuthScreenVisibility,
+  syncAuthView,
+} from './auth-flow.ts'
 import { isValidPerformancePercent } from './performance.ts'
 import {
   coordinatorDisplayState,
@@ -29,6 +34,7 @@ interface DesktopPreferences {
   theme: Theme
   language: 'english'
   onboarding_complete: boolean
+  auth_status: boolean
   start_on_login: boolean
   start_minimized_to_tray: boolean
   keep_running_in_tray: boolean
@@ -100,9 +106,86 @@ let working = false
 let payoutError = ''
 let payoutMessage = ''
 let settingsError = ''
+let authError = ''
+let currentAuthScreen: 'login' | 'signup' | 'forgot' = 'login'
 
 root.innerHTML = `
-  <main class="shell">
+  <div class="auth-overlay" id="auth-overlay" role="dialog" aria-modal="true" aria-label="DeLore sign in">
+    <div class="auth-checking" id="auth-checking" role="status">Checking saved session…</div>
+
+    <div class="auth-card" id="auth-login" aria-labelledby="auth-login-title" hidden>
+      <img class="auth-logo" src="/logo.png" alt="DeLore" />
+      <p class="eyebrow">LOCAL DEMO SESSION</p>
+      <h1 id="auth-login-title">Welcome back to DeLore</h1>
+      <p class="muted">Mock sign-in only. Google, GitHub, email authentication and account security are not connected.</p>
+      <div class="auth-providers">
+        <button class="auth-provider" id="login-google" type="button">
+          <svg aria-hidden="true" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5Z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.74 7.18l7.7 5.98c4.5-4.16 7.08-10.28 7.08-17.63Z"/><path fill="#FBBC05" d="M10.53 28.59A14.4 14.4 0 0 1 9.75 24c0-1.59.27-3.13.76-4.59l-7.98-6.19A23.9 23.9 0 0 0 0 24c0 3.87.93 7.54 2.56 10.78l7.97-6.19Z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.9-5.82l-7.7-5.98c-2.13 1.43-4.86 2.3-8.2 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48Z"/></svg>
+          Continue with Google
+        </button>
+        <button class="auth-provider" id="login-github" type="button">
+          <svg aria-hidden="true" viewBox="0 0 24 24"><path fill="currentColor" d="M12 .9a11.1 11.1 0 0 0-3.51 21.63c.56.1.76-.24.76-.54v-2.08c-3.1.67-3.76-1.32-3.76-1.32-.5-1.28-1.24-1.62-1.24-1.62-1.01-.69.08-.68.08-.68 1.12.08 1.71 1.15 1.71 1.15 1 .1.76 2.4 3.7 1.7.1-.73.39-1.22.7-1.5-2.48-.28-5.09-1.24-5.09-5.52 0-1.22.44-2.22 1.15-3-.12-.28-.5-1.42.11-2.96 0 0 .94-.3 3.05 1.15a10.6 10.6 0 0 1 5.55 0c2.11-1.45 3.04-1.15 3.04-1.15.61 1.54.23 2.68.12 2.96.72.78 1.15 1.78 1.15 3.01 0 4.29-2.61 5.23-5.1 5.51.4.35.75 1.03.75 2.08v3.08c0 .3.2.65.77.54A11.1 11.1 0 0 0 12 .9Z"/></svg>
+          Continue with GitHub
+        </button>
+      </div>
+      <div class="auth-divider"><span>or use email</span></div>
+      <label for="login-email">Email</label>
+      <input id="login-email" type="email" autocomplete="email" required />
+      <label for="login-password">Password</label>
+      <input id="login-password" type="password" autocomplete="current-password" required />
+      <p class="field-error" id="login-error" role="alert" hidden></p>
+      <button class="button button-primary auth-submit" id="sign-in" type="button">Sign In</button>
+      <div class="auth-links">
+        <a href="#" id="forgot-password-link">Forgot password?</a>
+        <a href="#" id="sign-up-link">Don't have an account? Sign up</a>
+      </div>
+    </div>
+
+    <div class="auth-card" id="auth-signup" aria-labelledby="auth-signup-title" hidden>
+      <img class="auth-logo" src="/logo.png" alt="DeLore" />
+      <p class="eyebrow">LOCAL DEMO SESSION</p>
+      <h1 id="auth-signup-title">Create an account</h1>
+      <p class="muted">This form demonstrates the interface only; no account is created and passwords are not stored.</p>
+      <div class="auth-providers">
+        <button class="auth-provider" id="signup-google" type="button">
+          <svg aria-hidden="true" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5Z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.74 7.18l7.7 5.98c4.5-4.16 7.08-10.28 7.08-17.63Z"/><path fill="#FBBC05" d="M10.53 28.59A14.4 14.4 0 0 1 9.75 24c0-1.59.27-3.13.76-4.59l-7.98-6.19A23.9 23.9 0 0 0 0 24c0 3.87.93 7.54 2.56 10.78l7.97-6.19Z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.9-5.82l-7.7-5.98c-2.13 1.43-4.86 2.3-8.2 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48Z"/></svg>
+          Continue with Google
+        </button>
+        <button class="auth-provider" id="signup-github" type="button">
+          <svg aria-hidden="true" viewBox="0 0 24 24"><path fill="currentColor" d="M12 .9a11.1 11.1 0 0 0-3.51 21.63c.56.1.76-.24.76-.54v-2.08c-3.1.67-3.76-1.32-3.76-1.32-.5-1.28-1.24-1.62-1.24-1.62-1.01-.69.08-.68.08-.68 1.12.08 1.71 1.15 1.71 1.15 1 .1.76 2.4 3.7 1.7.1-.73.39-1.22.7-1.5-2.48-.28-5.09-1.24-5.09-5.52 0-1.22.44-2.22 1.15-3-.12-.28-.5-1.42.11-2.96 0 0 .94-.3 3.05 1.15a10.6 10.6 0 0 1 5.55 0c2.11-1.45 3.04-1.15 3.04-1.15.61 1.54.23 2.68.12 2.96.72.78 1.15 1.78 1.15 3.01 0 4.29-2.61 5.23-5.1 5.51.4.35.75 1.03.75 2.08v3.08c0 .3.2.65.77.54A11.1 11.1 0 0 0 12 .9Z"/></svg>
+          Continue with GitHub
+        </button>
+      </div>
+      <div class="auth-divider"><span>or use email</span></div>
+      <label for="signup-email">Email</label>
+      <input id="signup-email" type="email" autocomplete="email" required />
+      <label for="signup-password">Password</label>
+      <input id="signup-password" type="password" autocomplete="new-password" required />
+      <label for="signup-confirm-password">Confirm Password</label>
+      <input id="signup-confirm-password" type="password" autocomplete="new-password" required />
+      <p class="field-error" id="signup-error" role="alert" hidden></p>
+      <button class="button button-primary auth-submit" id="create-account" type="button">Create Account</button>
+      <div class="auth-links">
+        <a href="#" id="sign-in-link">Already have an account? Sign in</a>
+      </div>
+    </div>
+
+    <div class="auth-card" id="auth-forgot" aria-labelledby="auth-forgot-title" hidden>
+      <img class="auth-logo" src="/logo.png" alt="DeLore" />
+      <p class="eyebrow">LOCAL DEMO SESSION</p>
+      <h1 id="auth-forgot-title">Reset password</h1>
+      <p class="muted">Password reset is unavailable because this demo has no account service.</p>
+      <label for="reset-email">Email</label>
+      <input id="reset-email" type="email" autocomplete="email" required />
+      <p class="field-success" id="reset-message" role="status" hidden></p>
+      <button class="button button-primary auth-submit" id="send-reset-link" type="button">Send reset link</button>
+      <div class="auth-links">
+        <a href="#" id="back-to-login-link">Back to login</a>
+      </div>
+    </div>
+  </div>
+
+  <main class="shell" id="app-shell" hidden>
     <header class="topbar">
       <a class="wordmark" href="#" aria-label="DeLore home"><img src="/logo.png" alt="DeLore" /></a>
       <span class="testnet-badge">TESTNET — no real payouts</span>
@@ -188,6 +271,18 @@ root.innerHTML = `
               <span class="state-chip" id="job-state">Idle</span>
             </div>
             <p class="job-detail" id="job-detail">No active job.</p>
+          </section>
+
+          <section class="panel">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">WALLET</p>
+                <h2 id="wallet-status">Wallet not connected</h2>
+              </div>
+              <span class="state-chip">Not connected</span>
+            </div>
+            <p class="muted">This testnet app records local ledger entries; no funds are held in escrow.</p>
+            <button class="button button-secondary" id="connect-wallet" type="button">Connect Crypto Wallet (MetaMask)</button>
           </section>
 
           <section class="panel progress-panel" id="preparation-panel" hidden>
@@ -292,6 +387,14 @@ root.innerHTML = `
           </section>
 
           <section class="panel">
+            <p class="eyebrow">ACCOUNT</p>
+            <h2>Local demo session</h2>
+            <p class="muted">This session is a local interface demo, not an authenticated account.</p>
+            <button class="button button-secondary" id="log-out" type="button">Log Out</button>
+            <p class="field-error" id="logout-error" role="alert" hidden></p>
+          </section>
+
+          <section class="panel">
             <p class="eyebrow">ABOUT</p>
             <h2>DeLore</h2>
             <p class="muted">Version 0.1.0</p>
@@ -342,6 +445,98 @@ const $ = <T extends HTMLElement>(id: string) => {
   const element = document.getElementById(id)
   if (!element) throw new Error(`Missing UI element: ${id}`)
   return element as T
+}
+
+function renderAuthView(): void {
+  if (!snapshot) return
+  const preferences = snapshot.desktop_preferences
+  $('auth-checking').hidden = true
+  syncAuthView(
+    {
+      authOverlay: $('auth-overlay'),
+      appShell: $('app-shell'),
+      onboarding: $<HTMLDialogElement>('welcome-dialog'),
+    },
+    preferences.auth_status,
+    preferences.onboarding_complete,
+  )
+
+  setAuthScreenVisibility(
+    {
+      login: $('auth-login'),
+      signup: $('auth-signup'),
+      forgot: $('auth-forgot'),
+    },
+    preferences.auth_status ? null : currentAuthScreen,
+  )
+  renderAuthMessages()
+}
+
+function renderAuthMessages(): void {
+  for (const screen of ['login', 'signup'] as const) {
+    const error = $<HTMLParagraphElement>(`${screen}-error`)
+    error.textContent = currentAuthScreen === screen ? authError : ''
+    error.hidden = currentAuthScreen !== screen || !authError
+  }
+}
+
+function showAuthScreen(screen: 'login' | 'signup' | 'forgot'): void {
+  currentAuthScreen = screen
+  authError = ''
+  if ($<HTMLElement>('auth-checking').hidden && snapshot && !snapshot.desktop_preferences.auth_status) {
+    renderAuthView()
+  } else {
+    setAuthScreenVisibility(
+      {
+        login: $('auth-login'),
+        signup: $('auth-signup'),
+        forgot: $('auth-forgot'),
+      },
+      screen,
+    )
+  }
+  if (screen === 'login') $<HTMLInputElement>('login-email').focus()
+  if (screen === 'signup') $<HTMLInputElement>('signup-email').focus()
+  if (screen === 'forgot') $<HTMLInputElement>('reset-email').focus()
+}
+
+function validateAuthFields(
+  email: HTMLInputElement,
+  password: HTMLInputElement,
+  confirmation?: HTMLInputElement,
+): boolean {
+  authError = ''
+  if (!email.checkValidity()) {
+    email.reportValidity()
+    return false
+  }
+  if (!password.value) {
+    authError = 'Enter your password.'
+  } else if (confirmation && password.value !== confirmation.value) {
+    authError = 'The passwords do not match.'
+  }
+  renderAuthMessages()
+  return !authError
+}
+
+function bindAuthButton(
+  id: string,
+  getEmail: () => string,
+  validate?: () => boolean,
+): void {
+  bindMockAuthButton<StatusSnapshot>($<HTMLButtonElement>(id), {
+    getEmail,
+    invoke,
+    validate,
+    onAuthenticated: (next) => {
+      authError = ''
+      updateStatus(next)
+    },
+    onError: (error) => {
+      authError = errorMessage(error)
+      renderAuthMessages()
+    },
+  })
 }
 
 function updateStatus(next: StatusSnapshot): void {
@@ -425,7 +620,7 @@ function renderStatus(): void {
   if (document.activeElement !== theme) theme.value = preferences.theme
   updatePayoutFeedback()
   renderSettingsError()
-  renderOnboarding()
+  renderAuthView()
 }
 
 function renderJob(job: StatusSnapshot['current_job']): void {
@@ -470,13 +665,6 @@ function renderPreparation(status: StatusSnapshot): void {
   $('setup-size').textContent = preparation.detail || (status.expected_setup_bytes
     ? `Estimated total setup size: ${formatBytes(status.expected_setup_bytes)}`
     : 'Calculating setup size…')
-}
-
-function renderOnboarding(): void {
-  const dialog = $<HTMLDialogElement>('welcome-dialog')
-  if (!snapshot) return
-  if (!snapshot.desktop_preferences.onboarding_complete && !dialog.open) dialog.showModal()
-  else if (snapshot.desktop_preferences.onboarding_complete && dialog.open) dialog.close()
 }
 
 function renderEarnings(earnings: EarningsSnapshot): void {
@@ -669,6 +857,73 @@ document.querySelectorAll<HTMLButtonElement>('[data-screen]').forEach((button) =
   button.addEventListener('click', () => showScreen(button.dataset.screen as typeof currentScreen))
 })
 
+$<HTMLAnchorElement>('forgot-password-link').addEventListener('click', (event) => {
+  event.preventDefault()
+  showAuthScreen('forgot')
+})
+$<HTMLAnchorElement>('sign-up-link').addEventListener('click', (event) => {
+  event.preventDefault()
+  showAuthScreen('signup')
+})
+$<HTMLAnchorElement>('sign-in-link').addEventListener('click', (event) => {
+  event.preventDefault()
+  showAuthScreen('login')
+})
+$<HTMLAnchorElement>('back-to-login-link').addEventListener('click', (event) => {
+  event.preventDefault()
+  showAuthScreen('login')
+})
+
+bindAuthButton(
+  'sign-in',
+  () => $<HTMLInputElement>('login-email').value.trim(),
+  () => validateAuthFields(
+    $<HTMLInputElement>('login-email'),
+    $<HTMLInputElement>('login-password'),
+  ),
+)
+bindAuthButton(
+  'create-account',
+  () => $<HTMLInputElement>('signup-email').value.trim(),
+  () => validateAuthFields(
+    $<HTMLInputElement>('signup-email'),
+    $<HTMLInputElement>('signup-password'),
+    $<HTMLInputElement>('signup-confirm-password'),
+  ),
+)
+bindAuthButton('login-google', () => 'google-user@example.invalid')
+bindAuthButton('login-github', () => 'github-user@example.invalid')
+bindAuthButton('signup-google', () => 'google-user@example.invalid')
+bindAuthButton('signup-github', () => 'github-user@example.invalid')
+
+$<HTMLButtonElement>('send-reset-link').addEventListener('click', () => {
+  const email = $<HTMLInputElement>('reset-email')
+  if (!email.checkValidity()) {
+    email.reportValidity()
+    return
+  }
+  $('reset-message').textContent = 'Password reset is unavailable in this local demo.'
+  $('reset-message').hidden = false
+})
+$<HTMLButtonElement>('connect-wallet').addEventListener('click', () => {
+  window.alert('Wallet connection is not implemented. Earnings are testnet ledger entries; no funds are held in escrow.')
+})
+$<HTMLButtonElement>('log-out').addEventListener('click', async () => {
+  const button = $<HTMLButtonElement>('log-out')
+  const error = $<HTMLParagraphElement>('logout-error')
+  button.disabled = true
+  error.textContent = ''
+  error.hidden = true
+  try {
+    await invoke('set_auth_status', { status: false })
+    window.location.reload()
+  } catch (reason) {
+    error.textContent = errorMessage(reason)
+    error.hidden = false
+    button.disabled = false
+  }
+})
+
 $<HTMLInputElement>('performance-slider').addEventListener('change', async (event) => {
   const percent = Number((event.currentTarget as HTMLInputElement).value)
   if (!isValidPerformancePercent(percent)) return
@@ -810,4 +1065,9 @@ void listen<string>('tray-action', (event) => {
     void invoke(snapshot.user_paused ? 'resume_provider' : 'pause_provider').catch(showError)
   }
 }).catch(showError)
-void invoke<StatusSnapshot>('get_status').then(updateStatus).catch(showError)
+void invoke<StatusSnapshot>('get_status').then(updateStatus).catch((error: unknown) => {
+  $('auth-checking').hidden = true
+  showAuthScreen('login')
+  authError = errorMessage(error)
+  renderAuthMessages()
+})

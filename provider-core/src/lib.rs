@@ -12,8 +12,8 @@ pub mod runtime;
 pub use config::{
     config_dir, config_path, confirm_not_recommended_runtime, coordinator_fees_url,
     coordinator_fees_url_with_override, effective_ollama_model, load_config,
-    load_config_with_recovery, save_config, set_desktop_preferences, set_ollama_model,
-    set_payout_address, set_performance_percent, set_resource_settings,
+    load_config_with_recovery, save_config, set_auth_status, set_desktop_preferences,
+    set_ollama_model, set_payout_address, set_performance_percent, set_resource_settings,
     validate_coordinator_ws_url, validate_ollama_model, validate_payout_address, AppLanguage,
     ConfigLoadResult, DesktopPreferences, OllamaModelSelection, ProviderConfig, Theme,
 };
