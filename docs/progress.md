@@ -119,3 +119,11 @@ Remaining NOT VERIFIED: macOS/Linux builds, NVIDIA/AMD execution, real battery a
 - Visible UI text audit through CDP returned false for `Ollama`, `runtime`, `sidecar`, `llama3`, `pull`, and `model`. The wallet panel stated that earnings are local testnet ledger entries and no funds are held in escrow.
 - Windows Action Center reported `No new notifications (Off)` after a successful job while app notifications were enabled; visible notification delivery is NOT VERIFIED. Native tray-menu Pause/Resume and Quit were not exercised. These remain NOT VERIFIED.
 - `git diff f6c15b8 -- website/index.html website/logo.png` produced no output; neither website file was changed during this follow-up.
+
+## Final validation (2026-11-25, UTC)
+
+- `cargo test --workspace`: 115 passed, 0 failed, 4 ignored. Package result lines: common 4/0; coordinator 27/0; desktop 14 passed, 1 ignored; provider-core 69/0; gpuswarm 1/0.
+- `cargo test --workspace -- --ignored --nocapture`: all four ignored tests passed: `close_shutdown_helper_stops_the_managed_runtime` (11.31 s), `managed_provider_runs_a_job_and_stops` (72.93 s), `disconnect_during_job_discards_result_and_reconnects` (15.63 s), and `performance_slider_controls_registration_and_job_flow` (33.97 s). The three coordinator-backed tests used their own ports, database, config directory, and coordinator PID; each helper stopped its own coordinator.
+- `cargo clippy --workspace --all-targets` finished successfully with no warnings. `cargo fmt --all -- --check` passed after applying rustfmt to the auth test module.
+- `npm --prefix desktop test`: 12 passed, 0 failed. `npm --prefix desktop run build` passed. `actionlint .github/workflows/build.yml` exited 0.
+- Final validation used `C:\gpu-swarm-phase9-88e391cb` on C: (C: had more free space than Q:); the target was removed after testing. No app, coordinator, or managed runtime process remained. Website diff from `f6c15b8` was empty and the worktree was clean after documentation commits.
