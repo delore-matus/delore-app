@@ -1180,8 +1180,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_error, desktop_resource_settings, ensure_demo_auth_enabled,
-        initial_runtime_state, map_error_with_logger, mock_login, provider_control_channel,
+        classify_error, desktop_resource_settings, ensure_demo_auth_enabled, initial_runtime_state,
+        map_error_with_logger, mock_login, provider_control_channel,
         requires_provider_confirmation, set_provider_paused, settings_unreadable_error,
         stop_provider_task_and_join, DesktopState, ProviderTask,
     };
@@ -1197,7 +1197,10 @@ mod tests {
 
     #[test]
     fn demo_auth_backend_is_enabled_only_by_its_cargo_feature() {
-        assert_eq!(ensure_demo_auth_enabled().is_ok(), cfg!(feature = "demo_auth"));
+        assert_eq!(
+            ensure_demo_auth_enabled().is_ok(),
+            cfg!(feature = "demo_auth")
+        );
         assert_eq!(
             mock_login("person@example.test".to_owned()).is_ok(),
             cfg!(feature = "demo_auth")
