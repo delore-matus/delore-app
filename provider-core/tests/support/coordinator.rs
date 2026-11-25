@@ -45,7 +45,12 @@ impl OwnedCoordinator {
         std::fs::create_dir_all(root.join("config"))
             .with_context(|| format!("failed to create test directory {}", root.display()))?;
         let http_port = free_port()?;
-        let ws_port = free_port()?;
+        let ws_port = loop {
+            let port = free_port()?;
+            if port != http_port {
+                break port;
+            }
+        };
         let http_url = format!("http://127.0.0.1:{http_port}");
         let ws_url = format!("ws://127.0.0.1:{ws_port}/ws");
         let child = Command::new(&coordinator_executable)
@@ -73,6 +78,8 @@ impl OwnedCoordinator {
         std::env::set_var("GPUSWARM_TEST_IDLE_STATE", "active");
         std::env::set_var("GPUSWARM_TEST_POWER_STATE", "ac");
         std::env::remove_var("COORDINATOR_WS");
+        std::env::remove_var("COORDINATOR_HTTP");
+        std::env::remove_var("PROVIDER_ID");
         std::env::remove_var("OLLAMA_MODEL");
 
         let client = reqwest::Client::new();
@@ -92,8 +99,9 @@ impl OwnedCoordinator {
                 .is_ok_and(|response| response.status().is_success())
             {
                 println!(
-                    "owned-coordinator pid={} http={} ws={} db={} at={}",
+                    "owned-coordinator pid={} test-runner-pid={} http={} ws={} db={} at={}",
                     coordinator.child.id(),
+                    std::process::id(),
                     coordinator.http_url,
                     coordinator.ws_url,
                     root.join("coordinator.sqlite3").display(),
