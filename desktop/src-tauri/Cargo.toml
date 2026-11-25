@@ -4,6 +4,10 @@ version = "0.1.0"
 description = "DeLore provider desktop app"
 edition = "2021"
 
+[features]
+default = []
+demo_auth = []
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

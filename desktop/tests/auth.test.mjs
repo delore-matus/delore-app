@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import {
   bindMockAuthButton,
+  isDemoAuthEnabled,
   setAuthScreenVisibility,
   syncAuthView,
 } from '../src/auth-flow.ts'
@@ -54,6 +55,7 @@ test('sign in click persists mock auth and reveals first-run onboarding', async 
       { authOverlay, appShell, onboarding },
       true,
       false,
+      true,
     ),
     onError: (error) => {
       throw error
@@ -92,16 +94,48 @@ test('saved sessions skip auth and completed onboarding stays on the dashboard',
   }
   const view = { authOverlay, appShell, onboarding }
 
-  syncAuthView(view, true, true)
+  syncAuthView(view, true, true, true)
   assert.equal(authOverlay.hidden, true)
   assert.equal(appShell.hidden, false)
   assert.equal(onboarding.open, false)
 
   onboarding.open = true
-  syncAuthView(view, false, false)
+  syncAuthView(view, false, false, true)
   assert.equal(authOverlay.hidden, false)
   assert.equal(appShell.hidden, true)
   assert.equal(onboarding.open, false)
+})
+
+test('demo auth defaults off and opens onboarding or dashboard directly', () => {
+  assert.equal(isDemoAuthEnabled(undefined), false)
+  assert.equal(isDemoAuthEnabled('false'), false)
+
+  const authOverlay = { hidden: false }
+  const appShell = { hidden: true }
+  const onboarding = {
+    open: false,
+    showModal() {
+      this.open = true
+    },
+    close() {
+      this.open = false
+    },
+  }
+  const view = { authOverlay, appShell, onboarding }
+
+  syncAuthView(view, false, false, isDemoAuthEnabled(undefined))
+  assert.equal(authOverlay.hidden, true)
+  assert.equal(appShell.hidden, false)
+  assert.equal(onboarding.open, true)
+
+  syncAuthView(view, false, true, isDemoAuthEnabled(undefined))
+  assert.equal(authOverlay.hidden, true)
+  assert.equal(appShell.hidden, false)
+  assert.equal(onboarding.open, false)
+})
+
+test('demo auth can be explicitly enabled for the mock screens', () => {
+  assert.equal(isDemoAuthEnabled('true'), true)
 })
 
 test('login, sign-up, and password-reset screens switch exclusively', () => {

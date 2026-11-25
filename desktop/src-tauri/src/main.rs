@@ -763,6 +763,7 @@ fn set_auth_status(
     state: State<'_, DesktopState>,
     status: bool,
 ) -> Result<StatusSnapshot, String> {
+    ensure_demo_auth_enabled()?;
     let config =
         save_auth_status(status).map_err(|error| map_invoke_error(&format!("{error:#}")))?;
     update_status(&state.inner().inner, &app, |snapshot| {
@@ -779,8 +780,17 @@ fn set_auth_status(
 
 #[tauri::command]
 fn mock_login(email: String) -> Result<(), String> {
+    ensure_demo_auth_enabled()?;
     let _ = email;
     Ok(())
+}
+
+fn ensure_demo_auth_enabled() -> Result<(), String> {
+    if cfg!(feature = "demo_auth") {
+        Ok(())
+    } else {
+        Err("Demo sign-in is disabled in this build.".to_owned())
+    }
 }
 
 #[tauri::command]
@@ -1170,9 +1180,10 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_error, desktop_resource_settings, initial_runtime_state, map_error_with_logger,
-        provider_control_channel, requires_provider_confirmation, set_provider_paused,
-        settings_unreadable_error, stop_provider_task_and_join, DesktopState, ProviderTask,
+        classify_error, desktop_resource_settings, ensure_demo_auth_enabled,
+        initial_runtime_state, map_error_with_logger, mock_login, provider_control_channel,
+        requires_provider_confirmation, set_provider_paused, settings_unreadable_error,
+        stop_provider_task_and_join, DesktopState, ProviderTask,
     };
     use provider_core::{
         ResourceMode, ResourceSettings, RuntimeManager, RuntimeProgressCallback, RuntimeState,
@@ -1183,6 +1194,15 @@ mod tests {
         Arc,
     };
     use tokio::sync::{mpsc, watch};
+
+    #[test]
+    fn demo_auth_backend_is_enabled_only_by_its_cargo_feature() {
+        assert_eq!(ensure_demo_auth_enabled().is_ok(), cfg!(feature = "demo_auth"));
+        assert_eq!(
+            mock_login("person@example.test".to_owned()).is_ok(),
+            cfg!(feature = "demo_auth")
+        );
+    }
 
     struct IsolatedConfigDir(std::path::PathBuf);
 

@@ -22,15 +22,21 @@ export interface AuthButtonOptions<T> {
   delay?: (milliseconds: number) => Promise<void>
 }
 
+export function isDemoAuthEnabled(value: string | undefined): boolean {
+  return value === 'true'
+}
+
 export function syncAuthView(
   elements: AuthViewElements,
   authenticated: boolean,
   onboardingComplete: boolean,
+  demoAuthEnabled = true,
 ): void {
-  elements.authOverlay.hidden = authenticated
-  elements.appShell.hidden = !authenticated
+  const canShowApp = !demoAuthEnabled || authenticated
+  elements.authOverlay.hidden = !demoAuthEnabled || authenticated
+  elements.appShell.hidden = !canShowApp
 
-  if (!authenticated) {
+  if (!canShowApp) {
     if (elements.onboarding.open) elements.onboarding.close()
     return
   }

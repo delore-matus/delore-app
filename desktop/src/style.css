@@ -176,6 +176,12 @@ input[type="text"], select {
 }
 .auth-card .eyebrow { color: #05f914; }
 .auth-card .muted { margin: 0 0 20px; font-size: 13px; }
+.demo-auth-notice {
+  margin: 0 0 14px;
+  color: #05f914;
+  font-size: 12px;
+  font-weight: 700;
+}
 .auth-logo { display: block; width: 42px; height: 42px; margin-bottom: 20px; object-fit: contain; }
 .auth-providers { display: grid; gap: 10px; margin-top: 20px; }
 .auth-provider {

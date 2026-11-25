@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import {
   bindMockAuthButton,
+  isDemoAuthEnabled,
   setAuthScreenVisibility,
   syncAuthView,
 } from './auth-flow.ts'
@@ -100,6 +101,7 @@ interface EarningsSnapshot {
 const root = document.querySelector<HTMLDivElement>('#app')
 if (!root) throw new Error('App root element is missing')
 
+const demoAuthEnabled = isDemoAuthEnabled(import.meta.env.VITE_DEMO_AUTH)
 let snapshot: StatusSnapshot | null = null
 let currentScreen: 'status' | 'earnings' | 'settings' = 'status'
 let working = false
@@ -110,12 +112,13 @@ let authError = ''
 let currentAuthScreen: 'login' | 'signup' | 'forgot' = 'login'
 
 root.innerHTML = `
-  <div class="auth-overlay" id="auth-overlay" role="dialog" aria-modal="true" aria-label="DeLore sign in">
+  <div class="auth-overlay" id="auth-overlay" role="dialog" aria-modal="true" aria-label="DeLore sign in" ${demoAuthEnabled ? '' : 'hidden'}>
     <div class="auth-checking" id="auth-checking" role="status">Checking saved session…</div>
 
     <div class="auth-card" id="auth-login" aria-labelledby="auth-login-title" hidden>
       <img class="auth-logo" src="/logo.png" alt="DeLore" />
       <p class="eyebrow">LOCAL DEMO SESSION</p>
+      <p class="demo-auth-notice">Demo sign-in: no account is created</p>
       <h1 id="auth-login-title">Welcome back to DeLore</h1>
       <p class="muted">Mock sign-in only. Google, GitHub, email authentication and account security are not connected.</p>
       <div class="auth-providers">
@@ -144,6 +147,7 @@ root.innerHTML = `
     <div class="auth-card" id="auth-signup" aria-labelledby="auth-signup-title" hidden>
       <img class="auth-logo" src="/logo.png" alt="DeLore" />
       <p class="eyebrow">LOCAL DEMO SESSION</p>
+      <p class="demo-auth-notice">Demo sign-in: no account is created</p>
       <h1 id="auth-signup-title">Create an account</h1>
       <p class="muted">This form demonstrates the interface only; no account is created and passwords are not stored.</p>
       <div class="auth-providers">
@@ -173,19 +177,20 @@ root.innerHTML = `
     <div class="auth-card" id="auth-forgot" aria-labelledby="auth-forgot-title" hidden>
       <img class="auth-logo" src="/logo.png" alt="DeLore" />
       <p class="eyebrow">LOCAL DEMO SESSION</p>
+      <p class="demo-auth-notice">Demo sign-in: no account is created</p>
       <h1 id="auth-forgot-title">Reset password</h1>
       <p class="muted">Password reset is unavailable because this demo has no account service.</p>
       <label for="reset-email">Email</label>
       <input id="reset-email" type="email" autocomplete="email" required />
       <p class="field-success" id="reset-message" role="status" hidden></p>
-      <button class="button button-primary auth-submit" id="send-reset-link" type="button">Send reset link</button>
+      <button class="button button-primary auth-submit" id="send-reset-link" type="button">Check reset availability</button>
       <div class="auth-links">
         <a href="#" id="back-to-login-link">Back to login</a>
       </div>
     </div>
   </div>
 
-  <main class="shell" id="app-shell" hidden>
+  <main class="shell" id="app-shell" ${demoAuthEnabled ? 'hidden' : ''}>
     <header class="topbar">
       <a class="wordmark" href="#" aria-label="DeLore home"><img src="/logo.png" alt="DeLore" /></a>
       <span class="testnet-badge">TESTNET — no real payouts</span>
@@ -386,13 +391,13 @@ root.innerHTML = `
             </div>
           </section>
 
-          <section class="panel">
+          ${demoAuthEnabled ? `<section class="panel">
             <p class="eyebrow">ACCOUNT</p>
             <h2>Local demo session</h2>
             <p class="muted">This session is a local interface demo, not an authenticated account.</p>
             <button class="button button-secondary" id="log-out" type="button">Log Out</button>
             <p class="field-error" id="logout-error" role="alert" hidden></p>
-          </section>
+          </section>` : ''}
 
           <section class="panel">
             <p class="eyebrow">ABOUT</p>
@@ -459,7 +464,20 @@ function renderAuthView(): void {
     },
     preferences.auth_status,
     preferences.onboarding_complete,
+    demoAuthEnabled,
   )
+
+  if (!demoAuthEnabled) {
+    setAuthScreenVisibility(
+      {
+        login: $('auth-login'),
+        signup: $('auth-signup'),
+        forgot: $('auth-forgot'),
+      },
+      null,
+    )
+    return
+  }
 
   setAuthScreenVisibility(
     {
@@ -481,6 +499,7 @@ function renderAuthMessages(): void {
 }
 
 function showAuthScreen(screen: 'login' | 'signup' | 'forgot'): void {
+  if (!demoAuthEnabled) return
   currentAuthScreen = screen
   authError = ''
   if ($<HTMLElement>('auth-checking').hidden && snapshot && !snapshot.desktop_preferences.auth_status) {
@@ -857,71 +876,75 @@ document.querySelectorAll<HTMLButtonElement>('[data-screen]').forEach((button) =
   button.addEventListener('click', () => showScreen(button.dataset.screen as typeof currentScreen))
 })
 
-$<HTMLAnchorElement>('forgot-password-link').addEventListener('click', (event) => {
-  event.preventDefault()
-  showAuthScreen('forgot')
-})
-$<HTMLAnchorElement>('sign-up-link').addEventListener('click', (event) => {
-  event.preventDefault()
-  showAuthScreen('signup')
-})
-$<HTMLAnchorElement>('sign-in-link').addEventListener('click', (event) => {
-  event.preventDefault()
-  showAuthScreen('login')
-})
-$<HTMLAnchorElement>('back-to-login-link').addEventListener('click', (event) => {
-  event.preventDefault()
-  showAuthScreen('login')
-})
+if (demoAuthEnabled) {
+  $<HTMLAnchorElement>('forgot-password-link').addEventListener('click', (event) => {
+    event.preventDefault()
+    showAuthScreen('forgot')
+  })
+  $<HTMLAnchorElement>('sign-up-link').addEventListener('click', (event) => {
+    event.preventDefault()
+    showAuthScreen('signup')
+  })
+  $<HTMLAnchorElement>('sign-in-link').addEventListener('click', (event) => {
+    event.preventDefault()
+    showAuthScreen('login')
+  })
+  $<HTMLAnchorElement>('back-to-login-link').addEventListener('click', (event) => {
+    event.preventDefault()
+    showAuthScreen('login')
+  })
 
-bindAuthButton(
-  'sign-in',
-  () => $<HTMLInputElement>('login-email').value.trim(),
-  () => validateAuthFields(
-    $<HTMLInputElement>('login-email'),
-    $<HTMLInputElement>('login-password'),
-  ),
-)
-bindAuthButton(
-  'create-account',
-  () => $<HTMLInputElement>('signup-email').value.trim(),
-  () => validateAuthFields(
-    $<HTMLInputElement>('signup-email'),
-    $<HTMLInputElement>('signup-password'),
-    $<HTMLInputElement>('signup-confirm-password'),
-  ),
-)
-bindAuthButton('login-google', () => 'google-user@example.invalid')
-bindAuthButton('login-github', () => 'github-user@example.invalid')
-bindAuthButton('signup-google', () => 'google-user@example.invalid')
-bindAuthButton('signup-github', () => 'github-user@example.invalid')
+  bindAuthButton(
+    'sign-in',
+    () => $<HTMLInputElement>('login-email').value.trim(),
+    () => validateAuthFields(
+      $<HTMLInputElement>('login-email'),
+      $<HTMLInputElement>('login-password'),
+    ),
+  )
+  bindAuthButton(
+    'create-account',
+    () => $<HTMLInputElement>('signup-email').value.trim(),
+    () => validateAuthFields(
+      $<HTMLInputElement>('signup-email'),
+      $<HTMLInputElement>('signup-password'),
+      $<HTMLInputElement>('signup-confirm-password'),
+    ),
+  )
+  bindAuthButton('login-google', () => 'google-user@example.invalid')
+  bindAuthButton('login-github', () => 'github-user@example.invalid')
+  bindAuthButton('signup-google', () => 'google-user@example.invalid')
+  bindAuthButton('signup-github', () => 'github-user@example.invalid')
 
-$<HTMLButtonElement>('send-reset-link').addEventListener('click', () => {
-  const email = $<HTMLInputElement>('reset-email')
-  if (!email.checkValidity()) {
-    email.reportValidity()
-    return
-  }
-  $('reset-message').textContent = 'Password reset is unavailable in this local demo.'
-  $('reset-message').hidden = false
-})
+  $<HTMLButtonElement>('send-reset-link').addEventListener('click', () => {
+    const email = $<HTMLInputElement>('reset-email')
+    if (!email.checkValidity()) {
+      email.reportValidity()
+      return
+    }
+    $('reset-message').textContent = 'No email is sent. Password reset is unavailable in this demo.'
+    $('reset-message').hidden = false
+  })
+
+  $<HTMLButtonElement>('log-out').addEventListener('click', async () => {
+    const button = $<HTMLButtonElement>('log-out')
+    const error = $<HTMLParagraphElement>('logout-error')
+    button.disabled = true
+    error.textContent = ''
+    error.hidden = true
+    try {
+      await invoke('set_auth_status', { status: false })
+      window.location.reload()
+    } catch (reason) {
+      error.textContent = errorMessage(reason)
+      error.hidden = false
+      button.disabled = false
+    }
+  })
+}
+
 $<HTMLButtonElement>('connect-wallet').addEventListener('click', () => {
   window.alert('Wallet connection is not implemented. Earnings are testnet ledger entries; no funds are held in escrow.')
-})
-$<HTMLButtonElement>('log-out').addEventListener('click', async () => {
-  const button = $<HTMLButtonElement>('log-out')
-  const error = $<HTMLParagraphElement>('logout-error')
-  button.disabled = true
-  error.textContent = ''
-  error.hidden = true
-  try {
-    await invoke('set_auth_status', { status: false })
-    window.location.reload()
-  } catch (reason) {
-    error.textContent = errorMessage(reason)
-    error.hidden = false
-    button.disabled = false
-  }
 })
 
 $<HTMLInputElement>('performance-slider').addEventListener('change', async (event) => {

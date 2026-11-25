@@ -136,12 +136,16 @@ Settings and earnings history stay in the app's local configuration folder.
 Use Settings → Local Data → Open data folder to review or back up those files;
 the app does not delete them automatically.
 
-The sign-in, sign-up, Google, and GitHub screens are local UI demos only. They
-do not authenticate an account, send or store passwords, or connect to OAuth;
-the saved `auth_status` flag only controls which screen is shown and is not an
-account security boundary. Password reset is not available. The wallet button
-is also a placeholder: there is no wallet connection or escrow, and earnings
-remain local testnet ledger entries.
+The sign-in overlay is disabled by default. To preview it locally, build the
+frontend with `VITE_DEMO_AUTH=true` and build the Tauri app with its
+`demo_auth` Cargo feature (for example, in PowerShell, set
+`$env:VITE_DEMO_AUTH = "true"` before running `cargo tauri dev --features demo_auth`).
+When enabled, the sign-in, sign-up, Google, and GitHub screens are local UI
+demos only: they do not authenticate an account, send or store passwords, or
+connect to OAuth. The saved `auth_status` flag only controls which screen is
+shown and is not an account security boundary. Password reset is unavailable
+and no email is sent. The wallet button is also a placeholder: there is no
+wallet connection or escrow, and earnings remain local testnet ledger entries.
 
 Intel integrated graphics, unsupported/unknown GPUs, and CPU-only systems are
 marked not recommended. The CLI asks for explicit confirmation before runtime
