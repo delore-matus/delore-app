@@ -134,18 +134,28 @@ async fn managed_provider_runs_a_job_and_stops() {
     let fee_config = fee_config.unwrap();
     assert_eq!(fee_config.fee_bps, 1000);
     assert_eq!(fee_config.fee_address, FEE_ADDRESS);
-    let providers: Value = reqwest::get(format!("{coordinator_http}/providers"))
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let provider_entry = providers
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|provider| provider["provider_id"] == provider_id)
-        .expect("provider should be registered before the job is submitted");
+    let registration_deadline = Instant::now() + Duration::from_secs(5);
+    let provider_entry = loop {
+        let providers: Value = reqwest::get(format!("{coordinator_http}/providers"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if let Some(provider_entry) = providers
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provider| provider["provider_id"] == provider_id)
+        {
+            break provider_entry.clone();
+        }
+        assert!(
+            Instant::now() < registration_deadline,
+            "provider should be registered before the job is submitted"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
     println!("GET /providers registered-provider={provider_entry}");
     assert_eq!(provider_entry["status"], "idle");
     assert_eq!(provider_entry["accepting_jobs"], true);
