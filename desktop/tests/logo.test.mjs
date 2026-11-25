@@ -16,3 +16,16 @@ test('official logo asset renders in desktop and website branding', () => {
   assert.match(desktopCss, /\.wordmark img/)
   assert.match(websiteSource, /src="\/logo\.png" alt="DeLore"/)
 })
+
+test('About advanced section shows a friendly read-only connection address', () => {
+  const desktopSource = readFileSync('src/main.ts', 'utf8')
+  const aboutStart = desktopSource.indexOf('<p class="eyebrow">ABOUT</p>')
+  assert.notEqual(aboutStart, -1)
+  const aboutEnd = desktopSource.indexOf('</section>', aboutStart)
+  const aboutSection = desktopSource.slice(aboutStart, aboutEnd)
+
+  assert.match(aboutSection, /<summary>Advanced<\/summary>/)
+  assert.match(aboutSection, /Where DeLore connects/)
+  assert.match(aboutSection, /id="coordinator-address"[^>]*readonly/)
+  assert.doesNotMatch(aboutSection, /coordinator address|WebSocket|ws:\/\//i)
+})

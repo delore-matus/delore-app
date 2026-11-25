@@ -401,12 +401,16 @@ root.innerHTML = `
 
           <section class="panel">
             <p class="eyebrow">ABOUT</p>
-            <h2>DeLore</h2>
+            <h2>About DeLore</h2>
             <p class="muted">Version 0.1.0</p>
-            <label class="settings-field">
-              <span>Advanced — coordinator address</span>
-              <input id="coordinator-address" type="text" readonly>
-            </label>
+            <details class="advanced-details">
+              <summary>Advanced</summary>
+              <label class="settings-field">
+                <span>Where DeLore connects</span>
+                <input id="coordinator-address" type="text" aria-label="Connection address" readonly>
+              </label>
+              <p class="muted">This address is managed by the app.</p>
+            </details>
             <div class="about-links">
               <a href="#" class="placeholder-link">Terms</a>
               <a href="#" class="placeholder-link">Privacy</a>
