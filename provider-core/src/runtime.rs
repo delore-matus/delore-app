@@ -144,9 +144,10 @@ pub struct RuntimeManager {
 
 impl RuntimeManager {
     pub fn new() -> Result<Self> {
-        let data_dir = dirs::data_local_dir()
-            .context("could not find the OS application data directory")?
-            .join("GpuSwarm");
+        let data_dir = Self::runtime_data_dir(
+            std::env::var_os("GPUSWARM_RUNTIME_DIR"),
+            dirs::data_local_dir(),
+        )?;
         Self::with_data_dir(data_dir)
     }
 
@@ -168,6 +169,23 @@ impl RuntimeManager {
 
     pub fn runtime_dir(&self) -> PathBuf {
         self.data_dir.join("runtime").join(OLLAMA_VERSION)
+    }
+
+    fn runtime_data_dir(
+        override_dir: Option<std::ffi::OsString>,
+        default_local_dir: Option<PathBuf>,
+    ) -> anyhow::Result<PathBuf> {
+        if let Some(override_dir) = override_dir {
+            let path = PathBuf::from(override_dir);
+            if !path.is_absolute() {
+                anyhow::bail!("GPUSWARM_RUNTIME_DIR must be an absolute path");
+            }
+            return Ok(path);
+        }
+
+        Ok(default_local_dir
+            .context("could not find the OS application data directory")?
+            .join("GpuSwarm"))
     }
 
     pub fn executable_path(&self) -> Result<PathBuf> {
@@ -1270,8 +1288,8 @@ mod tests {
         download_resumable, ensure_available_space, ensure_download_confirmation,
         ensure_provider_confirmation, mach_header_supports_arch, parse_checksum_file,
         process_pull_progress, select_localhost_port, verify_sha256, wait_for_runtime_ready,
-        RuntimeDownloadPhase, RuntimeProgressCallback, RuntimeState, RuntimeSuitability,
-        RUNTIME_STARTUP_TIMEOUT,
+        RuntimeDownloadPhase, RuntimeManager, RuntimeProgressCallback, RuntimeState,
+        RuntimeSuitability, RUNTIME_STARTUP_TIMEOUT,
     };
 
     #[test]
@@ -1283,6 +1301,25 @@ mod tests {
                 .unwrap_err()
                 .to_string(),
             "checksum entry not found"
+        );
+    }
+
+    #[test]
+    fn runtime_data_directory_override_must_be_absolute() {
+        let override_dir = std::env::temp_dir().join("gpuswarm-runtime-test");
+        assert_eq!(
+            RuntimeManager::runtime_data_dir(Some(override_dir.as_os_str().to_owned()), None)
+                .unwrap(),
+            override_dir
+        );
+        assert!(RuntimeManager::runtime_data_dir(
+            Some(std::ffi::OsString::from("relative-runtime-dir")),
+            None
+        )
+        .is_err());
+        assert_eq!(
+            RuntimeManager::runtime_data_dir(None, Some(std::env::temp_dir())).unwrap(),
+            std::env::temp_dir().join("GpuSwarm")
         );
     }
 
