@@ -144,7 +144,7 @@ Remaining NOT VERIFIED: macOS/Linux builds, NVIDIA/AMD execution, real battery a
   - Run 1: close shutdown 13.06 s; `managed_provider_runs_a_job_and_stops` 77.39 s; disconnect/reconnect 13.62 s; performance slider 32.76 s.
   - Run 2: 8.84 s; 8.68 s; 13.29 s; 27.83 s.
   - Run 3: 9.10 s; 8.45 s; 11.94 s; 27.08 s.
-- `cargo test --workspace`: 117 passed, 0 failed, 3 ignored (common 4, coordinator 27, desktop 15 with 1 ignored, provider-core 70, gpuswarm 1). `cargo clippy --workspace --all-targets` exited 0 with no warnings. Focused self-signed WSS rejection, non-loopback WS rejection, duplicate-result rejection, and pending-payout export tests all passed.
+- `cargo test --workspace`: 117 passed, 0 failed, 4 ignored (common 4, coordinator 27, desktop 15, provider-core 70, gpuswarm 1; four ignored tests are the managed-runtime/flow tests). `cargo clippy --workspace --all-targets` exited 0 with no warnings. Focused self-signed WSS rejection, non-loopback WS rejection, duplicate-result rejection, and pending-payout export tests all passed.
 - Cargo used the dedicated target `C:\gpu-swarm-phase8-9-1126T151900Z` on C: because C: had more free space than Q:. Disk was checked against the 3 GB floor; after validation the dedicated target was removed. C: then had 10.54 GB free.
 
 ### Installed NSIS and Phase 9
