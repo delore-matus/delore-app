@@ -18,23 +18,40 @@ jobs:
             rust-target: x86_64-pc-windows-msvc
             artifact: windows
             args: --bundles nsis
-            asset_pattern: DeLore-windows-x64[ext]
+            assetNamePattern: DeLore-windows-x64[ext]
           - os: macos-latest
-            rust-target: aarch64-apple-darwin,x86_64-apple-darwin
+            rust-target: aarch64-apple-darwin
             artifact: macos
             args: --target universal-apple-darwin --bundles dmg
-            asset_pattern: DeLore-macos-universal[ext]
+            assetNamePattern: DeLore-macos-universal[ext]
           - os: ubuntu-latest
             rust-target: x86_64-unknown-linux-gnu
             artifact: linux
             args: --bundles appimage,deb
-            asset_pattern: DeLore-linux-amd64[ext]
+            assetNamePattern: DeLore-linux-amd64[ext]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.rust-target }}
+      - name: Add x86_64 target for universal macOS build
+        if: matrix.artifact == 'macos'
+        run: rustup target add x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: delore
@@ -56,8 +73,8 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseDraft: true
           args: ${{ matrix.args }}
-          releaseAssetNamePattern: ${{ matrix.asset_pattern }}
-          workflowArtifactNamePattern: ${{ matrix.asset_pattern }}
+          releaseAssetNamePattern: ${{ matrix.assetNamePattern }}
+          workflowArtifactNamePattern: ${{ matrix.assetNamePattern }}
           uploadWorkflowArtifacts: true
       - name: Build MSI without publishing it
         if: matrix.artifact == 'windows'
