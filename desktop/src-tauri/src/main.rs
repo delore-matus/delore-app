@@ -804,6 +804,39 @@ fn open_data_folder() -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn delete_local_data(
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+) -> Result<(), String> {
+    stop_provider_task(&app, state.inner()).await?;
+    app.autolaunch()
+        .disable()
+        .map_err(|error| map_invoke_error(&format!("Could not disable start-on-login: {error}")))?;
+    let data_dir = provider_core::config_dir()
+        .map_err(|error| map_invoke_error(&format!("Could not locate local data: {error:#}")))?;
+    delete_local_data_files(&data_dir)
+        .map_err(|error| map_invoke_error(&format!("Could not delete local data: {error}")))?;
+    app.restart();
+}
+
+fn delete_local_data_files(data_dir: &Path) -> std::io::Result<()> {
+    for file_name in ["config.json", "config.json.bad", "earnings.json"] {
+        match fs::remove_file(data_dir.join(file_name)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    match fs::remove_dir_all(data_dir.join("logs")) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    Ok(())
+}
+
+#[tauri::command]
 fn set_payout_address(
     app: tauri::AppHandle,
     state: State<'_, DesktopState>,
@@ -1134,6 +1167,7 @@ fn main() {
             mock_login,
             open_logs,
             open_data_folder,
+            delete_local_data,
             confirm_hardware_use,
             set_payout_address
         ])
@@ -1180,10 +1214,10 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_error, desktop_resource_settings, ensure_demo_auth_enabled, initial_runtime_state,
-        map_error_with_logger, mock_login, provider_control_channel,
-        requires_provider_confirmation, set_provider_paused, settings_unreadable_error,
-        stop_provider_task_and_join, DesktopState, ProviderTask,
+        classify_error, delete_local_data_files, desktop_resource_settings,
+        ensure_demo_auth_enabled, initial_runtime_state, map_error_with_logger, mock_login,
+        provider_control_channel, requires_provider_confirmation, set_provider_paused,
+        settings_unreadable_error, stop_provider_task_and_join, DesktopState, ProviderTask,
     };
     use provider_core::{
         ResourceMode, ResourceSettings, RuntimeManager, RuntimeProgressCallback, RuntimeState,
@@ -1205,6 +1239,36 @@ mod tests {
             mock_login("person@example.test".to_owned()).is_ok(),
             cfg!(feature = "demo_auth")
         );
+    }
+
+    #[test]
+    fn delete_local_data_removes_only_known_user_data() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "gpuswarm-delete-data-test-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(directory.join("logs/nested")).unwrap();
+        for file in ["config.json", "config.json.bad", "earnings.json"] {
+            std::fs::write(directory.join(file), "test data").unwrap();
+        }
+        std::fs::write(directory.join("logs/nested/delore.log"), "test log").unwrap();
+        std::fs::write(directory.join("keep.txt"), "unrelated").unwrap();
+
+        delete_local_data_files(&directory).unwrap();
+
+        assert!(!directory.join("config.json").exists());
+        assert!(!directory.join("config.json.bad").exists());
+        assert!(!directory.join("earnings.json").exists());
+        assert!(!directory.join("logs").exists());
+        assert_eq!(
+            std::fs::read_to_string(directory.join("keep.txt")).unwrap(),
+            "unrelated"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     struct IsolatedConfigDir(std::path::PathBuf);

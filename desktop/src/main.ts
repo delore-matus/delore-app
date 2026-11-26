@@ -388,6 +388,7 @@ root.innerHTML = `
             <p class="muted">Settings and job history are stored locally. Open this folder to review or back up your files.</p>
             <div class="about-links">
               <button class="button button-secondary" id="open-data-folder" type="button">Open data folder</button>
+              <button class="button button-secondary" id="delete-local-data" type="button">Delete local data</button>
             </div>
           </section>
 
@@ -1046,6 +1047,15 @@ $<HTMLButtonElement>('open-logs').addEventListener('click', async () => {
 $<HTMLButtonElement>('open-data-folder').addEventListener('click', async () => {
   try {
     await invoke('open_data_folder')
+  } catch (error) {
+    settingsError = errorMessage(error)
+    renderSettingsError()
+  }
+})
+$<HTMLButtonElement>('delete-local-data').addEventListener('click', async () => {
+  if (!window.confirm('Delete DeLore settings, earnings, and logs from this device? This cannot be undone.')) return
+  try {
+    await invoke('delete_local_data')
   } catch (error) {
     settingsError = errorMessage(error)
     renderSettingsError()
