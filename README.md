@@ -118,6 +118,10 @@ Runtime files and models are kept under the OS-local application data directory:
 - Linux: `$XDG_DATA_HOME/GpuSwarm/runtime` and
   `$XDG_DATA_HOME/GpuSwarm/models` (normally `~/.local/share/GpuSwarm`)
 
+For isolated runs, set `GPUSWARM_RUNTIME_DIR` to an absolute directory. The
+managed runtime and model directories are placed beneath it; when unset, the
+platform application data directory is used.
+
 The app starts the bundled executable directly, sets `OLLAMA_MODELS` to its
 private model directory, and binds the API to a dynamically selected
 `127.0.0.1` port. The process is stopped with the provider. The app does not

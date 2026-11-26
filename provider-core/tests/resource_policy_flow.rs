@@ -117,20 +117,32 @@ async fn performance_slider_controls_registration_and_job_flow() {
         }
     }
 
-    let providers: Value = client
-        .get(format!("{coordinator_http}/providers"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let provider_entry = providers
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|provider| provider["provider_id"] == provider_id)
-        .expect("provider must be listed while paused at 0%");
+    let registration_deadline = Instant::now() + Duration::from_secs(10);
+    let provider_entry = loop {
+        let providers: Value = client
+            .get(format!("{coordinator_http}/providers"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if let Some(provider) = providers
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provider| provider["provider_id"] == provider_id)
+        {
+            break provider.clone();
+        }
+        assert!(
+            Instant::now() < registration_deadline,
+            "provider was not listed while paused at 0%: {providers}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
     assert_eq!(provider_entry["model"], "llama3.2:1b");
     assert_eq!(provider_entry["status"], "paused");
     assert_eq!(provider_entry["accepting_jobs"], false);
